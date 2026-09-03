@@ -1,0 +1,343 @@
+name: CUC slot audit
+
+on:
+  push:
+    branches:
+      - code-review/tf-integrity-20260903-2217-gpt-5-6-sol
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit canonical TF slot model
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import collections
+          import hashlib
+          import json
+          from pathlib import Path
+
+          ROOT = Path('.')
+          VERSION = '0.2.8'
+          PREV_VERSION = '0.2.7'
+          OUT = Path('slot-audit')
+          OUT.mkdir(exist_ok=True)
+
+          def split_tf(path: Path):
+              lines = path.read_text(encoding='utf-8').splitlines()
+              try:
+                  sep = next(i for i, line in enumerate(lines) if line == '')
+              except StopIteration:
+                  raise ValueError(f'No TF header/data separator in {path}')
+              return lines[:sep], lines[sep + 1:]
+
+          def parse_otype(path: Path):
+              _, data = split_tf(path)
+              ranges = {}
+              for line in data:
+                  if not line:
+                      continue
+                  nodes, typ = line.split('\t', 1)
+                  if '-' in nodes:
+                      a, b = map(int, nodes.split('-', 1))
+                  else:
+                      a = b = int(nodes)
+                  ranges[typ] = (a, b)
+              return ranges
+
+          def expand_node_feature(path: Path, start_node: int | None = None, count: int | None = None):
+              """Parse the dense/sparse node-feature syntax used in this repository.
+
+              Returns a dict for sparse mode, or a dense list when start_node/count are supplied.
+              Blank data lines advance one node and represent an absent value.
+              An explicit `N\\tvalue` resets the current node to N.
+              """
+              _, data = split_tf(path)
+              values = {}
+              current = start_node
+              for line in data:
+                  if '\t' in line:
+                      head, value = line.split('\t', 1)
+                      if head.isdigit():
+                          current = int(head)
+                      else:
+                          value = line
+                  else:
+                      value = line
+                  if current is None:
+                      raise ValueError(f'Cannot infer first node in {path}')
+                  values[current] = value if value != '' else None
+                  current += 1
+              if start_node is not None and count is not None:
+                  return [values.get(n) for n in range(start_node, start_node + count)]
+              return values
+
+          def parse_oslots(path: Path, first_non_slot: int):
+              _, data = split_tf(path)
+              result = {}
+              node = first_non_slot
+              for line in data:
+                  slots = []
+                  for token in line.split():
+                      if '-' in token:
+                          a, b = map(int, token.split('-', 1))
+                          slots.extend(range(a, b + 1))
+                      else:
+                          slots.append(int(token))
+                  result[node] = slots
+                  node += 1
+              return result
+
+          def classify_sign(v):
+              if v is None or v == '':
+                  return 'empty'
+              if v == ' ':
+                  return 'space_ascii'
+              if v == '\u00a0':
+                  return 'space_nbsp'
+              if v.isspace():
+                  return 'whitespace_other'
+              return 'visible'
+
+          def counter_dict(c):
+              return dict(sorted(c.items(), key=lambda kv: (-kv[1], str(kv[0]))))
+
+          def audit_version(version: str):
+              base = ROOT / 'tf' / version
+              types = parse_otype(base / 'otype.tf')
+              sign_lo, sign_hi = types['sign']
+              nslots = sign_hi - sign_lo + 1
+              assert sign_lo == 1
+              features = {}
+              for name in ('sign', 'usign', 'emen', 'cert', 'alt', 'cont'):
+                  p = base / f'{name}.tf'
+                  if p.exists():
+                      features[name] = expand_node_feature(p, sign_lo, nslots)
+              assert len(features['sign']) == nslots
+
+              sign_class = collections.Counter(classify_sign(v) for v in features['sign'])
+              usign_class = collections.Counter(classify_sign(v) for v in features.get('usign', []))
+              emen = collections.Counter(v or '<absent>' for v in features.get('emen', [None] * nslots))
+              cert = collections.Counter(v or '<absent>' for v in features.get('cert', [None] * nslots))
+              alt = collections.Counter(v or '<absent>' for v in features.get('alt', [None] * nslots))
+              cont = collections.Counter(v or '<absent>' for v in features.get('cont', [None] * nslots))
+
+              cross = collections.Counter()
+              for i in range(nslots):
+                  cross[(
+                      classify_sign(features['sign'][i]),
+                      features.get('emen', [None] * nslots)[i] or '<absent>',
+                      features.get('cert', [None] * nslots)[i] or '<absent>',
+                      features.get('alt', [None] * nslots)[i] or '<absent>',
+                      features.get('cont', [None] * nslots)[i] or '<absent>',
+                  )] += 1
+
+              whitespace = []
+              visible = []
+              for i, v in enumerate(features['sign'], start=1):
+                  cls = classify_sign(v)
+                  if cls in {'space_ascii', 'space_nbsp', 'whitespace_other', 'empty'}:
+                      whitespace.append(i)
+                  else:
+                      visible.append(i)
+
+              result = {
+                  'version': version,
+                  'otype': {k: list(v) for k, v in types.items()},
+                  'slot_count': nslots,
+                  'sign_class': counter_dict(sign_class),
+                  'usign_class': counter_dict(usign_class),
+                  'emen': counter_dict(emen),
+                  'cert': counter_dict(cert),
+                  'alt': counter_dict(alt),
+                  'cont': counter_dict(cont),
+                  'cross': [
+                      {'sign_class': k[0], 'emen': k[1], 'cert': k[2], 'alt': k[3], 'cont': k[4], 'count': v}
+                      for k, v in cross.most_common()
+                  ],
+              }
+
+              # Word and tablet analysis is only required for the primary version.
+              if version == VERSION:
+                  oslots = parse_oslots(base / 'oslots.tf', sign_hi + 1)
+                  word_lo, word_hi = types['word']
+                  tablet_lo, tablet_hi = types['tablet']
+                  g_cons = expand_node_feature(base / 'g_cons.tf')
+                  trailer = expand_node_feature(base / 'trailer.tf') if (base / 'trailer.tf').exists() else {}
+                  tablet_labels = expand_node_feature(base / 'tablet.tf')
+
+                  words = []
+                  word_classes = collections.Counter()
+                  mismatch_examples = []
+                  empty_examples = []
+                  for w in range(word_lo, word_hi + 1):
+                      slots = oslots.get(w, [])
+                      vals = [features['sign'][s - 1] for s in slots]
+                      classes = [classify_sign(v) for v in vals]
+                      visible_vals = [v for v, cls in zip(vals, classes) if cls == 'visible']
+                      visible_text = ''.join(visible_vals)
+                      gc = g_cons.get(w) or ''
+                      n_visible = sum(c == 'visible' for c in classes)
+                      n_ws = sum(c in {'space_ascii', 'space_nbsp', 'whitespace_other'} for c in classes)
+                      n_empty = sum(c == 'empty' for c in classes)
+
+                      if not gc:
+                          if n_visible == 0 and n_ws + n_empty > 0:
+                              cls = 'empty_g_cons_placeholder_only'
+                          elif n_visible > 0:
+                              cls = 'empty_g_cons_but_visible_signs'
+                          else:
+                              cls = 'empty_g_cons_zero_slots'
+                      else:
+                          if visible_text == gc:
+                              cls = 'nonempty_g_cons_matches_visible_signs'
+                          else:
+                              cls = 'nonempty_g_cons_mismatch_visible_signs'
+                      word_classes[cls] += 1
+
+                      emens = collections.Counter((features['emen'][s - 1] or '<absent>') for s in slots)
+                      if not gc and len(empty_examples) < 30:
+                          empty_examples.append({
+                              'word': w, 'slots': [slots[0], slots[-1]] if slots else [],
+                              'slot_count': len(slots), 'visible_count': n_visible,
+                              'whitespace_count': n_ws, 'empty_sign_count': n_empty,
+                              'emen': counter_dict(emens), 'trailer': trailer.get(w),
+                              'visible_text': visible_text,
+                          })
+                      if gc and visible_text != gc and len(mismatch_examples) < 30:
+                          mismatch_examples.append({
+                              'word': w, 'g_cons': gc, 'visible_text': visible_text,
+                              'slots': [slots[0], slots[-1]] if slots else [],
+                              'slot_count': len(slots),
+                              'emen': counter_dict(emens), 'trailer': trailer.get(w),
+                          })
+                      words.append((w, gc, visible_text, slots, n_visible, n_ws, n_empty))
+
+                  # More detailed classification of whitespace slots.
+                  whitespace_cross = collections.Counter()
+                  for s in whitespace:
+                      i = s - 1
+                      whitespace_cross[(
+                          classify_sign(features['sign'][i]),
+                          classify_sign(features['usign'][i]) if 'usign' in features else '<missing-feature>',
+                          features.get('emen', [None] * nslots)[i] or '<absent>',
+                          features.get('cert', [None] * nslots)[i] or '<absent>',
+                          features.get('alt', [None] * nslots)[i] or '<absent>',
+                      )] += 1
+
+                  # Tablet-level visibility and exact fingerprints.
+                  tablet_rows = []
+                  sig_groups = collections.defaultdict(list)
+                  word_sig_groups = collections.defaultdict(list)
+                  # Map word slots to tablet by containment; tablet spans are contiguous here.
+                  word_idx = 0
+                  for t in range(tablet_lo, tablet_hi + 1):
+                      tslots = oslots.get(t, [])
+                      tset = set(tslots)
+                      label = tablet_labels.get(t) or str(t)
+                      t_visible = ''.join(features['sign'][s - 1] or '' for s in tslots if classify_sign(features['sign'][s - 1]) == 'visible')
+                      t_words = []
+                      while word_idx < len(words) and words[word_idx][3] and words[word_idx][3][-1] < (tslots[0] if tslots else -1):
+                          word_idx += 1
+                      j = word_idx
+                      while j < len(words):
+                          w, gc, _, wslots, *_ = words[j]
+                          if not wslots or not tslots:
+                              j += 1
+                              continue
+                          if wslots[0] > tslots[-1]:
+                              break
+                          if wslots[0] >= tslots[0] and wslots[-1] <= tslots[-1]:
+                              t_words.append(gc)
+                          j += 1
+                      visible_words = [x for x in t_words if x]
+                      slot_sig = hashlib.sha256(t_visible.encode('utf-8')).hexdigest()
+                      word_sig = hashlib.sha256('\u241f'.join(visible_words).encode('utf-8')).hexdigest()
+                      sig_groups[slot_sig].append(label)
+                      word_sig_groups[word_sig].append(label)
+                      tablet_rows.append({
+                          'tablet': label,
+                          'slot_count': len(tslots),
+                          'visible_sign_count': sum(classify_sign(features['sign'][s - 1]) == 'visible' for s in tslots),
+                          'word_count': len(t_words),
+                          'nonempty_g_cons_word_count': len(visible_words),
+                      })
+
+                  result['word_classes'] = counter_dict(word_classes)
+                  result['empty_g_cons_examples'] = empty_examples
+                  result['g_cons_mismatch_examples'] = mismatch_examples
+                  result['whitespace_cross'] = [
+                      {'sign_class': k[0], 'usign_class': k[1], 'emen': k[2], 'cert': k[3], 'alt': k[4], 'count': v}
+                      for k, v in whitespace_cross.most_common()
+                  ]
+                  result['tablet_rows'] = tablet_rows
+                  result['tablets_zero_visible_signs'] = [r for r in tablet_rows if r['visible_sign_count'] == 0]
+                  result['tablets_zero_nonempty_words'] = [r for r in tablet_rows if r['nonempty_g_cons_word_count'] == 0]
+                  result['duplicate_visible_sign_fingerprints'] = [v for v in sig_groups.values() if len(v) > 1]
+                  result['duplicate_nonempty_word_fingerprints'] = [v for v in word_sig_groups.values() if len(v) > 1]
+
+              return result
+
+          current = audit_version(VERSION)
+          previous = audit_version(PREV_VERSION)
+
+          diff = {
+              'slot_count': current['slot_count'] - previous['slot_count'],
+              'sign_class': {
+                  k: current['sign_class'].get(k, 0) - previous['sign_class'].get(k, 0)
+                  for k in sorted(set(current['sign_class']) | set(previous['sign_class']))
+              },
+              'emen': {
+                  k: current['emen'].get(k, 0) - previous['emen'].get(k, 0)
+                  for k in sorted(set(current['emen']) | set(previous['emen']))
+              },
+          }
+
+          report = {'current': current, 'previous': previous, 'diff': diff}
+          (OUT / 'cuc-slot-audit.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def md_counter(title, d):
+              rows = [f'### {title}', '', '| Value | Count |', '| --- | ---: |']
+              rows += [f'| `{k}` | {v:,} |' for k, v in d.items()]
+              rows.append('')
+              return rows
+
+          md = [
+              '# CUC TF 0.2.8 slot audit', '',
+              'Generated from canonical `tf/0.2.8` on the checked-out review branch.', '',
+              f"Total sign slots: **{current['slot_count']:,}**", '',
+          ]
+          md += md_counter('`sign` value classes', current['sign_class'])
+          md += md_counter('`emen` values', current['emen'])
+          md += md_counter('`cert` values', current['cert'])
+          md += md_counter('`alt` values', current['alt'])
+          md += md_counter('Word consistency classes', current['word_classes'])
+          md += [
+              '## 0.2.7 → 0.2.8 aggregate change', '',
+              f"Total slot change: **{diff['slot_count']:+,}**", '',
+              '| Sign class | Change |', '| --- | ---: |',
+          ]
+          md += [f'| `{k}` | {v:+,} |' for k, v in diff['sign_class'].items()]
+          md += ['', '## Whitespace/empty slot combinations', '', '| sign | usign | emen | cert | alt | count |', '| --- | --- | --- | --- | --- | ---: |']
+          for row in current['whitespace_cross']:
+              md.append(f"| `{row['sign_class']}` | `{row['usign_class']}` | `{row['emen']}` | `{row['cert']}` | `{row['alt']}` | {row['count']:,} |")
+          md += ['', '## Tablet checks', '', f"Tablets with zero visible signs: **{len(current['tablets_zero_visible_signs'])}**", '', f"Tablets with zero non-empty `g_cons` words: **{len(current['tablets_zero_nonempty_words'])}**", '', f"Exact duplicate visible-sign fingerprints: **{len(current['duplicate_visible_sign_fingerprints'])} groups**", '', f"Exact duplicate non-empty-word fingerprints: **{len(current['duplicate_nonempty_word_fingerprints'])} groups**", '']
+          md += ['## Empty `g_cons` examples', '', '```json', json.dumps(current['empty_g_cons_examples'], ensure_ascii=False, indent=2), '```', '']
+          md += ['## `g_cons` vs visible-sign mismatch examples', '', '```json', json.dumps(current['g_cons_mismatch_examples'], ensure_ascii=False, indent=2), '```', '']
+          md += ['## Duplicate fingerprint groups', '', 'Visible signs:', '', '```json', json.dumps(current['duplicate_visible_sign_fingerprints'], ensure_ascii=False, indent=2), '```', '', 'Non-empty words:', '', '```json', json.dumps(current['duplicate_nonempty_word_fingerprints'], ensure_ascii=False, indent=2), '```', '']
+          (OUT / 'cuc-slot-audit.md').write_text('\n'.join(md), encoding='utf-8')
+          print('\n'.join(md[:120]))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuc-slot-audit
+          path: slot-audit/
+          if-no-files-found: error
