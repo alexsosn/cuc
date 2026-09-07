@@ -123,10 +123,11 @@ class ReviewedMorphologyRegressionFixtureTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
-        self.assertEqual(len(payload["file_results"]), 2)
+        self.assertEqual(payload["file_count"], 2)
+        self.assertEqual(len(payload["files"]), 2)
         self.assertEqual(payload["summary"]["compared_ids"], 7)
         self.assertEqual(
-            {result["label"] for result in payload["file_results"]},
+            {result["label"] for result in payload["files"]},
             {"KTU 1.6.tsv", "KTU 2.10.tsv"},
         )
         self.assertLess(len(completed.stdout.encode("utf-8")), 32_000)
