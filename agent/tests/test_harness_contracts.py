@@ -46,14 +46,20 @@ class HarnessContractTests(unittest.TestCase):
             operation_ids=operation_ids,
         )
 
-    def successful_test(self, change_id="change-1", intent_id="targeted", head="head-1"):
+    def successful_test(
+        self,
+        change_id="change-1",
+        intent_id="targeted",
+        head="head-1",
+        executed="merge-1",
+    ):
         c = self.contracts()
         return c.TestResult(
             intent_id=intent_id,
             change_id=change_id,
             outcome=c.GateOutcome.SUCCESS,
             head_sha=head,
-            executed_sha="merge-1",
+            executed_sha=executed,
             exit_code=0,
             passed_tests=1,
             failed_tests=0,
@@ -191,6 +197,45 @@ class HarnessContractTests(unittest.TestCase):
         )
         self.assertEqual(blocked.outcome, c.GateOutcome.BLOCKED_EXECUTION)
 
+    def test_test_result_requires_executed_assertion_evidence(self):
+        c = self.contracts()
+        with self.assertRaises(ValueError):
+            c.TestResult(
+                "i",
+                "c",
+                c.GateOutcome.SUCCESS,
+                "head",
+                "merge",
+                0,
+                0,
+                0,
+                "no tests executed",
+            )
+        with self.assertRaises(ValueError):
+            c.TestResult(
+                "i",
+                "c",
+                c.GateOutcome.TEST_FAILURE,
+                "head",
+                "merge",
+                2,
+                0,
+                0,
+                "collection aborted",
+            )
+        with self.assertRaises(ValueError):
+            c.TestResult(
+                "i",
+                "c",
+                c.GateOutcome.REGRESSION,
+                "head",
+                "merge",
+                1,
+                0,
+                0,
+                "no failing regression test",
+            )
+
     def test_review_contract_rejects_impossible_dispositions(self):
         c = self.contracts()
         with self.assertRaises(ValueError):
@@ -230,6 +275,21 @@ class HarnessContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             c.RunState(run_id="run", task=self.task(), changes=(first, second))
 
+    def test_run_state_rejects_malformed_phase_snapshots(self):
+        c = self.contracts()
+        with self.assertRaises(ValueError):
+            c.RunState(run_id="review-forgery", task=self.task(), phase=c.RunPhase.REVIEW)
+        with self.assertRaises(ValueError):
+            c.RunState(run_id="complete-forgery", task=self.task(), phase=c.RunPhase.COMPLETE)
+        with self.assertRaises(ValueError):
+            c.RunState(
+                run_id="blocked-forgery",
+                task=self.task(),
+                phase=c.RunPhase.BLOCKED,
+                resume_phase=c.RunPhase.VERIFY,
+                pause_reason="claims blocked verification without a change",
+            )
+
     def test_run_state_json_round_trip_is_lossless(self):
         c = self.contracts()
         finding = c.ReviewFinding(
@@ -238,7 +298,7 @@ class HarnessContractTests(unittest.TestCase):
         state = c.RunState(
             run_id="run-roundtrip",
             task=self.task(),
-            phase=c.RunPhase.REVIEW,
+            phase=c.RunPhase.COMPLETE,
             research=c.ResearchArtifact("research-1", "researched", ("repo:file",)),
             plan=c.PlanArtifact("plan-1", "planned", ("test", "implement")),
             test_intents=(self.intent(),),
@@ -396,6 +456,41 @@ class HarnessContractTests(unittest.TestCase):
         state = sm.apply_event(state, sm.VerificationPassed())
         self.assertEqual(state.phase, c.RunPhase.REVIEW)
         self.assertEqual(state.verified_head_sha, "head-1")
+
+    def test_verification_rejects_mixed_executed_revisions(self):
+        c = self.contracts()
+        sm = self.state_machine()
+        state = c.RunState(run_id="run", task=self.task())
+        state = sm.apply_event(
+            state, sm.ResearchRecorded(c.ResearchArtifact("r", "research complete"))
+        )
+        state = sm.apply_event(
+            state, sm.PlanRecorded(c.PlanArtifact("p", "plan", ("tests", "code")))
+        )
+        state = sm.apply_event(
+            state,
+            sm.TestsDeclared(
+                (
+                    self.intent("targeted"),
+                    self.intent("regression", c.TestKind.REGRESSION),
+                )
+            ),
+        )
+        state = sm.apply_event(state, sm.ChangeRecorded(self.change()))
+        state = sm.apply_event(
+            state,
+            sm.TestRecorded(
+                self.successful_test("change-1", "targeted", executed="merge-1")
+            ),
+        )
+        state = sm.apply_event(
+            state,
+            sm.TestRecorded(
+                self.successful_test("change-1", "regression", executed="merge-2")
+            ),
+        )
+        with self.assertRaises(sm.InvalidTransition):
+            sm.apply_event(state, sm.VerificationPassed())
 
     def test_stale_result_and_stale_review_are_rejected(self):
         c = self.contracts()
