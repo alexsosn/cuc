@@ -7,6 +7,24 @@
     "auto/KTU 1.6.tsv": "auto_parsing/0.2.8/KTU 1.6.tsv",
     "auto/KTU 2.10.tsv": "auto_parsing/0.2.8/KTU 2.10.tsv"
   },
+  "expected_summary": {
+    "compared_ids": 7,
+    "reviewed_option_count": 8,
+    "auto_option_count": 11,
+    "true_positive_option_count": 4,
+    "exact_set_accuracy": 0.42857142857142855,
+    "macro_precision": 0.5,
+    "macro_recall": 0.5714285714285714,
+    "macro_f1": 0.5238095238095238,
+    "macro_jaccard": 0.5,
+    "micro_precision": 0.36363636363636365,
+    "micro_recall": 0.5,
+    "micro_f1": 0.42105263157894735,
+    "gold_coverage": 0.5714285714285714,
+    "mean_extra_options": 1.0,
+    "mean_missing_options": 0.5714285714285714,
+    "mean_option_count_error": 0.42857142857142855
+  },
   "cases": [
     {
       "id": "176080",
