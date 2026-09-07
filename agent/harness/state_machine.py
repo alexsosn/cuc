@@ -80,7 +80,8 @@ class ResumeRequested:
 def _require_phase(state: RunState, expected: RunPhase, event_name: str) -> None:
     if state.phase is not expected:
         raise InvalidTransition(
-            f"{event_name} requires phase {expected.value}; current phase is {state.phase.value}"
+            f"{event_name} requires phase {expected.value}; "
+            f"current phase is {state.phase.value}"
         )
 
 
@@ -97,7 +98,12 @@ def _after_gate(state: RunState, outcome: GateOutcome, reason: str) -> RunState:
     if outcome is GateOutcome.SUCCESS:
         return state
     if outcome in {GateOutcome.TEST_FAILURE, GateOutcome.REGRESSION}:
-        return replace(state, phase=RunPhase.IMPLEMENT, verified_head_sha=None, review=None)
+        return replace(
+            state,
+            phase=RunPhase.IMPLEMENT,
+            verified_head_sha=None,
+            review=None,
+        )
     if outcome is GateOutcome.BLOCKED_EXECUTION:
         return _pause(state, RunPhase.BLOCKED, reason)
     if outcome is GateOutcome.HUMAN_ESCALATION:
@@ -134,15 +140,20 @@ def apply_event(state: RunState, event: object) -> RunState:
     if isinstance(event, ChangeRecorded):
         _require_phase(state, RunPhase.IMPLEMENT, "ChangeRecorded")
         prior_operations = {
-            operation_id for change in state.changes for operation_id in change.operation_ids
+            operation_id
+            for change in state.changes
+            for operation_id in change.operation_ids
         }
         reused = prior_operations.intersection(event.change.operation_ids)
         if reused:
             raise InvalidTransition(
-                "operation IDs cannot be reused after retry/resume: " + ", ".join(sorted(reused))
+                "operation IDs cannot be reused after retry/resume: "
+                + ", ".join(sorted(reused))
             )
         if any(change.change_id == event.change.change_id for change in state.changes):
-            raise InvalidTransition(f"change ID already recorded: {event.change.change_id}")
+            raise InvalidTransition(
+                f"change ID already recorded: {event.change.change_id}"
+            )
         return replace(
             state,
             changes=state.changes + (event.change,),
@@ -164,7 +175,10 @@ def apply_event(state: RunState, event: object) -> RunState:
         declared_ids = {intent.intent_id for intent in state.test_intents}
         if event.result.intent_id not in declared_ids:
             raise InvalidTransition(f"undeclared test intent: {event.result.intent_id}")
-        updated = replace(state, test_results=state.test_results + (event.result,))
+        updated = replace(
+            state,
+            test_results=state.test_results + (event.result,),
+        )
         return _after_gate(updated, event.result.outcome, event.result.summary)
 
     if isinstance(event, EvalRecorded):
@@ -177,7 +191,10 @@ def apply_event(state: RunState, event: object) -> RunState:
                 f"evaluation result is for stale/unknown change {event.result.change_id}; "
                 f"current change is {change.change_id}"
             )
-        updated = replace(state, eval_results=state.eval_results + (event.result,))
+        updated = replace(
+            state,
+            eval_results=state.eval_results + (event.result,),
+        )
         return _after_gate(updated, event.result.outcome, event.result.summary)
 
     if isinstance(event, VerificationPassed):
@@ -189,14 +206,22 @@ def apply_event(state: RunState, event: object) -> RunState:
             raise InvalidTransition("verification requires declared tests")
 
         current_tests = tuple(
-            result for result in state.test_results if result.change_id == change.change_id
+            result
+            for result in state.test_results
+            if result.change_id == change.change_id
         )
-        latest_tests = _latest_results_by_id(current_tests, lambda result: result.intent_id)
+        latest_tests = _latest_results_by_id(
+            current_tests, lambda result: result.intent_id
+        )
         missing = [
-            intent.intent_id for intent in state.test_intents if intent.intent_id not in latest_tests
+            intent.intent_id
+            for intent in state.test_intents
+            if intent.intent_id not in latest_tests
         ]
         if missing:
-            raise InvalidTransition("missing fresh test results: " + ", ".join(sorted(missing)))
+            raise InvalidTransition(
+                "missing fresh test results: " + ", ".join(sorted(missing))
+            )
         non_success = [
             intent_id
             for intent_id, result in latest_tests.items()
@@ -204,13 +229,18 @@ def apply_event(state: RunState, event: object) -> RunState:
         ]
         if non_success:
             raise InvalidTransition(
-                "latest test results are not successful: " + ", ".join(sorted(non_success))
+                "latest test results are not successful: "
+                + ", ".join(sorted(non_success))
             )
 
         current_evals = tuple(
-            result for result in state.eval_results if result.change_id == change.change_id
+            result
+            for result in state.eval_results
+            if result.change_id == change.change_id
         )
-        latest_evals = _latest_results_by_id(current_evals, lambda result: result.eval_id)
+        latest_evals = _latest_results_by_id(
+            current_evals, lambda result: result.eval_id
+        )
         failed_evals = [
             eval_id
             for eval_id, result in latest_evals.items()
@@ -218,14 +248,25 @@ def apply_event(state: RunState, event: object) -> RunState:
         ]
         if failed_evals:
             raise InvalidTransition(
-                "latest evaluation results are not successful: " + ", ".join(sorted(failed_evals))
+                "latest evaluation results are not successful: "
+                + ", ".join(sorted(failed_evals))
             )
 
-        head_shas = {result.head_sha for result in latest_tests.values()}
-        head_shas.update(result.head_sha for result in latest_evals.values())
+        evidence = tuple(latest_tests.values()) + tuple(latest_evals.values())
+        head_shas = {result.head_sha for result in evidence}
         head_shas.discard(None)
         if len(head_shas) != 1:
-            raise InvalidTransition("verification evidence must refer to one proposed head SHA")
+            raise InvalidTransition(
+                "verification evidence must refer to one proposed head SHA"
+            )
+
+        executed_shas = {result.executed_sha for result in evidence}
+        executed_shas.discard(None)
+        if len(executed_shas) != 1:
+            raise InvalidTransition(
+                "verification evidence must refer to one executed revision SHA"
+            )
+
         verified_head = next(iter(head_shas))
         return replace(
             state,
@@ -244,7 +285,11 @@ def apply_event(state: RunState, event: object) -> RunState:
                 f"verified revision is {state.verified_head_sha}"
             )
         if event.result.disposition is ReviewDisposition.APPROVE:
-            return replace(state, review=event.result, phase=RunPhase.COMPLETE)
+            return replace(
+                state,
+                review=event.result,
+                phase=RunPhase.COMPLETE,
+            )
         if event.result.disposition is ReviewDisposition.REQUEST_CHANGES:
             return replace(
                 state,
@@ -254,12 +299,20 @@ def apply_event(state: RunState, event: object) -> RunState:
             )
         if event.result.disposition is ReviewDisposition.ESCALATE:
             updated = replace(state, review=event.result)
-            return _pause(updated, RunPhase.AWAITING_HUMAN, event.result.summary)
-        raise InvalidTransition(f"unsupported review disposition: {event.result.disposition}")
+            return _pause(
+                updated,
+                RunPhase.AWAITING_HUMAN,
+                event.result.summary,
+            )
+        raise InvalidTransition(
+            f"unsupported review disposition: {event.result.disposition}"
+        )
 
     if isinstance(event, ResumeRequested):
         if state.phase not in {RunPhase.BLOCKED, RunPhase.AWAITING_HUMAN}:
-            raise InvalidTransition("ResumeRequested requires blocked or awaiting-human state")
+            raise InvalidTransition(
+                "ResumeRequested requires blocked or awaiting-human state"
+            )
         if state.resume_phase is None:
             raise InvalidTransition("exceptional state has no resume phase")
         return replace(
