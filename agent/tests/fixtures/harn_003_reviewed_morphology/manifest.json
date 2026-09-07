@@ -1,0 +1,61 @@
+{
+  "name": "HARN-003 reviewed morphology regression fixture",
+  "description": "Small deliberately non-trivial source-derived fixture for the authoritative reviewed morphology scorer.",
+  "sources": {
+    "reviewed/KTU 1.6.tsv": "reviewed/KTU 1.6.tsv",
+    "reviewed/KTU 2.10.tsv": "reviewed/KTU 2.10.tsv",
+    "auto/KTU 1.6.tsv": "auto_parsing/0.2.8/KTU 1.6.tsv",
+    "auto/KTU 2.10.tsv": "auto_parsing/0.2.8/KTU 2.10.tsv"
+  },
+  "cases": [
+    {
+      "id": "176080",
+      "tablet": "KTU 2.10",
+      "surface": "tḥm",
+      "roles": ["unambiguous"],
+      "rationale": "Single reviewed analysis and exact automatic baseline case."
+    },
+    {
+      "id": "176084",
+      "tablet": "KTU 2.10",
+      "surface": "rgm",
+      "roles": ["overgeneration"],
+      "rationale": "Reviewed imperative versus several automatic morphology options in the letter-opening formula."
+    },
+    {
+      "id": "176085",
+      "tablet": "KTU 2.10",
+      "surface": "yšlmlk",
+      "roles": ["dulat-not-found"],
+      "rationale": "Automatic output remains explicitly unresolved while reviewed evidence supplies a segmented analysis."
+    },
+    {
+      "id": "176096",
+      "tablet": "KTU 2.10",
+      "surface": "inmm",
+      "roles": ["genuine-ambiguity"],
+      "rationale": "Reviewed gold deliberately preserves two defensible analyses."
+    },
+    {
+      "id": "176102",
+      "tablet": "KTU 2.10",
+      "surface": "yd",
+      "roles": ["overgeneration"],
+      "rationale": "Reviewed contextual sense selects yd (I) while automatic output retains yd (I) and yd (II)."
+    },
+    {
+      "id": "159322",
+      "tablet": "KTU 1.6",
+      "surface": "aliyn",
+      "roles": ["ordered-heuristic"],
+      "rationale": "First token of the active aliyn bˤl formula-context bigram."
+    },
+    {
+      "id": "159323",
+      "tablet": "KTU 1.6",
+      "surface": "bˤl",
+      "roles": ["ordered-heuristic"],
+      "rationale": "Second token of the active aliyn bˤl formula-context bigram."
+    }
+  ]
+}
