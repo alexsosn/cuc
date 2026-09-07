@@ -23,14 +23,25 @@ class InvalidTransition(ValueError):
     """Raised when an event is inconsistent with the current durable state."""
 
 
+def _require_contract(value: object, contract_type: type, field_name: str) -> None:
+    if not isinstance(value, contract_type):
+        raise ValueError(f"{field_name} must be {contract_type.__name__}")
+
+
 @dataclass(frozen=True)
 class ResearchRecorded:
     artifact: ResearchArtifact
+
+    def __post_init__(self) -> None:
+        _require_contract(self.artifact, ResearchArtifact, "artifact")
 
 
 @dataclass(frozen=True)
 class PlanRecorded:
     artifact: PlanArtifact
+
+    def __post_init__(self) -> None:
+        _require_contract(self.artifact, PlanArtifact, "artifact")
 
 
 @dataclass(frozen=True)
@@ -38,9 +49,14 @@ class TestsDeclared:
     intents: tuple[TestIntent, ...]
 
     def __post_init__(self) -> None:
-        intents = tuple(self.intents)
+        try:
+            intents = tuple(self.intents)
+        except TypeError as exc:
+            raise ValueError("intents must be an iterable of TestIntent") from exc
         if not intents:
             raise ValueError("at least one test intent is required")
+        if any(not isinstance(intent, TestIntent) for intent in intents):
+            raise ValueError("intents must contain only TestIntent")
         ids = [intent.intent_id for intent in intents]
         if len(ids) != len(set(ids)):
             raise ValueError("test intent IDs must be unique")
@@ -51,15 +67,24 @@ class TestsDeclared:
 class ChangeRecorded:
     change: ChangeSet
 
+    def __post_init__(self) -> None:
+        _require_contract(self.change, ChangeSet, "change")
+
 
 @dataclass(frozen=True)
 class TestRecorded:
     result: TestResult
 
+    def __post_init__(self) -> None:
+        _require_contract(self.result, TestResult, "result")
+
 
 @dataclass(frozen=True)
 class EvalRecorded:
     result: EvalResult
+
+    def __post_init__(self) -> None:
+        _require_contract(self.result, EvalResult, "result")
 
 
 @dataclass(frozen=True)
@@ -70,6 +95,9 @@ class VerificationPassed:
 @dataclass(frozen=True)
 class ReviewRecorded:
     result: ReviewResult
+
+    def __post_init__(self) -> None:
+        _require_contract(self.result, ReviewResult, "result")
 
 
 @dataclass(frozen=True)
@@ -120,6 +148,9 @@ def _latest_results_by_id(results, key):
 
 def apply_event(state: RunState, event: object) -> RunState:
     """Apply one validated event without performing external side effects."""
+
+    if not isinstance(state, RunState):
+        raise InvalidTransition("state must be RunState")
 
     if isinstance(event, ResearchRecorded):
         _require_phase(state, RunPhase.RESEARCH, "ResearchRecorded")
