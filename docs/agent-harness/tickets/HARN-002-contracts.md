@@ -118,11 +118,12 @@ Required public contracts:
 
 ## TDD plan
 
-1. Commit contract/state-machine tests while `agent/harness` does not exist; CI must fail by import/collection on the exact test module. This is valid TDD RED for a new module, distinct from infrastructure bootstrap failure because the authoritative suite itself executes normally.
-2. Implement the smallest standard-library contracts satisfying schema/serialization tests.
-3. Implement pure transition reducer and retry/resume validation.
-4. Run the full HARN-011 agent suite on a fork-only PR and repair any regression without narrowing discovery.
-5. Perform a logically independent adversarial review focused on replay/resume, malformed partial state, duplicate side-effect identity, stale execution identity, and illegal transition bypasses.
+1. Commit contract/state-machine tests while `agent/harness` does not exist. Tests dynamically import the not-yet-existing package and turn absence into an ordinary assertion failure so pytest collection remains healthy. HARN-011 defines collection/import abort as `blocked-execution`; that must **not** be used as TDD RED evidence.
+2. Observe the explicit assertion failure on the exact head/run and classify it as `test-failure`.
+3. Implement the smallest standard-library contracts satisfying schema/serialization tests.
+4. Implement pure transition reducer and retry/resume validation.
+5. Run the full HARN-011 agent suite on a fork-only PR and repair any regression without narrowing discovery.
+6. Perform a logically independent adversarial review focused on replay/resume, malformed partial state, duplicate side-effect identity, stale execution identity, and illegal transition bypasses.
 
 ## Deferred deliberately
 
