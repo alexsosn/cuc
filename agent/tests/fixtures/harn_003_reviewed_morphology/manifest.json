@@ -7,6 +7,12 @@
     "auto/KTU 1.6.tsv": "auto_parsing/0.2.8/KTU 1.6.tsv",
     "auto/KTU 2.10.tsv": "auto_parsing/0.2.8/KTU 2.10.tsv"
   },
+  "source_blobs": {
+    "reviewed/KTU 1.6.tsv": "55eb913014733791796f9554a932034d4e5c90bd",
+    "reviewed/KTU 2.10.tsv": "81a53d2b459ff0c23b53f52783ff681718195c6c",
+    "auto/KTU 1.6.tsv": "b237f7a8ce456fa6a715ec3cdc0aefd3ade3444a",
+    "auto/KTU 2.10.tsv": "3bde3359d2500e77f2cf8aa6867efc44985ba729"
+  },
   "expected_summary": {
     "compared_ids": 7,
     "reviewed_option_count": 8,
