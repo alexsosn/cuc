@@ -92,6 +92,8 @@ class SkillCapabilityContractTest(unittest.TestCase):
         )
         self.assertIn("dulat", manifest.required_evidence)
         self.assertIn("tropper", manifest.required_evidence)
+        self.assertIn("burns-cultic-vocabulary", manifest.required_evidence)
+        self.assertEqual(manifest.optional_evidence, ())
         self.assertIn(
             "agent/prompts/Morphological_Labeling_Agent_Guide.md",
             manifest.authoritative_resources,
@@ -164,7 +166,7 @@ class SkillCapabilityContractTest(unittest.TestCase):
         with self.assertRaises(api.UnmanagedSkillError):
             registry.get("parse-ugaritic-passive-participle")
 
-    def test_provenance_hashes_manifest_skill_and_declared_resources(self) -> None:
+    def test_provenance_hashes_manifest_skill_package_and_declared_resources(self) -> None:
         registry = self.registry()
         provenance = registry.provenance("review-automatic-parsing")
         manifest = registry.get("review-automatic-parsing")
@@ -172,6 +174,7 @@ class SkillCapabilityContractTest(unittest.TestCase):
         self.assertEqual(provenance.canonical_name, manifest.canonical_name)
         self.assertEqual(provenance.contract_version, manifest.contract_version)
         self.assertRegex(provenance.manifest_sha256, r"^[0-9a-f]{64}$")
+        self.assertRegex(provenance.skill_package_sha256, r"^[0-9a-f]{64}$")
         digests = {item.path: item.sha256 for item in provenance.resources}
         expected_paths = {
             f"{manifest.skill_path}/SKILL.md",
@@ -185,7 +188,7 @@ class SkillCapabilityContractTest(unittest.TestCase):
             registry.provenance("review-automatic-parsing"),
         )
 
-    def test_provenance_detects_declared_resource_drift_without_git(self) -> None:
+    def test_provenance_detects_declared_and_undeclared_package_drift_without_git(self) -> None:
         api = self.api()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -198,6 +201,7 @@ class SkillCapabilityContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (skill_dir / "reference.md").write_text("first\n", encoding="utf-8")
+            (skill_dir / "unlisted-helper.py").write_text("VALUE = 1\n", encoding="utf-8")
             payload = {
                 "schema_version": 1,
                 "contract_version": "1.0.0",
@@ -227,9 +231,19 @@ class SkillCapabilityContractTest(unittest.TestCase):
 
             registry = api.SkillCapabilityRegistry(root)
             first = registry.provenance("example-skill")
+
             (skill_dir / "reference.md").write_text("second\n", encoding="utf-8")
-            second = registry.provenance("example-skill")
-            self.assertNotEqual(first, second)
+            declared_changed = registry.provenance("example-skill")
+            self.assertNotEqual(first, declared_changed)
+
+            (skill_dir / "reference.md").write_text("first\n", encoding="utf-8")
+            (skill_dir / "unlisted-helper.py").write_text("VALUE = 2\n", encoding="utf-8")
+            package_changed = registry.provenance("example-skill")
+            self.assertNotEqual(first, package_changed)
+            self.assertNotEqual(
+                first.skill_package_sha256,
+                package_changed.skill_package_sha256,
+            )
 
 
 if __name__ == "__main__":
