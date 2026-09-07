@@ -3,12 +3,6 @@ name: Agent tests
 on:
   pull_request:
     branches: ["agent-harness-safety"]
-    paths:
-      - "agent/**"
-      - ".agents/**"
-      - ".claude/**"
-      - "docs/agent-harness/**"
-      - ".github/workflows/agent-tests.yml"
   workflow_dispatch:
 
 permissions:
