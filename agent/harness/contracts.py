@@ -60,7 +60,12 @@ def _optional_text(value: str | None, field_name: str) -> str | None:
     return _required_text(value, field_name)
 
 
-def _text_tuple(values: tuple[str, ...] | list[str], field_name: str, *, required: bool = False) -> tuple[str, ...]:
+def _text_tuple(
+    values: tuple[str, ...] | list[str],
+    field_name: str,
+    *,
+    required: bool = False,
+) -> tuple[str, ...]:
     normalized = tuple(_required_text(value, field_name) for value in values)
     if required and not normalized:
         raise ValueError(f"{field_name} must not be empty")
@@ -344,6 +349,7 @@ class EvalResult:
             normalized_metrics.append((normalized_name, value))
         if len(metric_names) != len(set(metric_names)):
             raise ValueError("metric names must be unique")
+        normalized_metrics.sort(key=lambda item: item[0])
 
         object.__setattr__(self, "eval_id", _required_text(self.eval_id, "eval_id"))
         object.__setattr__(self, "change_id", _required_text(self.change_id, "change_id"))
@@ -392,7 +398,11 @@ class ChangeSet:
     def __post_init__(self) -> None:
         object.__setattr__(self, "change_id", _required_text(self.change_id, "change_id"))
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
-        object.__setattr__(self, "changed_paths", _text_tuple(self.changed_paths, "changed_paths", required=True))
+        object.__setattr__(
+            self,
+            "changed_paths",
+            _text_tuple(self.changed_paths, "changed_paths", required=True),
+        )
         operations = _text_tuple(self.operation_ids, "operation_ids")
         if len(operations) != len(set(operations)):
             raise ValueError("operation_ids must be unique within a change")
@@ -508,7 +518,9 @@ class ReviewResult:
             inspected_sha=payload["inspected_sha"],
             disposition=ReviewDisposition(payload["disposition"]),
             summary=payload["summary"],
-            findings=tuple(ReviewFinding.from_dict(item) for item in payload.get("findings", ())),
+            findings=tuple(
+                ReviewFinding.from_dict(item) for item in payload.get("findings", ())
+            ),
         )
 
 
@@ -530,7 +542,11 @@ class RunState:
 
     def __post_init__(self) -> None:
         phase = _enum(self.phase, RunPhase, "phase")
-        resume_phase = None if self.resume_phase is None else _enum(self.resume_phase, RunPhase, "resume_phase")
+        resume_phase = (
+            None
+            if self.resume_phase is None
+            else _enum(self.resume_phase, RunPhase, "resume_phase")
+        )
         pause_reason = _optional_text(self.pause_reason, "pause_reason")
         verified_head_sha = _optional_text(self.verified_head_sha, "verified_head_sha")
 
@@ -551,8 +567,14 @@ class RunState:
 
         exceptional = {RunPhase.BLOCKED, RunPhase.AWAITING_HUMAN}
         if phase in exceptional:
-            if resume_phase is None or resume_phase in exceptional or resume_phase is RunPhase.COMPLETE:
-                raise ValueError("exceptional phase requires a resumable non-exceptional resume_phase")
+            if (
+                resume_phase is None
+                or resume_phase in exceptional
+                or resume_phase is RunPhase.COMPLETE
+            ):
+                raise ValueError(
+                    "exceptional phase requires a resumable non-exceptional resume_phase"
+                )
             if pause_reason is None:
                 raise ValueError("exceptional phase requires pause_reason")
         elif resume_phase is not None or pause_reason is not None:
@@ -601,10 +623,18 @@ class RunState:
             phase=RunPhase(payload.get("phase", RunPhase.RESEARCH.value)),
             research=ResearchArtifact.from_dict(research) if research else None,
             plan=PlanArtifact.from_dict(plan) if plan else None,
-            test_intents=tuple(TestIntent.from_dict(item) for item in payload.get("test_intents", ())),
-            changes=tuple(ChangeSet.from_dict(item) for item in payload.get("changes", ())),
-            test_results=tuple(TestResult.from_dict(item) for item in payload.get("test_results", ())),
-            eval_results=tuple(EvalResult.from_dict(item) for item in payload.get("eval_results", ())),
+            test_intents=tuple(
+                TestIntent.from_dict(item) for item in payload.get("test_intents", ())
+            ),
+            changes=tuple(
+                ChangeSet.from_dict(item) for item in payload.get("changes", ())
+            ),
+            test_results=tuple(
+                TestResult.from_dict(item) for item in payload.get("test_results", ())
+            ),
+            eval_results=tuple(
+                EvalResult.from_dict(item) for item in payload.get("eval_results", ())
+            ),
             review=ReviewResult.from_dict(review) if review else None,
             resume_phase=RunPhase(resume_phase) if resume_phase else None,
             pause_reason=payload.get("pause_reason"),
