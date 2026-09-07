@@ -128,6 +128,57 @@ class HarnessContractTypeSafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             c.ChangeSet("change", "summary", "agent/harness/contracts.py")
 
+    def test_deserialization_cannot_turn_scalar_strings_into_tuples(self):
+        malformed = (
+            lambda: c.TaskSpec.from_dict(
+                {
+                    "task_id": "task",
+                    "title": "title",
+                    "objective": "objective",
+                    "acceptance_criteria": "criterion",
+                }
+            ),
+            lambda: c.PlanArtifact.from_dict(
+                {
+                    "plan_id": "plan",
+                    "summary": "summary",
+                    "steps": "step",
+                }
+            ),
+            lambda: c.TestIntent.from_dict(
+                {
+                    "intent_id": "intent",
+                    "kind": c.TestKind.TARGETED.value,
+                    "command": "pytest",
+                    "working_directory": "agent",
+                    "description": "scalar command",
+                }
+            ),
+            lambda: c.ChangeSet.from_dict(
+                {
+                    "change_id": "change",
+                    "summary": "summary",
+                    "changed_paths": "agent/harness/contracts.py",
+                }
+            ),
+        )
+        for load in malformed:
+            with self.subTest(loader=load):
+                with self.assertRaises(ValueError):
+                    load()
+
+    def test_implement_checkpoint_with_change_requires_retry_cause(self):
+        with self.assertRaises(ValueError):
+            c.RunState(
+                run_id="skipped-verification",
+                task=self.task(),
+                phase=c.RunPhase.IMPLEMENT,
+                research=self.research(),
+                plan=self.plan(),
+                test_intents=(self.intent(),),
+                changes=(self.change(),),
+            )
+
     def test_transition_events_reject_wrong_contract_payloads(self):
         malformed = (
             lambda: sm.ResearchRecorded({}),
