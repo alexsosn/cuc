@@ -61,6 +61,8 @@ def _optional_text(value: object, field_name: str) -> str | None:
 
 
 def _text_tuple(values: object, field_name: str, *, required: bool = False) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{field_name} must be an iterable of strings, not a scalar string")
     try:
         raw = tuple(values)  # type: ignore[arg-type]
     except TypeError as exc:
