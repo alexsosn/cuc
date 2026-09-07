@@ -1,174 +1,357 @@
 # Preliminary Research: Agent Harness for CUC
 
-Status: seed research, not an implementation decision.
+Status: architecture corrected by HARN-014; still preliminary until the LangGraph/Deep Agents spikes are measured.
 
-## Problem
+## Primary objective
 
-CUC already contains a substantial deterministic morphological parsing pipeline, domain-specific audit/parse skills, reviewed gold data, linting, and morphology agreement metrics. The missing piece is a coherent agent harness that can orchestrate research, planning, TDD, implementation, regression evaluation, and logically independent adversarial review without replacing the deterministic parser or using GitHub CI as the inner development loop.
+The system exists to produce and improve a **morphologically parsed CUC** while keeping the automatic parser reproducible and the scholarly/agentic review process auditable.
 
-The target development environment is the isolated fork `alexsosn/cuc`; upstream `DT-UCPH/cuc` remains read-only until explicit human authorization for final submission.
+Deliverable priority:
+
+1. morphologically parsed CUC;
+2. reproducible automatic parsing;
+3. agentic parsing tools and harness;
+4. evaluation + expert-feedback infrastructure;
+5. autonomous development loop supporting the above.
+
+The harness and development automation are infrastructure around the corpus, not the research deliverable themselves.
+
+## Two different loops
+
+The architecture must keep two workflows separate.
+
+### 1. Agentic parsing harness
+
+This formalizes the workflow that already exists in the current skills and prompts.
+
+The authoritative semantics are defined primarily by `.agents/skills/review-automatic-parsing/SKILL.md` plus the morphology/tagging guides it references:
+
+- **one complete column is the working/context unit**;
+- **every token is reviewed in order**;
+- the whole column remains available as context while each token is adjudicated;
+- worklists, lints, alignments and audits identify useful evidence but **never decide which tokens are processed**;
+- evidence is collected from DULAT, Tropper, EUPT, translations, legacy review, corpus parallels, conventions and specialist audit skills as required;
+- repeated/formulaic parallels are reconciled within the column and against the corpus;
+- defensible ambiguity is preserved as alternatives rather than collapsed for convenience;
+- completion is explicit: reviewing only flagged rows does not complete a column;
+- `reviewed/**` is curated scholarly gold;
+- `auto_parsing/**` is generated and must never be hand-edited.
+
+A conceptual runtime is therefore:
+
+```text
+load complete column
+    -> establish worklist/evidence indexes
+    -> token 1: inspect -> gather evidence -> adjudicate -> record provenance
+    -> token 2: inspect -> gather evidence -> adjudicate -> record provenance
+    -> ...
+    -> token N
+    -> column reconciliation
+    -> status/lint/reconstruction checks
+    -> corpus-parallel reconciliation where required
+    -> persist reviewed result / completion record
+```
+
+This is **not** an anomaly-detection loop. Every token is part of the job.
+
+### 2. Autonomous development controller
+
+The research -> plan -> TDD -> implementation -> tests/evals -> logically independent adversarial review lifecycle applies to **development issues**.
+
+It consumes GitHub issues such as:
+
+- parser/config defects or missing productive rules;
+- linter defects;
+- skill/procedure failures;
+- repeated evidence procedures that should become deterministic tools;
+- harness/runtime defects;
+- eval/benchmark defects;
+- performance/stability/ergonomics/documentation/edge-case work when feature tickets are exhausted or blocked.
+
+Its conceptual flow remains:
+
+```text
+GitHub issue
+  -> research
+  -> plan
+  -> write tests / RED
+  -> implement
+  -> targeted + full tests
+  -> regression/eval gates
+  -> clean-context independent adversarial review
+       reject -> revise -> tests/evals -> review
+       approve -> finalize/merge
+```
+
+Parsing findings may create development issues when they are systematic/generalizable, but the parsing runtime itself is not a TDD graph.
 
 ## Current CUC assets to preserve
 
-- Deterministic parsing pipeline under `agent/pipeline/` and `agent/scripts/`.
-- DULAT lookups, context reranking, provenance and attestation signals.
-- Ordered linguistic heuristics and safeguards.
-- `.agents/skills/*` packages with domain instructions, references, scripts, and some agent metadata.
-- `reviewed/**` as curated gold data.
-- `auto_parsing/**` as generated data that must never be hand-edited.
-- `scripts/score_reviewed_morphology.py` and its per-token / aggregate agreement metrics.
-- Lint and step-change safeguards.
-- Fork-safety policy and repository-safety regression test.
+- deterministic parsing pipeline under `agent/pipeline/` and supporting scripts;
+- DULAT lookups, context reranking, provenance and attestation signals;
+- ordered linguistic heuristics and safeguards;
+- `.agents/skills/*` as existing operational workflow specifications, not merely prompt fragments;
+- `agent/prompts/**` and tagging conventions as authoritative morphology/notation knowledge where skills defer to them;
+- `reviewed/**` as curated gold data;
+- `auto_parsing/**` as generated data that must never be hand-edited;
+- `scripts/score_reviewed_morphology.py` and its token/aggregate agreement metrics;
+- lint, reconstruction and step-change safeguards;
+- fork-safety policy and repository-safety regression tests.
 
 ## Candidate stack
 
 ### LangGraph: orchestration runtime
 
-LangGraph is the strongest fit for the outer workflow because CUC needs a mixed deterministic + agentic process rather than a single model/tool loop. Relevant capabilities are checkpointed state, resumable execution, explicit branching, human-in-the-loop interrupts, fault tolerance, and parallelizable tasks.
+LangGraph remains the strongest candidate for durable orchestration because both long column-review runs and the development controller require checkpointed state, resumable execution, explicit branching, human interrupts, and inspectable transitions.
 
-A plausible state machine is:
+However, there should be **separate graphs/state machines** for parsing and development.
 
-```
-research
-  -> plan
-  -> write_tests
-  -> implement
-  -> run_targeted_tests
-       fail -> revise -> run_targeted_tests
-       pass -> run_regression_eval
-                  fail -> revise
-                  pass -> independent_review
-                             reject -> revise
-                             approve -> finalize
-```
+Parsing graph responsibilities:
 
-The graph state should store structured artifacts rather than an opaque chat transcript: task specification, research findings, plan, test intent, changed files, test results, regression metrics, reviewer findings, unresolved risks, iteration number, and final disposition.
+- complete-column task state;
+- stable token cursor and resume semantics;
+- evidence/provenance records;
+- per-token decisions and preserved alternatives;
+- column completion gates;
+- corpus reconciliation findings;
+- model/skill/tool/run provenance.
 
-The LangGraph Functional API deserves an early spike because it can add checkpointing and interrupts around existing Python control flow with less restructuring than a full graph rewrite. A Graph API implementation may still be preferable once state transitions stabilize.
+Development graph responsibilities:
 
-### LangChain: optional inside nodes
+- issue/task specification;
+- research and plan artifacts;
+- test intents/results;
+- change set and executed revision identity;
+- regression/eval results;
+- independent review findings;
+- bounded retries and GitHub side-effect gates.
 
-LangChain should not be a prerequisite for the deterministic parser. It is useful where a node genuinely needs a model/tool loop: research, investigation, change proposal, or review. The harness should keep the LLM-facing layer replaceable and avoid leaking LangChain message/tool types into the CUC domain layer.
+The LangGraph Functional API deserves an early comparison with the Graph API, but only after the real skill-derived parsing state is specified. HARN-004 must not invent runtime semantics to make a framework spike convenient.
+
+### LangChain: optional inside model/tool nodes
+
+LangChain should remain optional. It is useful only where a node genuinely needs a model/tool interaction loop. Deterministic parser, linter, scorer, reconstruction and corpus-index logic must remain ordinary CUC code.
+
+No LangChain message/tool types should leak into domain or persisted corpus contracts.
 
 ### Deep Agents: benchmark, not default dependency
 
-Deep Agents already provides planning, subagents, filesystem/context management, permissions, skills, and human approval on top of LangGraph. Before building these pieces ourselves, we should implement the same narrow CUC spike both with minimal LangGraph primitives and with Deep Agents (or otherwise inspect a representative implementation) and compare control, complexity, testability, context isolation, permissions, and dependency cost.
+Deep Agents should be evaluated against the **same real column-review vertical slice**, not against an artificial research-plan-TDD parser graph. Compare planning/subagents, context isolation, skills, permissions, checkpointing, testability, observability and dependency/control cost.
 
-The likely outcome is hybrid: explicit LangGraph for the deterministic research-plan-test-review lifecycle, with selected Deep Agents ideas or components for context isolation/subagents if they are demonstrably useful. This remains a hypothesis until the spike.
+### Langfuse: observability/evaluation plane
 
-### Langfuse: observability and evaluation layer
+Langfuse remains a sidecar rather than the runtime.
 
-Langfuse is a good fit as a sidecar rather than the runtime. It can trace model calls/tool invocations, attach metadata and scores, manage datasets, and run/compare offline experiments. It should not own CUC's execution semantics.
+It should trace both categories of run without conflating them:
 
-CUC has a natural evaluation bridge already: reviewed token analyses are gold data and `score_reviewed_morphology.py` emits exact-set accuracy, precision/recall/F1/Jaccard, coverage, ambiguity error, and per-token details. Those metrics should remain authoritative deterministic evaluators; Langfuse can ingest or visualize them rather than reimplement them.
+**Parsing run metadata**
+- corpus/tablet/column;
+- exact input/repository revision;
+- model/provider/version;
+- skill/prompt/tool versions;
+- token cursor / tool calls / evidence calls;
+- completion state;
+- deterministic eval scores;
+- expert feedback references.
 
-Initial Langfuse integration should be optional and fail-open for ordinary parser operation: missing Langfuse credentials or an unavailable Langfuse service must not prevent deterministic parsing/tests. Secrets must never be committed.
+**Development run metadata**
+- GitHub ticket;
+- branch/base/head/executed revision;
+- dev-loop phase/iteration;
+- test/eval gates;
+- reviewer context/result;
+- final disposition.
 
-## Proposed architecture boundary
+Langfuse availability must never be required for parser/test correctness. Existing CUC deterministic scores stay authoritative; Langfuse stores/compares them rather than reimplementing them.
 
+## Corrected architecture boundary
+
+```text
+CUC/TF + evidence sources
+          |
+          v
+reproducible deterministic automatic parser
+  parser / rules / linter / scorer / reconstruction / provenance
+          |
+          v
+agentic parsing harness
+  existing skills + prompts are source of truth
+  complete column -> every token in order -> reconciliation -> completion
+          |
+          +--------------------------+
+          |                          |
+          v                          v
+morphologically parsed CUC      evals + expert feedback
+                                     |
+                            systematic finding
+                                     |
+                                     v
+                               GitHub issue
+                                     |
+                                     v
+autonomous development controller
+  research -> plan -> TDD -> implement -> tests/evals -> independent review
+                                     |
+                                     v
+                  parser / linter / tool / skill / harness improvements
+                                     |
+                                     +------> back into parsing system
+
+Langfuse/experiment plane spans parsing runs, evals, feedback and development runs.
 ```
-CUC domain
-  deterministic parser / scorer / linter / data invariants
-          |
-          v
-Harness adapters
-  ParserRun, TestResult, EvalResult, Skill, Tool, ReviewFinding
-          |
-          v
-LangGraph orchestration
-  research -> plan -> TDD -> implement -> evaluate -> review -> finalize
-          |
-          +---- model/tool nodes (LangChain only where useful)
-          |
-          +---- optional Deep Agents spike/components
-          |
-          v
-Langfuse
-  traces / spans / datasets / experiments / scores
-```
 
-The key dependency rule is inward: CUC domain code must not depend on LangGraph/LangChain/Langfuse types. Harness code adapts existing CUC functions/scripts into structured interfaces.
+The dependency rule remains inward: CUC domain code and corpus contracts must not depend on LangGraph/LangChain/Langfuse types.
 
-## Independent adversarial review requirement
+## Skill-first design rule
 
-"Independent review" must mean more than a second prompt in the same accumulated context. The reviewer should receive a clean context containing only the task/specification, relevant repository state/diff, tests and outputs, and explicit review criteria. It should not receive the implementer's hidden rationale or proposed self-justification by default.
+HARN-008 is now architectural, not cosmetic. Before wiring parsing into LangGraph, extract the actual contracts already encoded in skills:
 
-Review output should be structured, for example:
+- working unit/context scope;
+- ordered steps;
+- required evidence sources;
+- optional/specialist evidence routes;
+- executable helpers/tools;
+- mutation class;
+- completion criteria;
+- escalation rules;
+- authoritative prompt/reference dependencies;
+- provenance/version identity.
 
-- disposition: approve / reject / needs-human
-- findings: severity, file/location, claim, evidence, suggested verification
-- tests_missing
-- invariant_risks
-- regression_risks
+`SKILL.md` should remain the human-readable source where possible. Machine metadata should formalize invocation/state/permissions, not duplicate or silently rewrite scholarly procedure.
 
-For high-risk changes, two independent review passes may be useful: implementation correctness and domain/data-integrity review.
+## Parsing state seed
 
-## TDD and evaluation gates
+HARN-018 should define framework-neutral contracts such as:
 
-Every implementation ticket should define tests before implementation. The harness must distinguish:
+- `ColumnTask`
+- `ColumnSnapshot`
+- `TokenCursor`
+- `TokenDecision`
+- `EvidenceRecord`
+- `ColumnRunState`
+- `ColumnCompletion`
+- `CorpusReconciliationFinding`
 
-1. unit/contract tests for new code;
-2. targeted parsing fixtures reproducing the motivating bug/feature;
-3. repository safety/data invariants;
-4. lint/step-change safeguards;
-5. reviewed-morphology regression metrics.
+Critical invariants:
 
-A generic "pytest passed" signal is insufficient. The graph should carry typed gate results and explicit acceptance thresholds.
+- no completed column with an unvisited token;
+- traversal order and revisits are explicit/auditable;
+- full column remains part of the context snapshot;
+- evidence and alternatives survive checkpoint/replay;
+- resume cannot silently skip a token;
+- worklists may prioritize evidence but may not narrow scope;
+- generated `auto_parsing/**` cannot be mutated ad hoc.
 
-## Checkpointing and side effects
+## Evaluation strategy
 
-Checkpointing is useful for long agent runs, but side effects require idempotency. Any task that writes files, commits, creates branches, or calls an external service must be isolated and have a deterministic operation identity so resume/retry does not duplicate actions.
+Evaluation must answer three separate questions.
 
-Upstream GitHub writes are outside the autonomous graph by policy. If a future graph ever reaches an upstream-submission node, it must interrupt for explicit human approval before the write.
+### A. Output quality: how good is the parsed CUC?
 
-## Observability schema seed
+Seed metrics:
 
-Every harness run should have stable identifiers and metadata:
+- reviewed morphology exact-set agreement;
+- macro/micro precision, recall, F1 and Jaccard;
+- ambiguity preservation and option-count errors;
+- unsupported extra analyses;
+- unresolved coverage;
+- reconstruction/lint validity;
+- column/corpus consistency.
 
-- run_id / thread_id
-- ticket_id
-- branch/base commit
-- harness version
-- skill name/version
-- model/provider where applicable
-- node name
-- iteration
-- test/eval gate status
-- reviewer identity/context id
-- final disposition
+HARN-003 provides the first fast deterministic fixture; larger held-out column/tablet datasets should follow.
 
-Langfuse traces should mirror the graph hierarchy without making Langfuse IDs part of domain state.
+### B. Agent quality: how well does the agent perform systematic review?
+
+Candidate measures:
+
+- expert acceptance/correction rate;
+- skipped-token/completion failures;
+- unsupported changes;
+- unnecessary re-opening of settled readings;
+- evidence/provenance completeness;
+- consistency improvements/regressions across parallels;
+- recovery after expert correction.
+
+Expert feedback must be attached to exact run/model/skill/tool/corpus revision and exact token/column where applicable.
+
+### C. Model/system quality: which model + skills + tools combination is better?
+
+Comparisons must use:
+
+- identical complete columns;
+- identical initial data/repository revision;
+- identical skills/prompts/evidence tools and permissions;
+- identical every-token completion contract;
+- evaluator/gold data withheld from model context where required;
+- exact model/provider/version metadata;
+- the same deterministic + expert-feedback protocol.
+
+Then compare quality first, followed by cost, latency, tool calls, retries and stability.
+
+## Feedback and automatic improvement
+
+Parsing runs, expert feedback and model comparisons may expose recurring problems.
+
+Before a GitHub issue is created, classify the finding:
+
+- local scholarly reading -> corpus decision only;
+- parser/config rule problem;
+- linter defect;
+- skill/procedure weakness;
+- deterministic-tool opportunity;
+- harness/runtime defect;
+- eval/benchmark defect.
+
+This is also how scripts and skills should improve: if agents repeatedly perform the same expensive evidence procedure or make the same class of mistake, measured evidence can justify a deterministic helper or a revised skill. The development controller then implements that change using research-plan-TDD-review.
+
+## Independent review requirement
+
+The clean-context adversarial reviewer remains a **development-controller gate**. It receives task/specification, final diff/repository state, actual test/eval outputs and applicable invariants, without the implementer's accumulated self-justification.
+
+Scholarly expert review of parsing output is a different feedback channel and must not be conflated with PR adversarial review.
+
+## GitHub and side effects
+
+- all autonomous development work stays in `alexsosn/cuc`;
+- upstream `DT-UCPH/cuc` remains read-only without explicit human authorization;
+- development writes need deterministic operation identities for retry/resume;
+- upstream writes remain explicit human-interrupt actions;
+- generated `auto_parsing/**` is rebuilt through controlled parser/regeneration capabilities rather than hand editing.
+
+## Revised execution order
+
+Already completed:
+
+`HARN-000 -> HARN-001 -> HARN-002`
+
+Current work:
+
+`HARN-003` — small representative deterministic morphology fixture.
+
+Then the corrected parsing-harness critical path is:
+
+`HARN-014 -> HARN-008 -> HARN-018 -> HARN-015 -> HARN-004 -> HARN-005 -> HARN-016 -> HARN-017`
+
+Development-controller work can progress in parallel once its prerequisites are stable:
+
+`HARN-006 -> HARN-009 -> HARN-007 -> HARN-010`
+
+HARN-012/HARN-013 remain independent CI/dependency hardening tickets and can be taken when the primary path is blocked or after higher-value feature tickets.
 
 ## Open research questions
 
-1. Functional API vs Graph API for the first CUC harness implementation.
-2. Whether Deep Agents materially reduces code without weakening explicit state-machine control.
-3. Best persistence backend for fork-only development (initially in-memory/SQLite-like local state vs durable external service).
-4. How to execute tests/builds in ChatGPT/GitHub-only operation without noisy CI and without relying on local Codex.
-5. How to represent `.agents/skills` as typed, versioned harness capabilities while preserving their current portability.
-6. How to enforce clean-context reviewer independence in the actual execution environment.
-7. Which reviewed examples should become the first small deterministic regression dataset for rapid inner-loop evaluation.
-8. Langfuse Cloud vs self-hosted vs optional local-only telemetry for this research project; privacy/cost/operational implications need explicit comparison.
-9. How to handle stochastic model calls so replay/resume is auditable and does not silently change prior evidence.
-10. Whether prompt management belongs in Langfuse initially or should remain repository-versioned until the harness stabilizes.
+1. Minimal machine-readable representation of the existing skill workflow without duplicating `SKILL.md` semantics.
+2. Exact `ColumnRunState` and safe resume/revisit semantics.
+3. How reviewed-column writes, automatic-parser regeneration and corpus reconciliation should be separated into controlled effect adapters.
+4. Functional API vs Graph API for the real column-review loop.
+5. Persistence backend for long parsing runs.
+6. How to isolate model context from held-out eval/expert gold while still giving the full input column and legitimate evidence.
+7. Expert-feedback format and adjudication/versioning.
+8. Representative held-out columns/tablets for fair model comparisons beyond HARN-003's fast fixture.
+9. Langfuse Cloud/self-hosted/local-only telemetry trade-offs.
+10. Whether Deep Agents improves real column-review orchestration without weakening explicit completion/state control.
+11. Rules for converting repeated parsing findings into deduplicated, reproducible development issues.
 
-## Recommended sequence
+## External framework references
 
-Do not begin with a broad rewrite. First establish a baseline and a narrow vertical slice:
-
-1. inventory current agentic entry points and deterministic boundaries;
-2. define typed harness contracts and gate semantics;
-3. choose one small reviewed morphology case as a vertical slice;
-4. implement minimal LangGraph orchestration around existing code;
-5. instrument that slice with Langfuse without making telemetry mandatory;
-6. implement a clean-context independent reviewer;
-7. compare against a Deep Agents version/approach;
-8. decide architecture from measured complexity, reliability, trace quality, and regression behavior.
-
-## External references consulted (2026-09-07)
-
-- LangGraph overview / persistence / Functional API: current LangChain documentation.
-- Deep Agents overview and product-positioning documentation: current LangChain documentation.
-- Langfuse evaluation, datasets, experiment runner, and API documentation: current Langfuse documentation.
-
-URLs are intentionally not embedded as execution dependencies; implementation tickets should re-check current APIs before coding because these projects evolve quickly.
+Framework APIs evolve quickly. LangGraph, Deep Agents and Langfuse versions/APIs must be re-checked in the implementation tickets before pinning dependencies. The architecture above deliberately depends on capabilities and boundaries, not on a particular current helper API.
