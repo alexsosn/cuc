@@ -24,7 +24,7 @@ The manifest stores only runtime-relevant identifiers and paths that a controlle
 - work/context unit;
 - ordered stage identifiers;
 - scope/safety invariants;
-- required/optional evidence identifiers;
+- evidence/dependency identifiers exposed by the source skill;
 - repository-relative authoritative dependency paths;
 - repository-relative helper/tool paths;
 - effect class and writable/read-only path scopes;
@@ -32,7 +32,7 @@ The manifest stores only runtime-relevant identifiers and paths that a controlle
 - escalation target identifiers;
 - evaluator requirements and runtime permissions.
 
-It deliberately does **not** restate the explanatory prose, source precedence rules, linguistic notation, commands, or scholarly argumentation from `SKILL.md` and its references.
+It deliberately does **not** restate the explanatory prose, source precedence rules, linguistic notation, commands, or scholarly argumentation from `SKILL.md` and its references. Evidence identifiers describe capabilities/dependencies available to the workflow; they do not replace the token-level source-selection rules in `SKILL.md`.
 
 ## Framework-neutral runtime seam
 
@@ -43,7 +43,7 @@ Add a standard-library-only `agent/harness/skill_capabilities.py` module with:
 - strict JSON manifest parsing/validation;
 - `SkillCapabilityRegistry` for canonical-name and alias-path resolution;
 - deterministic detection of unmanaged legacy-only `.claude/skills` packages;
-- `SkillProvenance` / resource digests computed from the manifest, `SKILL.md`, and declared prompt/reference/tool resources.
+- `SkillProvenance` containing manifest, complete canonical skill-package, and declared external repository-resource digests.
 
 No LangGraph, LangChain, Deep Agents, Langfuse, Pydantic, or vendor-specific type belongs in this layer.
 
@@ -57,19 +57,21 @@ A real `.claude/skills` package with no canonical `.agents` counterpart is **unm
 
 Do not hard-code Git blob IDs into the capability schema. They become stale after every legitimate skill edit and are unavailable in a plain exported worktree.
 
-Instead compute SHA-256 digests from repository bytes at load time for:
+Instead compute SHA-256 provenance from repository bytes at load time at three levels:
 
 1. the capability manifest itself;
-2. canonical `SKILL.md`;
-3. every declared authoritative/reference/helper resource.
+2. the **complete canonical skill package**, recursively and deterministically, including `SKILL.md`, bundled references, bundled scripts, agent-interface files such as `agents/openai.yaml`, and future package files even when they are not individually listed in the manifest;
+3. each declared authoritative/helper resource that lives elsewhere in the repository.
 
-The resulting provenance object is exact, deterministic, JSON-serializable, and works both inside and outside Git. A harness trace can store these digests together with the repository commit SHA when Git context is available.
+The package digest includes repository-relative package paths and file bytes. Symlink entries include their link target text and are rejected if broken or if they escape the repository. This is intentionally a worktree/content identity rather than a Git-tree identity, so it also works in exported repositories without `.git` metadata.
+
+The resulting provenance object is deterministic and JSON-serializable. A harness trace should store these digests together with the repository commit SHA when Git context is available. External scholarly datasets/services named by evidence identifiers need their own runtime adapter/source-version provenance when actually queried; HARN-008 does not pretend that a symbolic identifier such as `dulat` is itself a source version. That execution-level evidence provenance belongs with the column/eval runtime work in HARN-015/HARN-018.
 
 ## First mapped capabilities
 
 ### `review-automatic-parsing`
 
-Machine invariants must include:
+Machine invariants include:
 
 - `complete-column`;
 - `every-token-in-order`;
@@ -87,11 +89,13 @@ Ordered stages:
 5. `verify`;
 6. `report`.
 
+Evidence/dependency identifiers retain the sources exposed by the skill, including DULAT, Tropper, EUPT, published translations, legacy review, corpus parallels, and Burns cultic-vocabulary evidence. The machine contract does not invent a separate Burns-optional policy that is absent from the source skill.
+
 Effect class: curated-data write, restricted to `reviewed/**` for the review operation. Parser/linter/tool fixes are escalation targets, not hidden side effects of the review capability.
 
 ### `regenerate-automatic-parsing`
 
-Machine invariants must include:
+Machine invariants include:
 
 - `generated-output-only`;
 - `reviewed-read-only`;
@@ -111,15 +115,20 @@ Ordered stages:
 
 Effect class: generated-data write. The manifest may authorize the generated/versioned output and intentional report paths, but never `reviewed/**`.
 
-## TDD plan
+## TDD / review record
 
-1. Add tests before `skill_capabilities.py` or real manifests exist. Import is performed inside test methods so RED is an ordinary assertion failure, not collection failure.
-2. Contract tests define strict schema/serialization behavior and reject unknown/vendor-specific fields, scalar/list confusion, unsafe paths, malformed aliases, and unsupported schema versions.
-3. Registry tests define canonical resolution, alias canonicalization, deterministic unmanaged-legacy reporting, and provenance hashing.
-4. Semantic regression tests compare the `review-automatic-parsing` manifest against sentinel statements in the actual current `SKILL.md`; the manifest cannot claim complete-column/every-token semantics if the source skill no longer says so.
-5. Add the two real manifests only after RED is observed.
-6. Run targeted tests, then the full `agent/tests` suite.
-7. Perform a logically independent adversarial review using only #9 acceptance, the actual skill packages, final diff, and test/eval evidence. Reject invented stages, duplicated scholarly semantics, alias identity duplication, write-scope widening, silent legacy-skill promotion, or provenance that cannot detect source drift.
+1. Contract tests were added before `skill_capabilities.py` or real manifests existed. Import happens inside test methods so RED was an ordinary assertion failure, not collection failure.
+2. Initial RED was exactly the missing capability module: 6 new failures with the pre-existing suite otherwise green.
+3. The first implementation added the framework-neutral registry/provenance layer and two real manifests.
+4. The first implementation run exposed two **test-fixture assumptions**, not implementation defects: the synthetic skill lacked required frontmatter, and one semantic sentinel ignored Markdown line wrapping. The tests were corrected without weakening their semantic requirements.
+5. First GREEN completed with the full suite.
+6. Logically independent adversarial review then rejected that GREEN for two real findings:
+   - provenance did not cover undeclared/future files inside a canonical skill package;
+   - the review manifest invented a Burns optionality distinction absent from `SKILL.md`.
+7. Both findings were converted into tests first. The review-driven RED failed only for those findings.
+8. Implementation was then changed to hash the entire canonical package and to align the evidence classification with the source skill.
+9. The review-driven implementation returned the full suite to GREEN.
+10. Finalization still requires a fresh adversarial review of the exact final head; previous review disposition is not reused as approval.
 
 ## Acceptance interpretation
 
@@ -129,4 +138,6 @@ Effect class: generated-data write. The manifest may authorize the generated/ver
 - Existing skill scripts/references are referenced, not wrapped or relocated.
 - Capability/provenance contracts are standard-library and framework neutral.
 - Alias and legacy-only behavior are deterministic.
-- Exact loaded skill/prompt/reference/tool bytes are traceable through provenance digests.
+- The complete canonical skill package is content-addressed, so bundled files cannot drift invisibly merely because they were omitted from a manifest list.
+- Declared repository-external prompt/reference/helper bytes are individually traceable.
+- External scholarly evidence versions are explicitly deferred to execution-time evidence provenance rather than falsely represented by symbolic dependency names.
