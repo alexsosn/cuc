@@ -23,6 +23,7 @@ import collections
 import re
 import sys
 from pathlib import Path
+from typing import Iterable
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -54,6 +55,31 @@ def reconstructs(ana: str, surf: str) -> bool:
         return False
 
 
+def select_seed_order(
+    order: Iterable[tuple[str, str]], existing: set[str]
+) -> list[tuple[str, str]]:
+    """Keep only new token rows and the section header that introduces each group.
+
+    Headers are deferred until a new token is encountered. This prevents a
+    partially or fully reviewed seed operation from appending orphan/duplicate
+    headers for sections whose token rows are all already curated.
+    """
+
+    selected: list[tuple[str, str]] = []
+    pending_header: str | None = None
+    for kind, value in order:
+        if kind == "H":
+            pending_header = value
+            continue
+        if kind != "T" or value in existing:
+            continue
+        if pending_header is not None:
+            selected.append(("H", pending_header))
+            pending_header = None
+        selected.append(("T", value))
+    return selected
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("tablet")
@@ -72,20 +98,13 @@ def main() -> int:
         paths.generated_sources_dir / "cuc_tablets_tsv" / args.version / f"KTU {args.tablet}.tsv"
     )
     rev_path = repo / "reviewed" / f"KTU {args.tablet}.tsv"
-    for p in (auto_path, gen_path, rev_path):
+    for p in (auto_path, rev_path):
         if not p.exists():
             raise SystemExit(f"missing: {p}")
 
     if args.column not in ROMAN and args.column != "-":
         raise SystemExit(f"unknown column {args.column}")
     start = ROMAN.index(args.column) if args.column in ROMAN else -1
-
-    # TF sign spans
-    spans = {}
-    for raw in gen_path.read_text(encoding="utf-8").splitlines():
-        f = raw.split("\t")
-        if len(f) >= 4 and f[0].isdigit():
-            spans[f[0]] = f[3]
 
     existing = {
         raw.split("\t")[0]
@@ -115,6 +134,27 @@ def main() -> int:
             seen.add(tid)
             order.append(("T", tid))
 
+    candidate_ids = [value for kind, value in order if kind == "T"]
+    skipped = sum(1 for tid in candidate_ids if tid in existing)
+    seed_order = select_seed_order(order, existing)
+    new_ids = [value for kind, value in seed_order if kind == "T"]
+
+    # TF sign spans are needed only for rows that will actually be appended.
+    # `agent/generated_sources/**` is intentionally local/generated and is not
+    # present in a clean checkout, so a no-op/dry-run over fully reviewed data
+    # must not fail merely because that materialized source is absent.
+    spans: dict[str, str] = {}
+    if new_ids:
+        if not gen_path.exists():
+            raise SystemExit(
+                "missing generated TF source required for new seed rows: "
+                f"{gen_path}"
+            )
+        for raw in gen_path.read_text(encoding="utf-8").splitlines():
+            f = raw.split("\t")
+            if len(f) >= 4 and f[0].isdigit():
+                spans[f[0]] = f[3]
+
     def choose(tid):
         vs = variants[tid]
         recon = [v for v in vs if reconstructs(v[1], surf[tid])]
@@ -122,22 +162,19 @@ def main() -> int:
         with_entry = [v for v in pool if v[2].strip() not in ("", "?")]
         return (with_entry or pool)[0]
 
-    out, need, skipped = [], [], 0
-    for kind, val in order:
+    out, need = [], []
+    for kind, val in seed_order:
         if kind == "H":
             out.append(val + "\t" * 7)
             continue
         tid = val
-        if tid in existing:
-            skipped += 1
-            continue
         s, ana, dulat, pos, gloss = choose(tid)
         col4 = fix_col4(dulat)
         out.append("\t".join([tid, s, spans.get(tid, ""), ana, col4, pos, gloss, SEED_MARK]))
         if not reconstructs(ana, s) or col4 == "?":
             need.append((tid, s, ana, col4, pos))
 
-    seeded = sum(1 for line in out if line.split("\t")[0].isdigit())
+    seeded = len(new_ids)
     print(
         f"KTU {args.tablet} from column {args.column}: {seeded} rows to append "
         f"({skipped} already present, left untouched)"
@@ -154,6 +191,10 @@ def main() -> int:
 
     if args.dry_run:
         print("\n(dry run — nothing written)")
+        return 0
+
+    if not out:
+        print("\nno rows to append")
         return 0
 
     with rev_path.open("a", encoding="utf-8") as fh:
