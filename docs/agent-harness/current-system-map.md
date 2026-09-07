@@ -13,6 +13,11 @@ external / local evidence
   DULAT, UDB, modules DB, Notarius, TF releases, EUPT/legacy evidence
                          |
                          v
+agent knowledge / conventions -------------+
+  prompts/                                  |
+  tracked data_sources/*.tsv                |
+                         |                   |
+                         v                   |
 agent domain packages ----------------------+
   pipeline/                                 |
   morph_features/                           |
@@ -31,13 +36,13 @@ filesystem/repository artifacts             |
   reports              reviewed             |
                          |                   |
                          v                   |
-.agents/skills = expert workflows that compose scripts, evidence, tests,
-and human/editorial judgment
+.agents/skills + one Claude-only skill = expert workflows that compose
+scripts, evidence, tests, conventions, and human/editorial judgment
 ```
 
-The future harness boundary should sit **above** the deterministic/domain packages and **below** the research/review orchestration. LangGraph should coordinate typed capabilities; it should not replace the parser steps, linter, scorer, alignment logic, or Text-Fabric conversion logic.
+The future harness boundary should sit **above** the deterministic/domain packages and **below** the research/review orchestration. LangGraph should coordinate typed capabilities; it should not replace the parser steps, linter, scorer, alignment logic, Text-Fabric conversion logic, or the repository's authoritative tagging conventions.
 
-## 2. Existing deterministic/domain packages
+## 2. Existing deterministic/domain and knowledge packages
 
 | Surface | Current role | Side effects / constraints | Harness seam |
 | --- | --- | --- | --- |
@@ -60,6 +65,8 @@ The future harness boundary should sit **above** the deterministic/domain packag
 | `agent/project_paths.py` | Resolves repo/agent roots, TF versions, local caches and generated/report paths | Environment-sensitive path selection (`CUC_*` vars); current code assumes agent package layout | Inject resolved paths/config into capabilities; do not let graph guess paths |
 | `agent/dulat_patches.py` | Curated DULAT corrections/supplements | Changes evidence semantics | Version/hash as provenance |
 | `agent/reviewed_normalization.py` | Reviewed-data normalization support | Curated-data semantics | Domain helper, not orchestration |
+| `agent/prompts/**` | Authoritative morphology/tagging procedure and notation guidance | Knowledge changes alter human/agent adjudication semantics even when parser code is unchanged | Treat as versioned knowledge input; include hashes/revision in review traces |
+| `agent/data_sources/*.tsv` | Tracked DULAT entry patches, generic parsing overrides, onomastic gloss overrides | Small tracked evidence/config tables can change parser/reviewer behavior | Explicit config/evidence dependency, hashed with the run |
 
 ### Important impurity inside the current boundary
 
@@ -67,9 +74,9 @@ The future harness boundary should sit **above** the deterministic/domain packag
 
 Likewise, `RefinementStep` cleanly exposes `refine_row(row) -> row`, but its default `refine_file(path)` reads and overwrites the file. This is a useful natural split between domain transformation and filesystem side effect.
 
-## 3. Agent skill inventory — 11/11 accounted for
+## 3. Agent skill inventory — 12 effective skills accounted for
 
-`.agents/skills` currently contains 11 top-level skills:
+`.agents/skills` contains 11 canonical top-level skill packages:
 
 | Skill | Role | Default effect class | Harness interpretation |
 | --- | --- | --- | --- |
@@ -85,6 +92,8 @@ Likewise, `RefinementStep` cleanly exposes `refine_row(row) -> row`, but its def
 | `review-linguistic-rule-change` | Turn expert feedback into measured rule/exception/test changes | research, then code/config/data mutation as justified | ideal research→plan→TDD workflow template |
 | `triage-morphology-lint-regressions` | Stable baseline-vs-candidate ERROR comparison | read/diagnose by default | deterministic gate + investigation workflow |
 
+`.claude/skills` is mostly a compatibility surface: 11 entries are symlinks to the canonical `.agents/skills` packages. It also contains one **real, non-symlink, Claude-only package**, `parse-ugaritic-passive-participle`, with its own `SKILL.md`, `agents/`, `references/`, and `scripts/audit_passive_participle.py`. Harness discovery must therefore either canonicalize aliases and then add this package explicitly, or migrate it into the canonical skill tree before assuming `.agents/skills` is exhaustive.
+
 ### Skill structure already worth preserving
 
 The skills are not merely prompts. Across the inventory they combine:
@@ -94,9 +103,13 @@ The skills are not merely prompts. Across the inventory they combine:
 - `scripts/**` executable audits/helpers;
 - for several skills, `agents/openai.yaml` agent metadata.
 
+In addition, multiple skills explicitly defer to `agent/prompts/**` for authoritative notation/procedure. In particular, `review-automatic-parsing` treats `Morphological_Labeling_Agent_Guide.md`, `Morphological_Labeling_Quick_Checklist.md`, and `Tagging conventions.md` as controlling knowledge. A future skill manifest therefore needs dependency references/hashes, not just a prompt body.
+
 HARN-008 should add only the machine-readable metadata genuinely needed for discovery/version/permissions. It should not copy the domain knowledge into LangGraph/LangChain-specific prompt classes.
 
-## 4. `agent/scripts` inventory — 29/29 accounted for
+## 4. Executable/helper surface
+
+### 4.1 `agent/scripts` inventory — 29/29 accounted for
 
 Classification is by current operational responsibility. "Mutation" means the script can write an artifact; it does not imply that every invocation writes.
 
@@ -132,6 +145,30 @@ Classification is by current operational responsibility. "Mutation" means the sc
 | `token_ref_index.py` | Build/query token/reference mapping support | index/read helper; provenance-sensitive |
 | `x_broken_server_report.py` | Diagnose/report historical server/data breakage | diagnostic/report utility |
 
+### 4.2 Bundled skill executables/helpers — 15 accounted for
+
+These are agent-facing executable surfaces even though they are not under `agent/scripts`:
+
+| Skill package | Executable/helper | Effect class / harness note |
+| --- | --- | --- |
+| `audit-onomastic-encoding` | `scripts/audit_onomastic.py` | read/diagnose corpus audit |
+| `audit-onomastic-encoding` | `scripts/eupt_align.py` | read/compare EUPT evidence |
+| `audit-onomastic-encoding` | `scripts/lint_diff.sh` | lint baseline comparison; environment-sensitive |
+| `audit-split-token-migrations` | `scripts/audit_split_token_pairs.py` | read/diagnose migration invariant audit |
+| `audit-ugaritic-analysis-reconstruction` | `scripts/check_reconstruction.py` | deterministic reconstruction checker |
+| `parse-ugaritic-feminine-endings` | `scripts/audit_feminine_endings.py` | linguistic audit |
+| `parse-ugaritic-gt-stems` | `scripts/audit_gt_stems.py` | linguistic audit |
+| `parse-ugaritic-n-stems` | `scripts/audit_n_stems.py` | linguistic audit |
+| `review-automatic-parsing` | `scripts/audit_marker_layers.py` | marker-layer audit |
+| `review-automatic-parsing` | `scripts/legacy_align.py` | legacy/current evidence alignment |
+| `review-automatic-parsing` | `scripts/review_status.py` | reviewed work-status inspection |
+| `review-automatic-parsing` | `scripts/sources.py` | shared evidence helper |
+| `review-automatic-parsing` | `scripts/sources_lookup.py` | multi-source evidence lookup |
+| `review-automatic-parsing` | `scripts/tropper_index.py` | Tropper evidence index/build/lookup; may materialize an index |
+| Claude-only `parse-ugaritic-passive-participle` | `scripts/audit_passive_participle.py` | linguistic audit |
+
+The presence of bundled executables means capability discovery cannot be based only on `agent/scripts`. Some are read-only audits; others can materialize indexes or depend on external/local evidence. Each must carry its own effect/provenance metadata before autonomous exposure.
+
 ### Script grouping for the first harness
 
 The first vertical slice should expose only a small allowlist:
@@ -139,7 +176,8 @@ The first vertical slice should expose only a small allowlist:
 **Read/evaluate:**
 - reviewed evaluator (`reviewed_evaluation` directly or `score_reviewed_morphology.py --json`);
 - lint regression comparator;
-- selected DULAT/corpus lookup helpers.
+- selected DULAT/corpus lookup helpers;
+- selected bundled audit scripts whose effects have been classified.
 
 **Execute deterministic parser:**
 - `TabletParsingPipeline` through a controlled staging-directory adapter.
@@ -148,9 +186,10 @@ The first vertical slice should expose only a small allowlist:
 - historical one-off `fix_*`, `build_1_3_*`, `emit_*`, `reconcile_*` scripts;
 - direct `reviewed/**` writers;
 - git-hook installer;
-- unrestricted filesystem or GitHub mutation.
+- unrestricted filesystem or GitHub mutation;
+- unclassified skill-bundled executables merely because a skill references them.
 
-## 5. Data and artifact authority
+## 5. Data, knowledge, and artifact authority
 
 | Path/surface | Authority | Mutation policy |
 | --- | --- | --- |
@@ -159,7 +198,8 @@ The first vertical slice should expose only a small allowlist:
 | `auto_parsing/<version>/**` | generated automatic parsing | **never hand-edit**; generator/config/code + test + regeneration only |
 | `reviewed/**` | curated scholarly gold/editorial data | direct edits are allowed only as explicit review/migration work; never overwritten by regeneration |
 | `agent/reports/**` / configured report directory | generated lint/evaluation artifacts | regenerate from authoritative input; provenance matters |
-| `agent/data_sources/**` | tracked supporting evidence/artifacts | source-specific provenance required |
+| `agent/prompts/**` | authoritative morphology/tagging knowledge for agent-assisted review | version and trace; edits change adjudication semantics |
+| `agent/data_sources/{dulat_entry_patches,generic_parsing_overrides,onomastic_gloss_overrides}.tsv` | tracked supporting evidence/config | source-specific provenance required; changes can alter generated output |
 | `agent/local_sources/**` | local caches (DULAT/UDB/modules/Notarius) | environment input; do not commit secrets/proprietary/unintended caches |
 | `lexicon_and_grammar/**` | linguistic resources/conventions | domain evidence/config |
 | `morphemes_files/**` | legacy/historical annotation/evidence | comparison/migration input, not current generated authority |
@@ -192,6 +232,10 @@ This means one apparent "parser call" crosses several side-effect boundaries. Th
 ### Reviewed data
 
 `review-automatic-parsing` explicitly defines reviewed data as gold created by token-by-token scholarly review; seeding is only a worklist. `migrate-reviewed-text-fabric` likewise requires a preview outside `reviewed/**`, alignment review, lint/tests, then an intentional final copy. These policies are stronger than generic filesystem permissions and must survive as capability-specific gates.
+
+### Knowledge dependencies
+
+`review-automatic-parsing` explicitly delegates notation/procedure to the prompt/convention files, and phenomenon skills add their own references. Therefore a review trace is incomplete if it records only the model and skill name. At minimum it should record the skill package revision plus the authoritative knowledge/reference file hashes used in that run.
 
 ### Git/repository
 
@@ -236,8 +280,11 @@ Outputs: structured summary + immutable references/hashes to staged artifacts. P
 ### `DeterministicEvaluator`
 Examples: lint regression and reviewed morphology scoring. Returns structured metrics/findings and an execution classification; never lets model text set pass/fail.
 
+### `KnowledgeBundle`
+Versioned references/hashes for `agent/prompts/**`, skill-local `references/**`, and tracked evidence/config tables used by a research/review run. It is input provenance, not free-form model memory.
+
 ### `SkillCapability`
-A versioned reference to a current `.agents/skills/<name>` package, its allowed tools/evidence, expected artifacts, and permission class. Domain instructions remain in the skill package.
+A versioned reference to a canonical `.agents/skills/<name>` package or explicitly registered non-canonical skill, its allowed tools/evidence, bundled executables, expected artifacts, aliases, and permission class. Domain instructions remain in the skill package.
 
 ### `CuratedDataChange`
 Represents a proposed reviewed-data edit/migration separately from generated output. Must carry evidence/provenance and require the task-specific review gate.
@@ -250,17 +297,18 @@ Fork-local branch/file/PR operation with explicit destination and operation ID. 
 1. Do not rewrite deterministic parser steps as LLM prompts.
 2. Do not give an agent unrestricted access to historical `fix_*` scripts merely because they exist.
 3. Do not make `reviewed/**` publication an automatic consequence of a parser/evaluator result.
-4. Do not treat a skill as only a prompt; preserve references/scripts/metadata.
+4. Do not treat a skill as only a prompt; preserve references/scripts/metadata and knowledge dependencies.
 5. Do not make LangGraph/LangChain/Langfuse types part of morphology, evaluation, migration, or path models.
 6. Do not use report text as the source of truth when structured scorer/comparator results exist.
 7. Do not let a graph guess local database/source paths; resolve and record them explicitly.
 8. Do not equate workflow failure with failing tests; HARN-000 demonstrated `blocked-execution` as a distinct state.
 9. Do not publish in-place output from a failed/interrupted regeneration; the regeneration skill already requires clean staging.
+10. Do not assume `.agents/skills` or `agent/scripts` alone exhaust the current executable agent surface; aliases, the Claude-only skill, and bundled skill scripts are real inputs.
 
 ## 10. Findings that should feed later tickets
 
 ### HARN-002
-Use framework-neutral contracts around artifacts, execution classifications, resolved evidence configuration, evaluator results, and side-effect operation IDs.
+Use framework-neutral contracts around artifacts, execution classifications, resolved evidence configuration, knowledge bundles, evaluator results, and side-effect operation IDs.
 
 ### HARN-003
 Call `reviewed_evaluation` directly where practical; `score_reviewed_morphology.py --json` is already a stable CLI façade. Do not duplicate its metric implementation.
@@ -269,10 +317,10 @@ Call `reviewed_evaluation` directly where practical; `score_reviewed_morphology.
 The minimal LangGraph slice can be mostly stubs around real deterministic evaluator/parser adapters. The domain parser must remain unaware of LangGraph.
 
 ### HARN-008
-Skill packaging already has a useful human/executable structure. Add minimal manifest/version/permission metadata rather than redesigning skills.
+Skill packaging already has a useful human/executable structure. Add minimal manifest/version/permission/alias/dependency metadata rather than redesigning skills. Resolve the Claude-only passive-participle package so canonical discovery is deterministic.
 
 ### HARN-009
-Capability permissions need more granularity than "filesystem write": generated-output publication, curated reviewed-data edits, local cache materialization, fork GitHub writes, and upstream GitHub writes have different policies.
+Capability permissions need more granularity than "filesystem write": generated-output publication, curated reviewed-data edits, local cache/index materialization, fork GitHub writes, and upstream GitHub writes have different policies. Bundled skill executables need the same classification.
 
 ### HARN-011
 Repair the test execution contract using the real `agent/` test root/runtime/import assumptions. Do not solve CI by globally narrowing pytest discovery.
@@ -282,8 +330,12 @@ Repair the test execution contract using the real `agent/` test root/runtime/imp
 This research ticket is documentation-only, so its test gate is an explicit inventory/consistency check rather than executable product code.
 
 - [x] Root repository surfaces enumerated from the branch tree.
-- [x] All 11 `.agents/skills` top-level packages accounted for by name and effect class.
+- [x] All 11 canonical `.agents/skills` top-level packages accounted for by name and effect class.
+- [x] `.claude/skills` alias topology inspected; the unique `parse-ugaritic-passive-participle` package recorded separately.
 - [x] All 29 `agent/scripts` files accounted for by name and operational role.
+- [x] All 15 currently discovered skill-bundled executable/helper files accounted for.
+- [x] `agent/prompts/**` authoritative knowledge files recorded as explicit versioned dependencies.
+- [x] Tracked `agent/data_sources/*.tsv` evidence/config tables recorded.
 - [x] Major reusable packages under `agent/` accounted for.
 - [x] Generated vs curated artifact authority recorded.
 - [x] Git hook and GitHub execution side effects recorded.
@@ -291,4 +343,4 @@ This research ticket is documentation-only, so its test gate is an explicit inve
 - [x] Candidate adapter seams identified without adding LangGraph/LangChain/Langfuse dependencies.
 - [x] No parser, data, workflow, dependency, or upstream repository state changed by this ticket.
 
-Independent review must attack this checklist rather than trusting it: compare the document against the actual directory trees, look for missing mutation paths, and challenge any item classified as deterministic/read-only when it can write or depend on mutable external state.
+Independent review must attack this checklist rather than trusting it: compare the document against the actual directory trees, look for missing mutation paths, aliases and non-canonical skills, verify bundled executables, and challenge any item classified as deterministic/read-only when it can write or depend on mutable external state.
