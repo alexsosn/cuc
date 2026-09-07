@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "contract_version": "1.0.0",
+  "canonical_name": "regenerate-automatic-parsing",
+  "skill_path": ".agents/skills/regenerate-automatic-parsing",
+  "aliases": [
+    ".claude/skills/regenerate-automatic-parsing"
+  ],
+  "work_unit": "regeneration-scope",
+  "ordered_stages": [
+    "choose-route",
+    "snapshot-baseline",
+    "dry-run",
+    "regenerate-to-stage",
+    "validate",
+    "publish"
+  ],
+  "scope_invariants": [
+    "generated-output-only",
+    "reviewed-read-only",
+    "dry-run-before-write",
+    "stage-before-publish",
+    "step-change-safeguard",
+    "failed-stage-not-resumable"
+  ],
+  "required_evidence": [
+    "tf-version-routing",
+    "pre-regeneration-baseline",
+    "pipeline-summary",
+    "lint-delta"
+  ],
+  "optional_evidence": [
+    "reviewed-agreement",
+    "scoped-diff"
+  ],
+  "authoritative_resources": [
+    ".agents/skills/regenerate-automatic-parsing/references/version-routing.md",
+    "agent/project_paths.py"
+  ],
+  "helper_resources": [
+    "agent/scripts/regenerate_tablets_and_reports.py",
+    "agent/scripts/export_text_fabric_tablet_sources.py",
+    "agent/scripts/run_tablet_parsing_pipeline.py",
+    "agent/scripts/compare_lint_errors.py",
+    "agent/scripts/score_reviewed_morphology.py"
+  ],
+  "effect": "generated-data-write",
+  "write_scopes": [
+    "agent/generated_sources/**",
+    "auto_parsing/**",
+    "agent/reports/**"
+  ],
+  "read_only_scopes": [
+    "reviewed/**"
+  ],
+  "completion_verifiers": [
+    "pipeline-summary-valid",
+    "lint-delta-reviewed",
+    "reviewed-agreement-checked",
+    "scoped-diff-reviewed"
+  ],
+  "escalation_targets": [
+    "safeguard-failure-investigation",
+    "counter-defect-fix",
+    "parser-test-fix"
+  ],
+  "evaluator_requirements": [
+    "lint-regression",
+    "reviewed-morphology-when-available"
+  ],
+  "permissions": [
+    "repository-read",
+    "generated-data-stage-write",
+    "generated-data-publish"
+  ]
+}

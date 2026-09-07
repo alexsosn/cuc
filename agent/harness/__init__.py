@@ -17,6 +17,14 @@ from .contracts import (
     TestKind,
     TestResult,
 )
+from .skill_capabilities import (
+    ResourceDigest,
+    SkillCapabilityManifest,
+    SkillCapabilityRegistry,
+    SkillEffect,
+    SkillProvenance,
+    UnmanagedSkillError,
+)
 from .state_machine import (
     ChangeRecorded,
     EvalRecorded,
@@ -43,6 +51,7 @@ __all__ = [
     "PlanRecorded",
     "ResearchArtifact",
     "ResearchRecorded",
+    "ResourceDigest",
     "ResumeRequested",
     "ReviewDisposition",
     "ReviewFinding",
@@ -50,12 +59,17 @@ __all__ = [
     "ReviewResult",
     "RunPhase",
     "RunState",
+    "SkillCapabilityManifest",
+    "SkillCapabilityRegistry",
+    "SkillEffect",
+    "SkillProvenance",
     "TaskSpec",
     "TestIntent",
     "TestKind",
     "TestRecorded",
     "TestResult",
     "TestsDeclared",
+    "UnmanagedSkillError",
     "VerificationPassed",
     "apply_event",
 ]
