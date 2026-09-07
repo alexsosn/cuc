@@ -1,0 +1,43 @@
+name: Agent tests
+
+on:
+  pull_request:
+    branches: ["agent-harness-safety"]
+    paths:
+      - "agent/**"
+      - ".agents/**"
+      - ".claude/**"
+      - "docs/agent-harness/**"
+      - ".github/workflows/agent-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.10"
+
+      - name: Install focused test runner
+        run: python -m pip install pytest==9.1.1
+
+      - name: Run agent CI contract test
+        run: python -m pytest tests/test_ci_contract.py -q
