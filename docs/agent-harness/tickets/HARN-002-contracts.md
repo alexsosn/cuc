@@ -2,9 +2,9 @@
 
 ## Research basis
 
-HARN-001 shows a deterministic/domain-heavy system with orchestration and side effects layered above it. The harness boundary should therefore carry *descriptions of work and evidence*, not parser internals, framework objects, open file handles, model clients, or mutable repository objects.
+HARN-001 shows a deterministic/domain-heavy system with orchestration and side effects layered above it. The harness boundary therefore carries descriptions of work and evidence, not parser internals, framework objects, open handles, model clients, or mutable repository objects.
 
-HARN-011 established an execution vocabulary that HARN-002 must preserve: `blocked-execution`, `test-failure`, `regression`, and `success` are materially different outcomes. HARN-002 adds `human-escalation` as an explicit gate result rather than encoding it as prose.
+HARN-011 established an execution vocabulary that HARN-002 preserves: `blocked-execution`, `test-failure`, `regression`, and `success` are materially different outcomes. HARN-002 adds `human-escalation` as an explicit gate result rather than prose.
 
 Existing CUC data-model style uses frozen standard-library dataclasses with explicit `to_dict()` methods. Reusing that style keeps these contracts independent of LangGraph, LangChain, Deep Agents, Langfuse, Pydantic, and runtime services.
 
@@ -12,35 +12,37 @@ Existing CUC data-model style uses frozen standard-library dataclasses with expl
 
 ### 1. Pure standard-library domain package
 
-Create `agent/harness/` with no orchestration-framework imports. Contracts use frozen dataclasses, `Enum`, tuples, mappings copied into JSON-safe dictionaries, and explicit validation.
+`agent/harness/` contains no orchestration-framework imports. Contracts use frozen dataclasses, `Enum`, normalized tuples, JSON-safe scalar mappings, and explicit runtime validation.
 
-### 2. Separate durable identity from human-readable labels
+Type annotations are not treated as runtime validation. `RunState` rejects wrong nested contract types before they can become a durable checkpoint, so malformed state fails at construction rather than later during serialization or replay.
 
-Every run has a `run_id`. Side-effect-capable changes carry a `change_id` and one or more `operation_ids`. Operation IDs are durable idempotency keys: retry/resume code must be able to recognize that an externally visible operation has already been attempted or completed without depending on process-local memory.
+### 2. Durable identity is explicit but side-effect execution is out of scope
 
-IDs are non-empty opaque strings. The contract layer does not generate UUIDs automatically because generation policy belongs to the controller/runtime and implicit generation makes replay tests less deterministic.
+Every run has a `run_id`. Changes have `change_id`s and may carry `operation_id`s. IDs are non-empty opaque strings and are never generated implicitly by the contract layer.
 
-### 3. State phases model orchestration progress, not domain parser state
+Within one `RunState`, operation IDs must be unique across all changes. HARN-002 supplies stable identity for downstream idempotency logic; it does **not** claim exactly-once external effects. Persisting attempted/completed side-effect status, closing crash windows between an external write and checkpoint persistence, and retry-after-approval behavior belong to HARN-009/HARN-004.
 
-`RunPhase`:
+### 3. State phases model orchestration progress
+
+Normal phases are:
 
 `research -> plan -> test-design -> implement -> verify -> review -> complete`
 
 Exceptional phases are `blocked` and `awaiting-human`.
 
-The normal retry loops are:
+Retry loops are explicit:
 
 - verification `test-failure` -> `implement`;
 - verification `regression` -> `implement`;
 - review `request-changes` -> `implement`;
-- execution blockage -> `blocked` with a recorded resume phase;
-- explicit human escalation -> `awaiting-human` with a recorded resume phase.
+- execution blockage -> `blocked` with the interrupted phase captured in `resume_phase`;
+- human escalation -> `awaiting-human` with the interrupted phase captured in `resume_phase`.
 
-A state can resume from `blocked`/`awaiting-human` only to the phase captured when it entered the exceptional state. This avoids arbitrary jump-ahead after partial failure.
+Resume is allowed only to the captured non-exceptional phase. Durable snapshots also validate phase prerequisites, so serialized state cannot claim `review` or `complete` without the evidence required to reach those phases.
 
-### 4. Gate outcome and review disposition are distinct
+### 4. Gate outcomes and review dispositions are separate
 
-`GateOutcome` is for executable/evaluation gates:
+`GateOutcome`:
 
 - `success`
 - `test-failure`
@@ -48,42 +50,29 @@ A state can resume from `blocked`/`awaiting-human` only to the phase captured wh
 - `blocked-execution`
 - `human-escalation`
 
-`ReviewDisposition` is scholarly/engineering review judgment:
+`ReviewDisposition`:
 
 - `approve`
 - `request-changes`
 - `escalate`
 
-A review cannot be represented as a generic successful test because reviewers need findings, evidence, reviewer identity/context, and an inspected revision SHA.
+Review results retain reviewer identity, independent review-context identity, findings/evidence, and the exact inspected head SHA. A review cannot be collapsed into a generic successful test.
 
-### 5. Evidence is referential, not unbounded logs
+### 5. Evidence is referential and revision-bound
 
-Test/eval/review contracts carry concise summaries plus optional stable evidence references. Full logs and large artifacts remain outside `RunState`; a future Langfuse/checkpoint adapter may store references/hashes. This keeps state serializable and bounded.
+Test/eval/review contracts carry concise summaries plus optional stable evidence references. Full logs and large artifacts remain outside `RunState`.
 
-### 6. Exact execution identity is first-class
+`TestResult` records both the proposed revision (`head_sha`) and the revision actually executed (`executed_sha`). Verification requires all current successful test/eval evidence to describe one proposed head **and one executed revision**. This prevents a false GREEN assembled from different GitHub synthetic merge commits for the same PR head.
 
-`TestResult` records both proposed revision (`head_sha`) and actually executed revision (`executed_sha`) when known, preserving the HARN-011 synthetic-merge distinction. A `success`, `test-failure`, or `regression` result requires an executed SHA; `blocked-execution` may lack one when execution never started.
+### 6. Transition semantics are pure
 
-### 7. Transition semantics are pure and testable
+`harness/state_machine.py` is a reducer from immutable `RunState` + typed event to immutable `RunState`. It performs no file, network, model, or GitHub side effects. Invalid event/phase combinations raise `InvalidTransition`.
 
-A small reducer in `harness/state_machine.py` applies typed events to immutable `RunState`. Invalid phase/event combinations raise `InvalidTransition`. No file/network/GitHub effects occur in the reducer.
-
-Events are intentionally coarse:
-
-- record research;
-- record plan;
-- declare tests;
-- record change;
-- record verification result;
-- record evaluation result;
-- record review;
-- resume exceptional state.
-
-The first implementation need not execute tools; it only proves contracts and deterministic state semantics for HARN-004 to wrap.
+Events cover research, plan, test declaration, change recording, test/eval evidence, verification, review, and resume. HARN-004 can wrap this reducer with LangGraph without importing LangGraph into the domain layer.
 
 ## Contract inventory
 
-Required public contracts:
+Public contracts:
 
 - `TaskSpec`
 - `ResearchArtifact`
@@ -98,38 +87,42 @@ Required public contracts:
 - enums for phase/outcome/severity/disposition/test kind
 - transition events and `apply_event`
 
-## Validation invariants
+## Hardened validation invariants
 
-- all public IDs and required text fields are non-empty;
-- tuple-like fields normalize to tuples and reject empty required collections;
+- required IDs/text are non-empty;
+- tuple-like fields normalize to tuples; required collections reject empty values;
+- nested durable values must be instances of their declared contract types;
 - `TaskSpec` requires at least one acceptance criterion;
 - `PlanArtifact` requires at least one step;
-- `TestIntent` requires a command and working directory and has an explicit `targeted`/`regression` kind;
-- non-blocked `TestResult` requires execution identity and an exit code;
-- `success` requires exit code 0 and zero failed tests;
-- `test-failure`/`regression` require a non-zero exit code or positive failed-test count;
-- `blocked-execution` requires a blocker summary and must not claim passed tests;
-- a blocking `ReviewFinding` cannot use informational severity;
+- `TestIntent` requires a command, working directory, and explicit targeted/regression kind;
+- `TestResult(success)` requires `head_sha`, `executed_sha`, exit code 0, zero failed tests, and at least one passed test;
+- `TestResult(test-failure|regression)` requires execution identity, a non-zero exit code, and at least one failed test; an import/collection abort with no failed tests is therefore not representable as a test failure;
+- `blocked-execution` and `human-escalation` cannot claim a completed test exit/count result;
+- `EvalResult(success|test-failure|regression)` requires proposed and executed revision identity;
+- eval metric names are unique and metrics are canonicalized by name for stable JSON round-trips;
+- a blocking `ReviewFinding` cannot have informational severity;
 - `ReviewResult(approve)` cannot contain blocking findings;
-- `ReviewResult(request-changes)` must contain at least one blocking finding;
-- `RunState` JSON round-trip preserves enums, tuples, mappings, optional artifacts, and exceptional resume phase;
-- duplicate `operation_id`s within a `ChangeSet` are invalid;
-- a run cannot record the same operation ID in two different changes.
+- `ReviewResult(request-changes)` requires at least one blocking finding;
+- test results must refer to declared intents and known changes; eval results must refer to known changes;
+- `review`/`complete` checkpoints require fresh successful evidence for every declared test on the latest change;
+- verified current test/eval evidence must agree on one proposed head and one executed revision;
+- `complete` requires an approving review of the verified head;
+- duplicate operation IDs within a change or across a run are invalid;
+- explicit `to_dict()` / `from_dict()` gives a lossless JSON round-trip for valid state.
 
-## TDD plan
+## TDD and adversarial-review record
 
-1. Commit contract/state-machine tests while `agent/harness` does not exist. Tests dynamically import the not-yet-existing package and turn absence into an ordinary assertion failure so pytest collection remains healthy. HARN-011 defines collection/import abort as `blocked-execution`; that must **not** be used as TDD RED evidence.
-2. Observe the explicit assertion failure on the exact head/run and classify it as `test-failure`.
-3. Implement the smallest standard-library contracts satisfying schema/serialization tests.
-4. Implement pure transition reducer and retry/resume validation.
-5. Run the full HARN-011 agent suite on a fork-only PR and repair any regression without narrowing discovery.
-6. Perform a logically independent adversarial review focused on replay/resume, malformed partial state, duplicate side-effect identity, stale execution identity, and illegal transition bypasses.
+1. Contract/state-machine tests were committed before `agent/harness` existed. Missing implementation was converted into ordinary assertion failures so pytest collection stayed healthy; the initial RED was classified as `test-failure`, not HARN-011 `blocked-execution`.
+2. The first implementation reached full GREEN, then an independent adversarial review rejected it for mixed executed-revision evidence, forged phase snapshots, and weak executed-test evidence.
+3. Regression tests reproduced those three findings before fixes were written.
+4. A second independent review of the next GREEN found nested type confusion: malformed values could enter `RunState` and fail only later during serialization. A second reviewer-driven RED reproduced that defect before the runtime type checks were added.
+5. Final acceptance requires a full fork-local suite on the documentation-final head plus a fresh review of the resulting diff. No generated `auto_parsing/**` data may be edited by this ticket.
 
 ## Deferred deliberately
 
-- LangGraph state classes/checkpointers — HARN-004;
 - deterministic eval adapters — HARN-003;
-- GitHub write capability enforcement — HARN-009;
+- LangGraph state/checkpoint/runtime integration — HARN-004;
+- GitHub side-effect capability enforcement, approval gates, and no-duplicate-write semantics — HARN-009;
 - skill manifests/discovery — HARN-008;
-- observability/Langfuse adapters — later ticket;
-- persistence backend, UUID generation, clock/timestamps, filesystem/GitHub effects — runtime concerns, not domain contracts.
+- Langfuse/observability adapter — later ticket;
+- persistence backend, UUID generation, clocks, filesystem/GitHub effects — runtime concerns outside these domain contracts.
