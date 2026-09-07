@@ -80,9 +80,16 @@ def _enum(value: Any, enum_type: type[Enum], field_name: str):
 
 
 def _nonnegative(value: int, field_name: str) -> int:
-    if not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field_name} must be a non-negative integer")
     return value
+
+
+def _latest_by_key(items, key):
+    latest = {}
+    for item in items:
+        latest[key(item)] = item
+    return latest
 
 
 @dataclass(frozen=True)
@@ -127,9 +134,13 @@ class ResearchArtifact:
     evidence_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "artifact_id", _required_text(self.artifact_id, "artifact_id"))
+        object.__setattr__(
+            self, "artifact_id", _required_text(self.artifact_id, "artifact_id")
+        )
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
-        object.__setattr__(self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs"))
+        object.__setattr__(
+            self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs")
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -157,8 +168,12 @@ class PlanArtifact:
     def __post_init__(self) -> None:
         object.__setattr__(self, "plan_id", _required_text(self.plan_id, "plan_id"))
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
-        object.__setattr__(self, "steps", _text_tuple(self.steps, "steps", required=True))
-        object.__setattr__(self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs"))
+        object.__setattr__(
+            self, "steps", _text_tuple(self.steps, "steps", required=True)
+        )
+        object.__setattr__(
+            self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs")
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -187,15 +202,21 @@ class TestIntent:
     description: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "intent_id", _required_text(self.intent_id, "intent_id"))
+        object.__setattr__(
+            self, "intent_id", _required_text(self.intent_id, "intent_id")
+        )
         object.__setattr__(self, "kind", _enum(self.kind, TestKind, "kind"))
-        object.__setattr__(self, "command", _text_tuple(self.command, "command", required=True))
+        object.__setattr__(
+            self, "command", _text_tuple(self.command, "command", required=True)
+        )
         object.__setattr__(
             self,
             "working_directory",
             _required_text(self.working_directory, "working_directory"),
         )
-        object.__setattr__(self, "description", _required_text(self.description, "description"))
+        object.__setattr__(
+            self, "description", _required_text(self.description, "description")
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -217,44 +238,6 @@ class TestIntent:
         )
 
 
-def _validate_gate_counts(
-    *,
-    outcome: GateOutcome,
-    head_sha: str | None,
-    executed_sha: str | None,
-    exit_code: int | None,
-    passed_tests: int,
-    failed_tests: int,
-    summary: str,
-) -> tuple[str | None, str | None, int, int, str]:
-    head_sha = _optional_text(head_sha, "head_sha")
-    executed_sha = _optional_text(executed_sha, "executed_sha")
-    passed_tests = _nonnegative(passed_tests, "passed_tests")
-    failed_tests = _nonnegative(failed_tests, "failed_tests")
-    summary = _required_text(summary, "summary")
-
-    if exit_code is not None and not isinstance(exit_code, int):
-        raise ValueError("exit_code must be an integer or None")
-
-    if outcome in {GateOutcome.SUCCESS, GateOutcome.TEST_FAILURE, GateOutcome.REGRESSION}:
-        if head_sha is None or executed_sha is None:
-            raise ValueError(f"{outcome.value} requires head_sha and executed_sha")
-        if exit_code is None:
-            raise ValueError(f"{outcome.value} requires exit_code")
-
-    if outcome is GateOutcome.SUCCESS:
-        if exit_code != 0 or failed_tests != 0:
-            raise ValueError("success requires exit_code=0 and failed_tests=0")
-    elif outcome in {GateOutcome.TEST_FAILURE, GateOutcome.REGRESSION}:
-        if exit_code == 0 and failed_tests == 0:
-            raise ValueError(f"{outcome.value} must contain failure evidence")
-    elif outcome is GateOutcome.BLOCKED_EXECUTION:
-        if passed_tests:
-            raise ValueError("blocked execution cannot claim passed tests")
-
-    return head_sha, executed_sha, passed_tests, failed_tests, summary
-
-
 @dataclass(frozen=True)
 class TestResult:
     intent_id: str
@@ -270,24 +253,59 @@ class TestResult:
 
     def __post_init__(self) -> None:
         outcome = _enum(self.outcome, GateOutcome, "outcome")
-        head, executed, passed, failed, summary = _validate_gate_counts(
-            outcome=outcome,
-            head_sha=self.head_sha,
-            executed_sha=self.executed_sha,
-            exit_code=self.exit_code,
-            passed_tests=self.passed_tests,
-            failed_tests=self.failed_tests,
-            summary=self.summary,
+        head_sha = _optional_text(self.head_sha, "head_sha")
+        executed_sha = _optional_text(self.executed_sha, "executed_sha")
+        passed_tests = _nonnegative(self.passed_tests, "passed_tests")
+        failed_tests = _nonnegative(self.failed_tests, "failed_tests")
+        summary = _required_text(self.summary, "summary")
+
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
+        ):
+            raise ValueError("exit_code must be an integer or None")
+
+        executed_outcomes = {
+            GateOutcome.SUCCESS,
+            GateOutcome.TEST_FAILURE,
+            GateOutcome.REGRESSION,
+        }
+        if outcome in executed_outcomes:
+            if head_sha is None or executed_sha is None:
+                raise ValueError(f"{outcome.value} requires head_sha and executed_sha")
+            if self.exit_code is None:
+                raise ValueError(f"{outcome.value} requires exit_code")
+
+        if outcome is GateOutcome.SUCCESS:
+            if self.exit_code != 0 or failed_tests != 0 or passed_tests == 0:
+                raise ValueError(
+                    "success requires exit_code=0, failed_tests=0, and at least one passed test"
+                )
+        elif outcome in {GateOutcome.TEST_FAILURE, GateOutcome.REGRESSION}:
+            if self.exit_code == 0 or failed_tests == 0:
+                raise ValueError(
+                    f"{outcome.value} requires a non-zero exit and at least one failed test"
+                )
+        elif outcome in {GateOutcome.BLOCKED_EXECUTION, GateOutcome.HUMAN_ESCALATION}:
+            if self.exit_code is not None or passed_tests or failed_tests:
+                raise ValueError(
+                    f"{outcome.value} cannot claim completed test execution"
+                )
+
+        object.__setattr__(
+            self, "intent_id", _required_text(self.intent_id, "intent_id")
         )
-        object.__setattr__(self, "intent_id", _required_text(self.intent_id, "intent_id"))
-        object.__setattr__(self, "change_id", _required_text(self.change_id, "change_id"))
+        object.__setattr__(
+            self, "change_id", _required_text(self.change_id, "change_id")
+        )
         object.__setattr__(self, "outcome", outcome)
-        object.__setattr__(self, "head_sha", head)
-        object.__setattr__(self, "executed_sha", executed)
-        object.__setattr__(self, "passed_tests", passed)
-        object.__setattr__(self, "failed_tests", failed)
+        object.__setattr__(self, "head_sha", head_sha)
+        object.__setattr__(self, "executed_sha", executed_sha)
+        object.__setattr__(self, "passed_tests", passed_tests)
+        object.__setattr__(self, "failed_tests", failed_tests)
         object.__setattr__(self, "summary", summary)
-        object.__setattr__(self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs"))
+        object.__setattr__(
+            self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs")
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -334,14 +352,16 @@ class EvalResult:
         outcome = _enum(self.outcome, GateOutcome, "outcome")
         head_sha = _optional_text(self.head_sha, "head_sha")
         executed_sha = _optional_text(self.executed_sha, "executed_sha")
-        if outcome in {GateOutcome.SUCCESS, GateOutcome.TEST_FAILURE, GateOutcome.REGRESSION}:
-            if head_sha is None or executed_sha is None:
-                raise ValueError(f"{outcome.value} requires head_sha and executed_sha")
-        summary = _required_text(self.summary, "summary")
-        metrics = tuple(self.metrics)
-        metric_names: list[str] = []
+        if outcome in {
+            GateOutcome.SUCCESS,
+            GateOutcome.TEST_FAILURE,
+            GateOutcome.REGRESSION,
+        } and (head_sha is None or executed_sha is None):
+            raise ValueError(f"{outcome.value} requires head_sha and executed_sha")
+
         normalized_metrics: list[tuple[str, JsonScalar]] = []
-        for name, value in metrics:
+        metric_names: list[str] = []
+        for name, value in tuple(self.metrics):
             normalized_name = _required_text(name, "metric name")
             if not isinstance(value, (str, int, float, bool)) and value is not None:
                 raise ValueError(f"metric {normalized_name!r} is not JSON-scalar")
@@ -352,13 +372,17 @@ class EvalResult:
         normalized_metrics.sort(key=lambda item: item[0])
 
         object.__setattr__(self, "eval_id", _required_text(self.eval_id, "eval_id"))
-        object.__setattr__(self, "change_id", _required_text(self.change_id, "change_id"))
+        object.__setattr__(
+            self, "change_id", _required_text(self.change_id, "change_id")
+        )
         object.__setattr__(self, "outcome", outcome)
         object.__setattr__(self, "head_sha", head_sha)
         object.__setattr__(self, "executed_sha", executed_sha)
-        object.__setattr__(self, "summary", summary)
+        object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
         object.__setattr__(self, "metrics", tuple(normalized_metrics))
-        object.__setattr__(self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs"))
+        object.__setattr__(
+            self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs")
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -375,7 +399,11 @@ class EvalResult:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> EvalResult:
         raw_metrics = payload.get("metrics", {})
-        metrics = tuple(raw_metrics.items()) if isinstance(raw_metrics, Mapping) else tuple(raw_metrics)
+        metrics = (
+            tuple(raw_metrics.items())
+            if isinstance(raw_metrics, Mapping)
+            else tuple(raw_metrics)
+        )
         return cls(
             eval_id=payload["eval_id"],
             change_id=payload["change_id"],
@@ -396,7 +424,9 @@ class ChangeSet:
     operation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "change_id", _required_text(self.change_id, "change_id"))
+        object.__setattr__(
+            self, "change_id", _required_text(self.change_id, "change_id")
+        )
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
         object.__setattr__(
             self,
@@ -438,10 +468,14 @@ class ReviewFinding:
         severity = _enum(self.severity, FindingSeverity, "severity")
         if self.blocking and severity is FindingSeverity.INFO:
             raise ValueError("an informational finding cannot be blocking")
-        object.__setattr__(self, "finding_id", _required_text(self.finding_id, "finding_id"))
+        object.__setattr__(
+            self, "finding_id", _required_text(self.finding_id, "finding_id")
+        )
         object.__setattr__(self, "severity", severity)
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
-        object.__setattr__(self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs"))
+        object.__setattr__(
+            self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs")
+        )
         object.__setattr__(self, "blocking", bool(self.blocking))
 
     def to_dict(self) -> dict[str, object]:
@@ -487,13 +521,17 @@ class ReviewResult:
             raise ValueError("request-changes review requires a blocking finding")
 
         object.__setattr__(self, "review_id", _required_text(self.review_id, "review_id"))
-        object.__setattr__(self, "reviewer_id", _required_text(self.reviewer_id, "reviewer_id"))
+        object.__setattr__(
+            self, "reviewer_id", _required_text(self.reviewer_id, "reviewer_id")
+        )
         object.__setattr__(
             self,
             "review_context_id",
             _required_text(self.review_context_id, "review_context_id"),
         )
-        object.__setattr__(self, "inspected_sha", _required_text(self.inspected_sha, "inspected_sha"))
+        object.__setattr__(
+            self, "inspected_sha", _required_text(self.inspected_sha, "inspected_sha")
+        )
         object.__setattr__(self, "disposition", disposition)
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
         object.__setattr__(self, "findings", findings)
@@ -548,8 +586,9 @@ class RunState:
             else _enum(self.resume_phase, RunPhase, "resume_phase")
         )
         pause_reason = _optional_text(self.pause_reason, "pause_reason")
-        verified_head_sha = _optional_text(self.verified_head_sha, "verified_head_sha")
-
+        verified_head_sha = _optional_text(
+            self.verified_head_sha, "verified_head_sha"
+        )
         test_intents = tuple(self.test_intents)
         changes = tuple(self.changes)
         test_results = tuple(self.test_results)
@@ -561,9 +600,22 @@ class RunState:
         change_ids = [change.change_id for change in changes]
         if len(change_ids) != len(set(change_ids)):
             raise ValueError("change IDs must be unique")
-        operation_ids = [operation for change in changes for operation in change.operation_ids]
+        operation_ids = [
+            operation for change in changes for operation in change.operation_ids
+        ]
         if len(operation_ids) != len(set(operation_ids)):
             raise ValueError("operation IDs must be unique across a run")
+
+        known_intents = set(intent_ids)
+        known_changes = set(change_ids)
+        for result in test_results:
+            if result.intent_id not in known_intents:
+                raise ValueError(f"test result uses undeclared intent: {result.intent_id}")
+            if result.change_id not in known_changes:
+                raise ValueError(f"test result uses unknown change: {result.change_id}")
+        for result in eval_results:
+            if result.change_id not in known_changes:
+                raise ValueError(f"evaluation result uses unknown change: {result.change_id}")
 
         exceptional = {RunPhase.BLOCKED, RunPhase.AWAITING_HUMAN}
         if phase in exceptional:
@@ -578,7 +630,20 @@ class RunState:
             if pause_reason is None:
                 raise ValueError("exceptional phase requires pause_reason")
         elif resume_phase is not None or pause_reason is not None:
-            raise ValueError("resume_phase/pause_reason are only valid for exceptional phases")
+            raise ValueError(
+                "resume_phase/pause_reason are only valid for exceptional phases"
+            )
+
+        effective_phase = resume_phase if phase in exceptional else phase
+        assert effective_phase is not None
+        self._validate_phase_snapshot(
+            effective_phase,
+            test_intents,
+            changes,
+            test_results,
+            eval_results,
+            verified_head_sha,
+        )
 
         object.__setattr__(self, "run_id", _required_text(self.run_id, "run_id"))
         object.__setattr__(self, "phase", phase)
@@ -589,6 +654,163 @@ class RunState:
         object.__setattr__(self, "resume_phase", resume_phase)
         object.__setattr__(self, "pause_reason", pause_reason)
         object.__setattr__(self, "verified_head_sha", verified_head_sha)
+
+    def _validate_phase_snapshot(
+        self,
+        phase: RunPhase,
+        test_intents: tuple[TestIntent, ...],
+        changes: tuple[ChangeSet, ...],
+        test_results: tuple[TestResult, ...],
+        eval_results: tuple[EvalResult, ...],
+        verified_head_sha: str | None,
+    ) -> None:
+        if phase is RunPhase.RESEARCH:
+            if any(
+                (
+                    self.research is not None,
+                    self.plan is not None,
+                    test_intents,
+                    changes,
+                    test_results,
+                    eval_results,
+                    self.review is not None,
+                    verified_head_sha is not None,
+                )
+            ):
+                raise ValueError("research phase cannot contain later-phase state")
+            return
+
+        if self.research is None:
+            raise ValueError(f"{phase.value} phase requires research evidence")
+        if phase is RunPhase.PLAN:
+            if any(
+                (
+                    self.plan is not None,
+                    test_intents,
+                    changes,
+                    test_results,
+                    eval_results,
+                    self.review is not None,
+                    verified_head_sha is not None,
+                )
+            ):
+                raise ValueError("plan phase cannot contain later-phase state")
+            return
+
+        if self.plan is None:
+            raise ValueError(f"{phase.value} phase requires a plan")
+        if phase is RunPhase.TEST_DESIGN:
+            if any(
+                (
+                    test_intents,
+                    changes,
+                    test_results,
+                    eval_results,
+                    self.review is not None,
+                    verified_head_sha is not None,
+                )
+            ):
+                raise ValueError("test-design phase cannot contain later-phase state")
+            return
+
+        if not test_intents:
+            raise ValueError(f"{phase.value} phase requires declared tests")
+        if phase is RunPhase.IMPLEMENT:
+            if verified_head_sha is not None:
+                raise ValueError("implementation phase cannot retain verified_head_sha")
+            if self.review is not None and (
+                self.review.disposition is not ReviewDisposition.REQUEST_CHANGES
+            ):
+                raise ValueError(
+                    "implementation phase may retain only a request-changes review"
+                )
+            return
+
+        if not changes:
+            raise ValueError(f"{phase.value} phase requires a recorded change")
+        if phase is RunPhase.VERIFY:
+            if verified_head_sha is not None or self.review is not None:
+                raise ValueError(
+                    "verify phase cannot contain verified/review-complete state"
+                )
+            return
+
+        if phase not in {RunPhase.REVIEW, RunPhase.COMPLETE}:
+            raise ValueError(f"unsupported durable phase: {phase.value}")
+        if verified_head_sha is None:
+            raise ValueError(f"{phase.value} phase requires verified_head_sha")
+
+        self._validate_verified_evidence(
+            test_intents,
+            changes,
+            test_results,
+            eval_results,
+            verified_head_sha,
+        )
+
+        if phase is RunPhase.REVIEW:
+            if self.review is not None:
+                if self.review.disposition is not ReviewDisposition.ESCALATE:
+                    raise ValueError(
+                        "review phase may retain only an escalated review awaiting retry"
+                    )
+                if self.review.inspected_sha != verified_head_sha:
+                    raise ValueError("review inspected a different verified head")
+            return
+
+        if self.review is None:
+            raise ValueError("complete phase requires an approving review")
+        if self.review.disposition is not ReviewDisposition.APPROVE:
+            raise ValueError("complete phase requires review approval")
+        if self.review.inspected_sha != verified_head_sha:
+            raise ValueError("complete review inspected a different verified head")
+
+    @staticmethod
+    def _validate_verified_evidence(
+        test_intents: tuple[TestIntent, ...],
+        changes: tuple[ChangeSet, ...],
+        test_results: tuple[TestResult, ...],
+        eval_results: tuple[EvalResult, ...],
+        verified_head_sha: str,
+    ) -> None:
+        change_id = changes[-1].change_id
+        current_tests = tuple(
+            result for result in test_results if result.change_id == change_id
+        )
+        latest_tests = _latest_by_key(current_tests, lambda result: result.intent_id)
+        missing = [
+            intent.intent_id
+            for intent in test_intents
+            if intent.intent_id not in latest_tests
+        ]
+        if missing:
+            raise ValueError(
+                "verified snapshot is missing current tests: "
+                + ", ".join(sorted(missing))
+            )
+        if any(
+            result.outcome is not GateOutcome.SUCCESS
+            for result in latest_tests.values()
+        ):
+            raise ValueError("verified snapshot contains a non-successful current test")
+
+        current_evals = tuple(
+            result for result in eval_results if result.change_id == change_id
+        )
+        latest_evals = _latest_by_key(current_evals, lambda result: result.eval_id)
+        if any(
+            result.outcome is not GateOutcome.SUCCESS
+            for result in latest_evals.values()
+        ):
+            raise ValueError("verified snapshot contains a non-successful evaluation")
+
+        evidence = tuple(latest_tests.values()) + tuple(latest_evals.values())
+        head_shas = {result.head_sha for result in evidence}
+        executed_shas = {result.executed_sha for result in evidence}
+        if head_shas != {verified_head_sha}:
+            raise ValueError("verified evidence does not match verified_head_sha")
+        if len(executed_shas) != 1 or None in executed_shas:
+            raise ValueError("verified evidence must share one executed revision")
 
     @property
     def latest_change(self) -> ChangeSet | None:
