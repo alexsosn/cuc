@@ -39,7 +39,9 @@ jobs:
         run: uv sync --frozen --no-install-project
 
       - name: Install pinned test runner
-        run: uv pip install --python .venv/bin/python pytest==9.1.1
+        run: >-
+          uv pip install --python .venv/bin/python
+          pytest==9.1.1 iniconfig==2.3.0 pluggy==1.6.0
 
       - name: Run full agent test suite
         run: .venv/bin/python -m pytest -q
