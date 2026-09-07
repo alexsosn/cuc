@@ -4,6 +4,8 @@ Snapshot basis: `alexsosn/cuc` branch `harn-001-system-inventory`, descended fro
 
 This document inventories the current agent-facing system before LangGraph/Langfuse integration. It deliberately separates linguistic/domain behavior from orchestration and repository side effects. The harness should wrap these capabilities, not rewrite the parser into LLM calls.
 
+> **HARN-014 architecture correction:** the existing skills are the source of truth for the agentic parsing runtime. In particular, `review-automatic-parsing` defines one complete column as the work/context unit and requires every token to be reviewed in order. The research-plan-TDD-review lifecycle is a separate GitHub-issue-driven development controller, not the parsing loop.
+
 ## 1. Architectural boundary
 
 The current system is already layered, but the boundaries are imperfect:
@@ -40,7 +42,12 @@ filesystem/repository artifacts             |
 scripts, evidence, tests, conventions, and human/editorial judgment
 ```
 
-The future harness boundary should sit **above** the deterministic/domain packages and **below** the research/review orchestration. LangGraph should coordinate typed capabilities; it should not replace the parser steps, linter, scorer, alignment logic, Text-Fabric conversion logic, or the repository's authoritative tagging conventions.
+The future architecture has **two orchestration layers above the deterministic/domain packages**:
+
+1. an agentic parsing harness that formalizes the existing skill-defined complete-column/every-token workflow;
+2. a separate development controller that runs research -> plan -> TDD -> implementation -> tests/evals -> independent review for GitHub issues.
+
+LangGraph may coordinate typed capabilities in either layer, but it must not replace parser steps, linter, scorer, alignment logic, Text-Fabric conversion logic, skills, or the repository's authoritative tagging conventions.
 
 ## 2. Existing deterministic/domain and knowledge packages
 
@@ -88,8 +95,8 @@ Likewise, `RefinementStep` cleanly exposes `refine_row(row) -> row`, but its def
 | `parse-ugaritic-gt-stems` | Gt-stem audit/repair workflow | research first; may lead to parser/reviewed changes | specialist research capability |
 | `parse-ugaritic-n-stems` | N-stem audit/repair workflow | research first; may lead to parser/reviewed changes | specialist research capability |
 | `regenerate-automatic-parsing` | Rebuild generated parser output and reports with staging/safeguards | broad generated-data mutation | explicit execution capability; never hand-edit output |
-| `review-automatic-parsing` | Token-by-token scholarly adjudication into gold `reviewed/**` | curated human/editorial write | human/research workflow; not autonomous parser node |
-| `review-linguistic-rule-change` | Turn expert feedback into measured rule/exception/test changes | research, then code/config/data mutation as justified | ideal research→plan→TDD workflow template |
+| `review-automatic-parsing` | Token-by-token scholarly adjudication into gold `reviewed/**`; complete column is the work/context unit and every token is reviewed in order | curated scholarly write | **primary agentic parsing workflow contract**; HARN-008/HARN-018 must formalize it without changing its semantics |
+| `review-linguistic-rule-change` | Turn expert feedback into measured rule/exception/test changes | research, then code/config/data mutation as justified | template/source for systematic finding -> development issue/change semantics |
 | `triage-morphology-lint-regressions` | Stable baseline-vs-candidate ERROR comparison | read/diagnose by default | deterministic gate + investigation workflow |
 
 `.claude/skills` is mostly a compatibility surface: 11 entries are symlinks to the canonical `.agents/skills` packages. It also contains one **real, non-symlink, Claude-only package**, `parse-ugaritic-passive-participle`, with its own `SKILL.md`, `agents/`, `references/`, and `scripts/audit_passive_participle.py`. Harness discovery must therefore either canonicalize aliases and then add this package explicitly, or migrate it into the canonical skill tree before assuming `.agents/skills` is exhaustive.
@@ -105,7 +112,7 @@ The skills are not merely prompts. Across the inventory they combine:
 
 In addition, multiple skills explicitly defer to `agent/prompts/**` for authoritative notation/procedure. In particular, `review-automatic-parsing` treats `Morphological_Labeling_Agent_Guide.md`, `Morphological_Labeling_Quick_Checklist.md`, and `Tagging conventions.md` as controlling knowledge. A future skill manifest therefore needs dependency references/hashes, not just a prompt body.
 
-HARN-008 should add only the machine-readable metadata genuinely needed for discovery/version/permissions. It should not copy the domain knowledge into LangGraph/LangChain-specific prompt classes.
+HARN-008 should extract the machine-readable metadata and state semantics genuinely needed for discovery/version/permissions/completion. It must not copy the domain knowledge into LangGraph/LangChain-specific prompt classes or reinterpret the complete-column/every-token workflow.
 
 ## 4. Executable/helper surface
 
@@ -171,20 +178,21 @@ The presence of bundled executables means capability discovery cannot be based o
 
 ### Script grouping for the first harness
 
-The first vertical slice should expose only a small allowlist:
+The first vertical slice should expose only a small allowlist **sufficient to execute the real `review-automatic-parsing` column workflow**, not a synthetic dev-loop workflow.
 
 **Read/evaluate:**
 - reviewed evaluator (`reviewed_evaluation` directly or `score_reviewed_morphology.py --json`);
 - lint regression comparator;
 - selected DULAT/corpus lookup helpers;
-- selected bundled audit scripts whose effects have been classified.
+- `review-automatic-parsing` worklist/evidence/status helpers;
+- selected specialist audit scripts whose effects have been classified.
 
-**Execute deterministic parser:**
+**Execute deterministic parser/regeneration when required:**
 - `TabletParsingPipeline` through a controlled staging-directory adapter.
 
 **Do not initially expose:**
 - historical one-off `fix_*`, `build_1_3_*`, `emit_*`, `reconcile_*` scripts;
-- direct `reviewed/**` writers;
+- unrestricted direct `reviewed/**` writers outside the specific skill workflow;
 - git-hook installer;
 - unrestricted filesystem or GitHub mutation;
 - unclassified skill-bundled executables merely because a skill references them.
@@ -229,13 +237,23 @@ This means one apparent "parser call" crosses several side-effect boundaries. Th
 
 `FullRegenerationRunner` composes TF materialization, `TabletParsingPipeline`, lint generation, reviewed scoring, and delta-report writes. It is already an orchestration layer. LangGraph should invoke it only when the task explicitly calls for a broad regeneration; it should not reimplement this sequence node-by-node without a demonstrated need.
 
-### Reviewed data
+### Reviewed data and agentic column review
 
-`review-automatic-parsing` explicitly defines reviewed data as gold created by token-by-token scholarly review; seeding is only a worklist. `migrate-reviewed-text-fabric` likewise requires a preview outside `reviewed/**`, alignment review, lint/tests, then an intentional final copy. These policies are stronger than generic filesystem permissions and must survive as capability-specific gates.
+`review-automatic-parsing` explicitly defines reviewed data as gold created by systematic token-by-token scholarly review. Its runtime semantics are stronger than generic filesystem permissions:
+
+- a **column**, not a tablet, is one work/context unit;
+- every token is reviewed in order;
+- worklists/evidence passes identify where to look hardest but never reduce scope;
+- the whole column is connected context;
+- alternative sourced readings are preserved;
+- completion is checked explicitly by status/lint/reconstruction rules;
+- recurring/generalizable problems escalate to specialist audits or parser/linter fixes instead of being improvised locally.
+
+Seeding is only a worklist. `migrate-reviewed-text-fabric` likewise requires a preview outside `reviewed/**`, alignment review, lint/tests, then an intentional final copy. These policies must survive as capability-specific gates.
 
 ### Knowledge dependencies
 
-`review-automatic-parsing` explicitly delegates notation/procedure to the prompt/convention files, and phenomenon skills add their own references. Therefore a review trace is incomplete if it records only the model and skill name. At minimum it should record the skill package revision plus the authoritative knowledge/reference file hashes used in that run.
+`review-automatic-parsing` explicitly delegates notation/procedure to the prompt/convention files, and phenomenon skills add their own references. Therefore a parsing trace is incomplete if it records only the model and skill name. At minimum it should record the skill package revision plus the authoritative knowledge/reference file hashes used in that run.
 
 ### Git/repository
 
@@ -253,7 +271,7 @@ There are two distinct test surfaces:
 
 Many `agent/tests` import `pipeline`, `scripts`, `linter`, `morph_features`, etc. as top-level modules. They therefore assume the `agent/` package root is on `sys.path` / is the working directory. HARN-000's bare root `pytest` under Python 3.10 produced 105 collection errors before the probe, demonstrating that root CI cannot currently be treated as the authoritative agent test invocation.
 
-HARN-011 must establish the persistent CI contract instead of hiding this with a global `pytest.ini`.
+HARN-011 established the persistent fork-local agent CI contract; HARN-012/HARN-013 retain remaining policy/dependency hardening.
 
 ### Existing machine-friendly gates to reuse
 
@@ -265,9 +283,11 @@ HARN-011 must establish the persistent CI contract instead of hiding this with a
 
 These are much stronger harness gates than asking an LLM whether output "looks correct".
 
+Parsing evaluation additionally needs explicit **complete-column coverage**, expert feedback, ambiguity/consistency measures, and model/skill/tool provenance; those belong to HARN-015/HARN-016 rather than a second morphology scorer.
+
 ## 8. Candidate harness contracts/adapters
 
-The following seams can be defined framework-neutrally in HARN-002:
+The development-controller contracts defined by HARN-002 remain framework-neutral. Parsing runtime state is a separate HARN-018 concern.
 
 ### `EvidenceQuery`
 Read-only calls over DULAT/UDB/corpus/TF/evidence sources. Returns structured evidence plus source/config provenance.
@@ -281,13 +301,16 @@ Outputs: structured summary + immutable references/hashes to staged artifacts. P
 Examples: lint regression and reviewed morphology scoring. Returns structured metrics/findings and an execution classification; never lets model text set pass/fail.
 
 ### `KnowledgeBundle`
-Versioned references/hashes for `agent/prompts/**`, skill-local `references/**`, and tracked evidence/config tables used by a research/review run. It is input provenance, not free-form model memory.
+Versioned references/hashes for `agent/prompts/**`, skill-local `references/**`, and tracked evidence/config tables used by a parsing/review run. It is input provenance, not free-form model memory.
 
 ### `SkillCapability`
-A versioned reference to a canonical `.agents/skills/<name>` package or explicitly registered non-canonical skill, its allowed tools/evidence, bundled executables, expected artifacts, aliases, and permission class. Domain instructions remain in the skill package.
+A versioned reference to a canonical `.agents/skills/<name>` package or explicitly registered non-canonical skill, its work/context unit, ordered stages, allowed tools/evidence, bundled executables, expected artifacts, completion rules, aliases, prompt/reference dependencies, and permission class. Domain instructions remain in the skill package.
+
+### `ColumnRunState` family
+HARN-018 should derive framework-neutral `ColumnTask`, `ColumnSnapshot`, `TokenCursor`, `TokenDecision`, `EvidenceRecord`, `ColumnCompletion`, and reconciliation contracts from `review-automatic-parsing`. Completion must be impossible with skipped tokens.
 
 ### `CuratedDataChange`
-Represents a proposed reviewed-data edit/migration separately from generated output. Must carry evidence/provenance and require the task-specific review gate.
+Represents a proposed reviewed-data edit/migration separately from generated output. Must carry evidence/provenance and require the task-specific review/completion semantics.
 
 ### `RepositoryChange`
 Fork-local branch/file/PR operation with explicit destination and operation ID. Upstream writes are a separate human-authorized capability and cannot be reached through a generic adapter.
@@ -295,39 +318,59 @@ Fork-local branch/file/PR operation with explicit destination and operation ID. 
 ## 9. Boundaries the harness should not cross in its first implementation
 
 1. Do not rewrite deterministic parser steps as LLM prompts.
-2. Do not give an agent unrestricted access to historical `fix_*` scripts merely because they exist.
-3. Do not make `reviewed/**` publication an automatic consequence of a parser/evaluator result.
-4. Do not treat a skill as only a prompt; preserve references/scripts/metadata and knowledge dependencies.
-5. Do not make LangGraph/LangChain/Langfuse types part of morphology, evaluation, migration, or path models.
-6. Do not use report text as the source of truth when structured scorer/comparator results exist.
-7. Do not let a graph guess local database/source paths; resolve and record them explicitly.
-8. Do not equate workflow failure with failing tests; HARN-000 demonstrated `blocked-execution` as a distinct state.
-9. Do not publish in-place output from a failed/interrupted regeneration; the regeneration skill already requires clean staging.
-10. Do not assume `.agents/skills` or `agent/scripts` alone exhaust the current executable agent surface; aliases, the Claude-only skill, and bundled skill scripts are real inputs.
+2. Do not invent an anomaly/suspicion selector that decides which tokens are reviewed; `review-automatic-parsing` requires every token in the column.
+3. Do not give an agent unrestricted access to historical `fix_*` scripts merely because they exist.
+4. Do not make `reviewed/**` publication an automatic consequence of a parser/evaluator result outside the explicit skill workflow.
+5. Do not treat a skill as only a prompt; preserve references/scripts/metadata, completion semantics and knowledge dependencies.
+6. Do not make LangGraph/LangChain/Langfuse types part of morphology, evaluation, migration, path or column-run domain models.
+7. Do not use report text as the source of truth when structured scorer/comparator results exist.
+8. Do not let a graph guess local database/source paths; resolve and record them explicitly.
+9. Do not equate workflow failure with failing tests; HARN-000 demonstrated `blocked-execution` as a distinct state.
+10. Do not publish in-place output from a failed/interrupted regeneration; the regeneration skill already requires clean staging.
+11. Do not assume `.agents/skills` or `agent/scripts` alone exhaust the current executable agent surface; aliases, the Claude-only skill, and bundled skill scripts are real inputs.
+12. Do not conflate scholarly expert feedback on parsing with clean-context adversarial PR review in the development controller.
 
-## 10. Findings that should feed later tickets
+## 10. Findings that feed later tickets
 
 ### HARN-002
-Use framework-neutral contracts around artifacts, execution classifications, resolved evidence configuration, knowledge bundles, evaluator results, and side-effect operation IDs.
+Completed: framework-neutral development-loop contracts around task/research/plan/tests/evals/changes/review and durable gate semantics. Do not reuse `RunState` as the column parser state merely because it already exists.
 
 ### HARN-003
 Call `reviewed_evaluation` directly where practical; `score_reviewed_morphology.py --json` is already a stable CLI façade. Do not duplicate its metric implementation.
 
-### HARN-004
-The minimal LangGraph slice can be mostly stubs around real deterministic evaluator/parser adapters. The domain parser must remain unaware of LangGraph.
+### HARN-014
+Correct architecture/backlog around two distinct controllers and the skill-defined systematic parsing workflow.
 
 ### HARN-008
-Skill packaging already has a useful human/executable structure. Add minimal manifest/version/permission/alias/dependency metadata rather than redesigning skills. Resolve the Claude-only passive-participle package so canonical discovery is deterministic.
+Skill packaging already has a useful human/executable structure. Extract minimal manifest/version/permission/alias/dependency/work-unit/completion metadata rather than redesigning skills. `review-automatic-parsing` is the first authoritative runtime workflow to formalize.
+
+### HARN-018
+Define column-run state, every-token cursor/completion, evidence/provenance, alternative-reading and resume/revisit semantics before LangGraph owns the parsing loop.
+
+### HARN-015
+Define output, agent and efficiency evals plus attributable expert feedback. Reuse deterministic scorers and keep evaluation gold out of model context where necessary.
+
+### HARN-004
+The LangGraph spike must exercise a real complete-column/every-token vertical slice derived from HARN-008/HARN-018. It is not a stub research-plan-TDD parser graph. The domain parser and skills remain framework-independent.
+
+### HARN-005
+Trace parsing runs and development runs as distinct trace schemas; ingest deterministic CUC metrics without changing them.
+
+### HARN-016
+Compare models on identical complete columns, repository/data revision, skills/prompts/tools/permissions and completion/eval protocol.
+
+### HARN-017
+Classify systematic findings from parsing/evals/expert feedback into parser/linter/skill/tool/harness/eval development issues; avoid generalizing from isolated local readings.
 
 ### HARN-009
 Capability permissions need more granularity than "filesystem write": generated-output publication, curated reviewed-data edits, local cache/index materialization, fork GitHub writes, and upstream GitHub writes have different policies. Bundled skill executables need the same classification.
 
-### HARN-011
-Repair the test execution contract using the real `agent/` test root/runtime/import assumptions. Do not solve CI by globally narrowing pytest discovery.
+### HARN-010
+The bounded autonomous research-plan-TDD-review controller consumes GitHub development issues. It does not parse corpus tokens.
 
 ## 11. HARN-001 validation gate
 
-This research ticket is documentation-only, so its test gate is an explicit inventory/consistency check rather than executable product code.
+This research ticket was documentation-only, so its test gate is an explicit inventory/consistency check rather than executable product code.
 
 - [x] Root repository surfaces enumerated from the branch tree.
 - [x] All 11 canonical `.agents/skills` top-level packages accounted for by name and effect class.
@@ -341,6 +384,6 @@ This research ticket is documentation-only, so its test gate is an explicit inve
 - [x] Git hook and GitHub execution side effects recorded.
 - [x] Test-root/runtime/import assumptions recorded, including HARN-000 failure evidence.
 - [x] Candidate adapter seams identified without adding LangGraph/LangChain/Langfuse dependencies.
-- [x] No parser, data, workflow, dependency, or upstream repository state changed by this ticket.
+- [x] No parser, data, workflow, dependency, or upstream repository state changed by HARN-001.
 
-Independent review must attack this checklist rather than trusting it: compare the document against the actual directory trees, look for missing mutation paths, aliases and non-canonical skills, verify bundled executables, and challenge any item classified as deterministic/read-only when it can write or depend on mutable external state.
+HARN-014 subsequently corrected the interpretation of the agentic parsing workflow without changing the underlying inventory: independent review of the correction must compare the architecture against the actual skills, especially complete-column scope, every-token traversal, completion semantics, and escalation rules.
