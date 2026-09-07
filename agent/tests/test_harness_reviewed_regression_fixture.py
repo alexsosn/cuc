@@ -30,6 +30,24 @@ REQUIRED_ROLES = {
     "ordered-heuristic",
     "overgeneration",
 }
+EXPECTED_METRIC_FIELDS = {
+    "compared_ids",
+    "reviewed_option_count",
+    "auto_option_count",
+    "true_positive_option_count",
+    "exact_set_accuracy",
+    "macro_precision",
+    "macro_recall",
+    "macro_f1",
+    "macro_jaccard",
+    "micro_precision",
+    "micro_recall",
+    "micro_f1",
+    "gold_coverage",
+    "mean_extra_options",
+    "mean_missing_options",
+    "mean_option_count_error",
+}
 
 
 class ReviewedMorphologyRegressionFixtureTest(unittest.TestCase):
@@ -123,9 +141,12 @@ class ReviewedMorphologyRegressionFixtureTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
+        manifest = self.load_manifest()
         self.assertEqual(payload["file_count"], 2)
         self.assertEqual(len(payload["files"]), 2)
         self.assertEqual(payload["summary"]["compared_ids"], 7)
+        self.assertEqual(set(payload["summary"]), EXPECTED_METRIC_FIELDS)
+        self.assertEqual(payload["summary"], manifest["expected_summary"])
         self.assertEqual(
             {result["label"] for result in payload["files"]},
             {"KTU 1.6.tsv", "KTU 2.10.tsv"},
