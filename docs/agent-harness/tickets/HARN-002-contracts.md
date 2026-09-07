@@ -14,7 +14,7 @@ Existing CUC data-model style uses frozen standard-library dataclasses with expl
 
 `agent/harness/` contains no orchestration-framework imports. Contracts use frozen dataclasses, `Enum`, normalized tuples, JSON-safe scalar mappings, and explicit runtime validation.
 
-Type annotations are not treated as runtime validation. `RunState` rejects wrong nested contract types before they can become a durable checkpoint, so malformed state fails at construction rather than later during serialization or replay.
+Type annotations are not treated as runtime validation. `RunState` rejects wrong nested contract types before they can become a durable checkpoint, so malformed state fails at construction rather than later during serialization or replay. Deserialization preserves that same validation boundary: `from_dict()` validates mappings and passes collection-shaped values through to constructors instead of coercing malformed scalar strings into character tuples.
 
 ### 2. Durable identity is explicit but side-effect execution is out of scope
 
@@ -39,6 +39,8 @@ Retry loops are explicit:
 - human escalation -> `awaiting-human` with the interrupted phase captured in `resume_phase`.
 
 Resume is allowed only to the captured non-exceptional phase. Durable snapshots also validate phase prerequisites, so serialized state cannot claim `review` or `complete` without the evidence required to reach those phases.
+
+`implement` checkpoints are also constrained to reducer-reachable forms. Before the first change, `implement` represents the initial implementation phase. Once a change exists, an `implement` checkpoint must retain either current `test-failure`/`regression` evidence for the latest change or a `request-changes` review backed by the verified evidence for the inspected revision. A restored checkpoint therefore cannot skip verification merely by declaring `phase=implement` after recording a change.
 
 ### 4. Gate outcomes and review dispositions are separate
 
@@ -68,7 +70,7 @@ Test/eval/review contracts carry concise summaries plus optional stable evidence
 
 `harness/state_machine.py` is a reducer from immutable `RunState` + typed event to immutable `RunState`. It performs no file, network, model, or GitHub side effects. Invalid event/phase combinations raise `InvalidTransition`.
 
-Events cover research, plan, test declaration, change recording, test/eval evidence, verification, review, and resume. HARN-004 can wrap this reducer with LangGraph without importing LangGraph into the domain layer.
+Event wrappers validate their contract payloads at construction time, and `apply_event()` rejects non-`RunState` inputs before dereferencing state fields. Events cover research, plan, test declaration, change recording, test/eval evidence, verification, review, and resume. HARN-004 can wrap this reducer with LangGraph without importing LangGraph into the domain layer.
 
 ## Contract inventory
 
@@ -91,7 +93,8 @@ Public contracts:
 
 - required IDs/text are non-empty;
 - tuple-like fields normalize to tuples; required collections reject empty values;
-- nested durable values must be instances of their declared contract types;
+- scalar strings are rejected for tuple-like fields both in direct construction and through `from_dict()`; deserialization must not pre-coerce malformed scalars into character tuples;
+- nested durable values must be instances of their declared contract types, while non-null nested serialized values must be mappings/collections of mappings as appropriate;
 - `TaskSpec` requires at least one acceptance criterion;
 - `PlanArtifact` requires at least one step;
 - `TestIntent` requires a command, working directory, and explicit targeted/regression kind;
@@ -104,19 +107,22 @@ Public contracts:
 - `ReviewResult(approve)` cannot contain blocking findings;
 - `ReviewResult(request-changes)` requires at least one blocking finding;
 - test results must refer to declared intents and known changes; eval results must refer to known changes;
+- `implement` with no recorded change is the initial implementation state; with a recorded change it requires current `test-failure`/`regression` evidence or a `request-changes` review backed by complete verified evidence;
 - `review`/`complete` checkpoints require fresh successful evidence for every declared test on the latest change;
 - verified current test/eval evidence must agree on one proposed head and one executed revision;
 - `complete` requires an approving review of the verified head;
 - duplicate operation IDs within a change or across a run are invalid;
-- explicit `to_dict()` / `from_dict()` gives a lossless JSON round-trip for valid state.
+- explicit `to_dict()` / `from_dict()` gives a lossless JSON round-trip for valid state and rejects malformed serialized shapes rather than silently normalizing them into another valid type.
 
 ## TDD and adversarial-review record
 
 1. Contract/state-machine tests were committed before `agent/harness` existed. Missing implementation was converted into ordinary assertion failures so pytest collection stayed healthy; the initial RED was classified as `test-failure`, not HARN-011 `blocked-execution`.
 2. The first implementation reached full GREEN, then an independent adversarial review rejected it for mixed executed-revision evidence, forged phase snapshots, and weak executed-test evidence.
 3. Regression tests reproduced those three findings before fixes were written.
-4. A second independent review of the next GREEN found nested type confusion: malformed values could enter `RunState` and fail only later during serialization. A second reviewer-driven RED reproduced that defect before the runtime type checks were added.
-5. Final acceptance requires a full fork-local suite on the documentation-final head plus a fresh review of the resulting diff. No generated `auto_parsing/**` data may be edited by this ticket.
+4. A second independent review of the next GREEN found nested type confusion: malformed values could enter `RunState` and fail only later during serialization. A reviewer-driven RED reproduced that defect before runtime nested-type checks were added.
+5. A third fresh review found malformed transition-event payloads, non-`RunState` reducer input, and scalar strings being accepted as tuple-like direct constructor values. Regression tests were committed first; the RED was `9 failed, 1069 passed, 8 subtests passed`. Event-boundary/runtime guards then restored full GREEN.
+6. A fourth fresh review of that GREEN found two durable restore/reachability defects: `from_dict()` pre-coercion could bypass the scalar-string guard, and a forged `IMPLEMENT` checkpoint could contain a recorded change without any reducer-valid retry cause. Regression tests were committed first; the exact RED was `5 failed, 1072 passed, 15 subtests passed`. The fix made deserialization preserve constructor validation and constrained `IMPLEMENT` checkpoints to reducer-reachable forms. The resulting full suite was `1073 passed, 19 subtests passed` on code head `2e83b223cc9fd3709a0ef07b21bd3f8b7f0bde6b` / synthetic merge `9c031f457ec370c282caa19956e2394d2cc9d14f`.
+7. Final acceptance requires a full fork-local suite on this documentation-final head plus a fresh review of the resulting diff. No generated `auto_parsing/**` data may be edited by this ticket.
 
 ## Deferred deliberately
 
