@@ -36,8 +36,16 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install focused test runner
-        run: python -m pip install pytest==9.1.1
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.7"
 
-      - name: Run agent CI contract test
-        run: python -m pytest tests/test_ci_contract.py -q
+      - name: Sync locked agent dependencies
+        run: uv sync --frozen --no-install-project
+
+      - name: Install pinned test runner
+        run: uv pip install --python .venv/bin/python pytest==9.1.1
+
+      - name: Run full agent test suite
+        run: .venv/bin/python -m pytest -q
