@@ -112,6 +112,41 @@ class HarnessContractTypeSafetyTests(unittest.TestCase):
                 sm.ResearchRecorded({"artifact_id": "not-a-contract"}),
             )
 
+    def test_scalar_strings_are_not_tuple_like_contract_values(self):
+        with self.assertRaises(ValueError):
+            c.TaskSpec("task", "title", "objective", "criterion")
+        with self.assertRaises(ValueError):
+            c.PlanArtifact("plan", "summary", "step")
+        with self.assertRaises(ValueError):
+            c.TestIntent(
+                "intent",
+                c.TestKind.TARGETED,
+                "pytest",
+                "agent",
+                "scalar command",
+            )
+        with self.assertRaises(ValueError):
+            c.ChangeSet("change", "summary", "agent/harness/contracts.py")
+
+    def test_transition_events_reject_wrong_contract_payloads(self):
+        malformed = (
+            lambda: sm.ResearchRecorded({}),
+            lambda: sm.PlanRecorded({}),
+            lambda: sm.TestsDeclared(({},)),
+            lambda: sm.ChangeRecorded({}),
+            lambda: sm.TestRecorded({}),
+            lambda: sm.EvalRecorded({}),
+            lambda: sm.ReviewRecorded({}),
+        )
+        for build in malformed:
+            with self.subTest(builder=build):
+                with self.assertRaises(ValueError):
+                    build()
+
+    def test_reducer_rejects_non_run_state(self):
+        with self.assertRaises(ValueError):
+            sm.apply_event({}, sm.ResumeRequested())
+
 
 if __name__ == "__main__":
     unittest.main()
