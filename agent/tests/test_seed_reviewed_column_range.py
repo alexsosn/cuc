@@ -28,6 +28,28 @@ class SeedReviewedColumnRangeTests(unittest.TestCase):
         self.assertIn("(dry run — nothing written)", result.stdout)
         self.assertEqual(before, reviewed.read_text(encoding="utf-8"))
 
+    def test_fully_reviewed_tablet_non_dry_is_noop(self):
+        agent_dir = Path(__file__).resolve().parents[1]
+        reviewed = agent_dir.parent / "reviewed" / "KTU 2.10.tsv"
+        before = reviewed.read_text(encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/seed_reviewed_column_range.py",
+                "2.10",
+                "-",
+            ],
+            cwd=agent_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertIn("0 rows to append", result.stdout)
+        self.assertIn("no rows to append", result.stdout)
+        self.assertEqual(before, reviewed.read_text(encoding="utf-8"))
+
     def test_seed_plan_omits_headers_without_new_rows(self):
         from scripts import seed_reviewed_column_range as seed
 
@@ -52,6 +74,7 @@ class SeedReviewedColumnRangeTests(unittest.TestCase):
                 ("T", "3"),
             ],
         )
+        self.assertEqual(selector(order, {"1", "2", "3", "4"}), [])
 
 
 if __name__ == "__main__":
