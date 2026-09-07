@@ -22,7 +22,7 @@ The dedicated `.github/workflows/agent-tests.yml` job:
 2. provisions Python 3.13;
 3. provisions uv 0.12.7;
 4. runs `uv sync --frozen --no-install-project` from `agent/`, so project runtime dependencies come from `agent/uv.lock`;
-5. installs the explicitly pinned test runner `pytest==9.1.1` into `agent/.venv`;
+5. installs the CI-only test packages `pytest==9.1.1`, `iniconfig==2.3.0`, and `pluggy==1.6.0` into `agent/.venv`; pytest's `packaging`/`pygments` dependencies are already supplied by the frozen project environment;
 6. runs the complete pytest suite from `agent/`.
 
 Workflow actions are pinned to exact release commits:
@@ -126,7 +126,7 @@ This GREEN used the complete `agent/tests` discovery configured by `agent/pyproj
 - Keep the test command rooted at `agent/` unless package/import layout is intentionally redesigned with tests proving the new contract.
 - Keep Python aligned with `agent/pyproject.toml` and `agent/uv.lock`.
 - Update pinned action/tool versions deliberately and record the new provenance.
-- If pytest becomes a locked development dependency, remove the separate CI installation rather than maintaining duplicate dependency declarations.
+- If pytest and its CI-only dependencies become locked development dependencies, remove the separate CI installation rather than maintaining duplicate dependency declarations.
 - Do not add a path filter to the permanent PR gate merely to save a small amount of CI time.
 - A failing full-suite test is work to investigate, not a reason to narrow discovery.
 - Generated-data policy still applies inside tests and fixes: never hand-edit `auto_parsing/**` to obtain GREEN.
