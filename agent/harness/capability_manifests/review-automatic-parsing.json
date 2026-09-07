@@ -29,11 +29,10 @@
     "eupt",
     "published-translations",
     "legacy-review",
-    "corpus-parallels"
-  ],
-  "optional_evidence": [
+    "corpus-parallels",
     "burns-cultic-vocabulary"
   ],
+  "optional_evidence": [],
   "authoritative_resources": [
     "agent/prompts/Morphological_Labeling_Agent_Guide.md",
     "agent/prompts/Morphological_Labeling_Quick_Checklist.md",

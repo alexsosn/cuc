@@ -277,6 +277,7 @@ class SkillProvenance:
     canonical_name: str
     contract_version: str
     manifest_sha256: str
+    skill_package_sha256: str
     resources: tuple[ResourceDigest, ...]
 
     def to_dict(self) -> dict[str, object]:
@@ -284,6 +285,7 @@ class SkillProvenance:
             "canonical_name": self.canonical_name,
             "contract_version": self.contract_version,
             "manifest_sha256": self.manifest_sha256,
+            "skill_package_sha256": self.skill_package_sha256,
             "resources": [item.to_dict() for item in self.resources],
         }
 
@@ -430,8 +432,53 @@ class SkillCapabilityRegistry:
             canonical_name=manifest.canonical_name,
             contract_version=manifest.contract_version,
             manifest_sha256=manifest_digest,
+            skill_package_sha256=self._skill_package_digest(manifest),
             resources=resources,
         )
+
+    def _skill_package_digest(self, manifest: SkillCapabilityManifest) -> str:
+        """Digest every file/symlink entry in the canonical skill package deterministically."""
+        package = self._resolve_repo_path(manifest.skill_path, require_file=False)
+        digest = sha256()
+        entries: list[tuple[str, bytes]] = []
+        for candidate in package.rglob("*"):
+            relative = candidate.relative_to(package).as_posix()
+            if candidate.is_symlink():
+                try:
+                    resolved = candidate.resolve(strict=True)
+                except FileNotFoundError as exc:
+                    raise ValueError(
+                        f"canonical skill package contains a broken symlink: {relative}"
+                    ) from exc
+                try:
+                    resolved.relative_to(self.repo_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"canonical skill package symlink escapes repository: {relative}"
+                    ) from exc
+                payload = b"L\0" + candidate.readlink().as_posix().encode("utf-8")
+                entries.append((relative, payload))
+                continue
+            if candidate.is_dir():
+                continue
+            if not candidate.is_file():
+                raise ValueError(
+                    f"canonical skill package contains unsupported entry: {relative}"
+                )
+            try:
+                candidate.resolve(strict=True).relative_to(self.repo_root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"canonical skill package file escapes repository: {relative}"
+                ) from exc
+            entries.append((relative, b"F\0" + candidate.read_bytes()))
+
+        for relative, payload in sorted(entries, key=lambda item: item[0]):
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(payload)
+            digest.update(b"\0")
+        return digest.hexdigest()
 
 
 def _skill_frontmatter_name(text: str) -> str | None:
