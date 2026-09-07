@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "contract_version": "1.0.0",
+  "canonical_name": "review-automatic-parsing",
+  "skill_path": ".agents/skills/review-automatic-parsing",
+  "aliases": [
+    ".claude/skills/review-automatic-parsing"
+  ],
+  "work_unit": "column",
+  "ordered_stages": [
+    "establish-scope",
+    "seed-if-needed",
+    "build-worklist",
+    "review-each-token",
+    "verify",
+    "report"
+  ],
+  "scope_invariants": [
+    "complete-column",
+    "every-token-in-order",
+    "worklists-attention-only",
+    "preserve-defensible-ambiguity",
+    "auto-parsing-generated-never-hand-edit",
+    "one-column-per-review-commit"
+  ],
+  "required_evidence": [
+    "dulat",
+    "tropper",
+    "eupt",
+    "published-translations",
+    "legacy-review",
+    "corpus-parallels",
+    "burns-cultic-vocabulary"
+  ],
+  "optional_evidence": [],
+  "authoritative_resources": [
+    "agent/prompts/Morphological_Labeling_Agent_Guide.md",
+    "agent/prompts/Morphological_Labeling_Quick_Checklist.md",
+    "agent/prompts/Tagging conventions.md",
+    ".agents/skills/review-automatic-parsing/references/evidence-sources.md",
+    ".agents/skills/review-automatic-parsing/references/tropper-conventions.md",
+    ".agents/skills/review-automatic-parsing/references/comment-conventions.md"
+  ],
+  "helper_resources": [
+    ".agents/skills/review-automatic-parsing/scripts/review_status.py",
+    ".agents/skills/review-automatic-parsing/scripts/legacy_align.py",
+    ".agents/skills/review-automatic-parsing/scripts/sources_lookup.py",
+    ".agents/skills/review-automatic-parsing/scripts/tropper_index.py",
+    ".agents/skills/audit-onomastic-encoding/scripts/eupt_align.py",
+    ".agents/skills/audit-onomastic-encoding/scripts/lint_diff.sh",
+    "agent/scripts/seed_reviewed_column_range.py",
+    "agent/linter/lint.py"
+  ],
+  "effect": "curated-data-write",
+  "write_scopes": [
+    "reviewed/**"
+  ],
+  "read_only_scopes": [
+    "auto_parsing/**"
+  ],
+  "completion_verifiers": [
+    "review-status-clean",
+    "lint-error-delta-no-regression",
+    "report-token-count"
+  ],
+  "escalation_targets": [
+    "phenomenon-audit-skill",
+    "review-linguistic-rule-change",
+    "parser-fix-test-regenerate"
+  ],
+  "evaluator_requirements": [
+    "review-status",
+    "reviewed-lint-delta"
+  ],
+  "permissions": [
+    "repository-read",
+    "external-evidence-read",
+    "reviewed-column-write"
+  ]
+}
