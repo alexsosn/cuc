@@ -102,11 +102,12 @@ class SkillCapabilityContractTest(unittest.TestCase):
         )
 
         skill_text = REVIEW_SKILL.read_text(encoding="utf-8")
+        normalized_skill_text = " ".join(skill_text.split())
         self.assertIn("bounded by a column", skill_text)
         self.assertIn("**Every token, in order.**", skill_text)
         self.assertIn(
             "the worklist tells you where to look hardest, not where to stop",
-            skill_text,
+            normalized_skill_text,
         )
         self.assertIn("`auto_parsing/**` is\n   generated: never hand-edit it", skill_text)
 
@@ -192,7 +193,10 @@ class SkillCapabilityContractTest(unittest.TestCase):
             manifest_dir = root / "agent" / "harness" / "capability_manifests"
             skill_dir.mkdir(parents=True)
             manifest_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text("# Example\n", encoding="utf-8")
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: example-skill\ndescription: Example capability.\n---\n\n# Example\n",
+                encoding="utf-8",
+            )
             (skill_dir / "reference.md").write_text("first\n", encoding="utf-8")
             payload = {
                 "schema_version": 1,
