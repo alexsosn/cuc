@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from hashlib import sha256
 import inspect
-import json
 from pathlib import Path
 
 import pytest
@@ -29,6 +27,12 @@ import harness.langgraph_column_review as runtime
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SHA0 = "0" * 64
+EXPECTED_CONTEXT = (
+    "worklist:legacy",
+    "worklist:eupt",
+    "worklist:tropper",
+    "worklist:lint",
+)
 
 
 def _state() -> ColumnRunState:
@@ -90,20 +94,22 @@ def _evaluation(state: ColumnRunState) -> ParsingEvaluationRecord:
     )
 
 
-def test_skill_context_initializes_once_before_tokens_and_survives_resume() -> None:
+def test_skill_context_initializes_once_flows_to_tokens_and_survives_resume() -> None:
     parameters = inspect.signature(runtime.ColumnReviewAdapters).parameters
     if "initialize_skill_context" not in parameters:
         pytest.fail("ColumnReviewAdapters lacks mandatory initialize_skill_context stage")
 
     calls: list[str] = []
+    contexts_seen: list[tuple[str, ...]] = []
     failed_once = False
 
     def initialize_skill_context(state, operation_id):
         calls.append(f"initialize:{operation_id}")
-        return ("worklist:legacy", "worklist:eupt", "worklist:tropper", "worklist:lint")
+        return EXPECTED_CONTEXT
 
-    def collect_evidence(state, token, operation_id):
+    def collect_evidence(state, token, skill_context, operation_id):
         calls.append(f"evidence:{token.token_id}")
+        contexts_seen.append(tuple(skill_context))
         return (
             EvidenceRecord(
                 "ev-t1",
@@ -114,9 +120,10 @@ def test_skill_context_initializes_once_before_tokens_and_survives_resume() -> N
             ),
         )
 
-    def adjudicate(state, token, evidence, operation_id, revisit_request=None):
+    def adjudicate(state, token, evidence, skill_context, operation_id, revisit_request=None):
         nonlocal failed_once
         calls.append(f"adjudicate:{token.token_id}")
+        contexts_seen.append(tuple(skill_context))
         if not failed_once:
             failed_once = True
             raise RuntimeError("intentional initialization-resume failure")
@@ -128,12 +135,14 @@ def test_skill_context_initializes_once_before_tokens_and_survives_resume() -> N
             "fixture decision",
         )
 
-    def reconcile(state, operation_id):
+    def reconcile(state, skill_context, operation_id):
         calls.append("reconcile")
+        contexts_seen.append(tuple(skill_context))
         return runtime.ReconciliationPlan((), ())
 
-    def verify_completion(state, gate_id, operation_id):
+    def verify_completion(state, gate_id, skill_context, operation_id):
         calls.append(f"gate:{gate_id}")
+        contexts_seen.append(tuple(skill_context))
         return CompletionGateResult(
             gate_id,
             True,
@@ -142,8 +151,9 @@ def test_skill_context_initializes_once_before_tokens_and_survives_resume() -> N
             "passed",
         )
 
-    def evaluate(state, operation_id):
+    def evaluate(state, skill_context, operation_id):
         calls.append("evaluate")
+        contexts_seen.append(tuple(skill_context))
         return _evaluation(state)
 
     adapters = runtime.ColumnReviewAdapters(
@@ -166,3 +176,5 @@ def test_skill_context_initializes_once_before_tokens_and_survives_resume() -> N
     assert calls.index("evidence:t1") > 0
     assert calls.count("evidence:t1") == 1
     assert calls.count("adjudicate:t1") == 2
+    assert contexts_seen
+    assert all(context == EXPECTED_CONTEXT for context in contexts_seen)
