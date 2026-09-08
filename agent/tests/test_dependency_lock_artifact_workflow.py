@@ -62,9 +62,10 @@ class DependencyLockArtifactWorkflowTest(unittest.TestCase):
         self.assertIn('"pyproject_sha256"', source)
         self.assertIn('"uv_lock_sha256"', source)
 
-    def test_authoritative_agent_tests_remain_frozen(self) -> None:
+    def test_authoritative_agent_tests_reject_stale_lockfiles(self) -> None:
         source = TEST_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("uv sync --frozen --no-install-project", source)
+        self.assertIn("uv sync --locked --no-install-project", source)
+        self.assertNotIn("uv sync --frozen --no-install-project", source)
         self.assertNotRegex(source, r"(?m)^\s*run:\s*uv lock\s*$")
 
 
