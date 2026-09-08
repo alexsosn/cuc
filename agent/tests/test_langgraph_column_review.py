@@ -36,6 +36,12 @@ SHA0 = "0" * 64
 SHA1 = "1" * 64
 SHA2 = "2" * 64
 SHA3 = "3" * 64
+EXPECTED_SKILL_CONTEXT = (
+    "fixture:legacy-worklist",
+    "fixture:eupt-worklist",
+    "fixture:tropper-worklist",
+    "fixture:lint-worklist",
+)
 
 
 def _load_runtime():
@@ -137,6 +143,7 @@ class FakeAdapters:
         self.fail_adjudication_once_for = fail_adjudication_once_for
         self.failed_once = False
         self.initialization_calls: list[str] = []
+        self.skill_contexts_seen: list[tuple[str, ...]] = []
         self.evidence_calls: list[tuple[str, str, tuple[str, ...]]] = []
         self.adjudication_calls: list[tuple[str, str, str | None]] = []
         self.reconciliation_calls: list[str] = []
@@ -146,14 +153,10 @@ class FakeAdapters:
 
     def initialize_skill_context(self, state, operation_id):
         self.initialization_calls.append(operation_id)
-        return (
-            "fixture:legacy-worklist",
-            "fixture:eupt-worklist",
-            "fixture:tropper-worklist",
-            "fixture:lint-worklist",
-        )
+        return EXPECTED_SKILL_CONTEXT
 
-    def collect_evidence(self, state, token, operation_id):
+    def collect_evidence(self, state, token, skill_context, operation_id):
+        self.skill_contexts_seen.append(tuple(skill_context))
         full_column = tuple(item.token_id for item in state.snapshot.tokens)
         self.evidence_calls.append((token.token_id, operation_id, full_column))
         suffix = operation_id.rsplit(":", 1)[-1]
@@ -167,7 +170,16 @@ class FakeAdapters:
             ),
         )
 
-    def adjudicate(self, state, token, evidence, operation_id, revisit_request=None):
+    def adjudicate(
+        self,
+        state,
+        token,
+        evidence,
+        skill_context,
+        operation_id,
+        revisit_request=None,
+    ):
+        self.skill_contexts_seen.append(tuple(skill_context))
         request_id = None if revisit_request is None else revisit_request.request_id
         self.adjudication_calls.append((token.token_id, operation_id, request_id))
         if (
@@ -187,7 +199,8 @@ class FakeAdapters:
             revisit_of=None if revisit_request is None else prior.decision_id,
         )
 
-    def reconcile(self, state, operation_id):
+    def reconcile(self, state, skill_context, operation_id):
+        self.skill_contexts_seen.append(tuple(skill_context))
         self.reconciliation_calls.append(operation_id)
         runtime = _load_runtime()
         if self.orphan_required_finding:
@@ -219,7 +232,8 @@ class FakeAdapters:
         )
         return runtime.ReconciliationPlan((finding,), (request,))
 
-    def verify_completion(self, state, gate_id, operation_id):
+    def verify_completion(self, state, gate_id, skill_context, operation_id):
+        self.skill_contexts_seen.append(tuple(skill_context))
         self.gate_calls.append(gate_id)
         return CompletionGateResult(
             gate_id,
@@ -229,7 +243,8 @@ class FakeAdapters:
             f"Checked {gate_id}",
         )
 
-    def evaluate(self, state, operation_id):
+    def evaluate(self, state, skill_context, operation_id):
+        self.skill_contexts_seen.append(tuple(skill_context))
         self.evaluation_calls.append(operation_id)
         record = _evaluation_for(state)
         self.evaluations.append(record)
@@ -316,6 +331,8 @@ def test_graph_reviews_every_token_in_textual_order_with_full_column_context():
     assert [item[0] for item in fake.evidence_calls] == ["t1", "t2", "t3"]
     assert all(item[2] == ("t1", "t2", "t3") for item in fake.evidence_calls)
     assert fake.initialization_calls == ["run-ktu-1.1-i:column:initialize-skill-context"]
+    assert fake.skill_contexts_seen
+    assert all(item == EXPECTED_SKILL_CONTEXT for item in fake.skill_contexts_seen)
     assert final.initial_pass_complete
     assert final.completion is not None
     assert result["terminal_status"] == "completed"
@@ -332,6 +349,7 @@ def test_checkpoint_resume_uses_domain_cursor_and_does_not_repeat_completed_toke
     result = graph.invoke(None, config=config)
     assert result["column_state"].completion is not None
     assert len(fake.initialization_calls) == 1
+    assert all(item == EXPECTED_SKILL_CONTEXT for item in fake.skill_contexts_seen)
     assert [item[0] for item in fake.evidence_calls].count("t1") == 1
     assert [item[0] for item in fake.evidence_calls].count("t2") == 1
     assert [item[0] for item in fake.adjudication_calls].count("t1") == 1
@@ -347,6 +365,7 @@ def test_different_checkpoint_thread_starts_a_fresh_column_run():
     _invoke(graph, _state(), thread_id="thread-a")
     _invoke(graph, _state(), thread_id="thread-b")
     assert len(fake.initialization_calls) == 2
+    assert all(item == EXPECTED_SKILL_CONTEXT for item in fake.skill_contexts_seen)
     assert [item[0] for item in fake.adjudication_calls] == [
         "t1", "t2", "t3", "t1", "t2", "t3"
     ]
@@ -362,6 +381,7 @@ def test_reconciliation_revisit_preserves_request_and_prior_decision_provenance(
     assert history[1].revisit_request_id == "request-revisit"
     assert final.resolved_revisit_request_ids == ("request-revisit",)
     assert [item[0] for item in fake.adjudication_calls] == ["t1", "t2", "t3", "t1"]
+    assert all(item == EXPECTED_SKILL_CONTEXT for item in fake.skill_contexts_seen)
 
 
 def test_required_finding_without_revisit_cannot_false_complete():
@@ -388,6 +408,7 @@ def test_successful_evaluation_is_forwarded_without_recomputation():
     assert result["evaluation"] == fake.evaluations[0]
     assert result["evaluation"].artifact_refs == ("fixture:evaluation",)
     assert result["evaluation"].decision_revision == result["column_state"].decision_revision
+    assert all(item == EXPECTED_SKILL_CONTEXT for item in fake.skill_contexts_seen)
 
 
 def test_operation_ids_are_stable_and_phase_specific():
