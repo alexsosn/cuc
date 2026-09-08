@@ -46,7 +46,7 @@ Research checked against current LangGraph 1.2.x documentation and Python 3.13 c
 
 ## Dependency/reproducibility boundary
 
-HARN-019 is now complete.
+HARN-019 is complete, and the HARN-021 trusted default-branch lock transport has now passed its live HARN-004 integration proof.
 
 Ordinary `Agent tests` uses:
 
@@ -58,12 +58,20 @@ so stale project metadata fails before tests. Dependency-bearing work must:
 
 1. add the dependency to `agent/pyproject.toml`;
 2. let the read-only `Dependency lock artifact` workflow run `uv lock` with pinned uv;
-3. retrieve the artifact;
-4. verify PR head, merge SHA/ref, uv version and file SHA-256 values with `verify_dependency_lock_artifact.py`;
-5. commit the artifact-generated `uv.lock` bytes without manual editing;
-6. return to the ordinary `--locked` test gate.
+3. let the trusted default-branch `workflow_run` resolve again under `contents: read`, hand off a provenance-bound same-run artifact, and commit only `agent/uv.lock` from a separate `contents: write` job;
+4. verify the bot commit has the triggering HARN head as its exact parent and changes only `agent/uv.lock`;
+5. make a connector/human-authored follow-up commit so ordinary `Agent tests` independently evaluates the resulting head through `uv sync --locked`.
 
-For the spike, use a conservative direct pin to the current stable LangGraph release confirmed during implementation research.
+Live proof on 2026-09-08/09:
+
+- triggering connector-authored HARN-004 head: `e4a2a4e062773503b0375e80c2d6dea1d1acd8d6`;
+- trusted workflow run: `34280422765`, with read-only `resolve-lock` and separate write-only `apply-lock`, both successful;
+- generated lock commit: `d50d615b4adaad3cfca27854942e87738c968f58`;
+- exact parent: `e4a2a4e062773503b0375e80c2d6dea1d1acd8d6`;
+- changed path: only `agent/uv.lock`;
+- author: `github-actions[bot]`.
+
+For this slice, `langgraph==1.2.11` is directly pinned in project metadata and represented by uv-generated lock bytes; the lock is never hand-edited.
 
 ## Runtime boundary
 
