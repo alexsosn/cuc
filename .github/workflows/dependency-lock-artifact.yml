@@ -46,16 +46,21 @@ jobs:
           MERGE_REF: ${{ github.ref }}
         run: |
           python3 - <<'PY'
+          from hashlib import sha256
           import json
           import os
           from pathlib import Path
 
+          pyproject = Path("agent/pyproject.toml")
+          lock = Path("agent/uv.lock")
           metadata = {
               "schema_version": 1,
               "pr_head_sha": os.environ["PR_HEAD_SHA"],
               "merge_sha": os.environ["MERGE_SHA"],
               "merge_ref": os.environ["MERGE_REF"],
               "uv_version":"0.12.7",
+              "pyproject_sha256": sha256(pyproject.read_bytes()).hexdigest(),
+              "uv_lock_sha256": sha256(lock.read_bytes()).hexdigest(),
           }
           Path("agent/lock-artifact-metadata.json").write_text(
               json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n",
