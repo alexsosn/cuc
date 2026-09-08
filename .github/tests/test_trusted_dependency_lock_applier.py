@@ -117,8 +117,8 @@ class TrustedDependencyLockApplierTest(unittest.TestCase):
 
     def test_script_has_two_head_cas_checks_and_single_fixed_tree_path(self) -> None:
         source = self.writer_script()
-        self.assertGreaterEqual(source.count("current_head()"), 2)
-        self.assertIn("current_head() != expected_head", source)
+        self.assertGreaterEqual(source.count("api.current_head(head_branch)"), 2)
+        self.assertGreaterEqual(source.count("api.current_head(head_branch) != expected_head"), 2)
         self.assertIn('"path": LOCK_PATH', source)
         self.assertIn('"parents": [expected_head]', source)
         self.assertIn('"force": False', source)
