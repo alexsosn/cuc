@@ -21,4 +21,6 @@ jobs:
           python-version: "3.13"
           check-latest: false
       - name: Run trusted dependency lock applier contract
-        run: python .github/tests/test_trusted_dependency_lock_applier.py -v
+        run: |
+          python .github/tests/test_trusted_dependency_lock_applier.py -v
+          python .github/tests/test_trusted_dependency_lock_hardening.py -v
