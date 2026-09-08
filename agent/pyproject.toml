@@ -5,7 +5,6 @@ description = "Ugaritic morphological parsing pipeline"
 requires-python = ">=3.13"
 dependencies = [
     "spacy>=3.8.11",
-    "typing-extensions>=4.15.0",
 ]
 
 [tool.ruff]
