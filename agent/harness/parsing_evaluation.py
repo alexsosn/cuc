@@ -36,12 +36,7 @@ def _sha256(value: object, field: str) -> str:
     return digest
 
 
-def _text_tuple(
-    value: object,
-    field: str,
-    *,
-    required: bool = False,
-) -> tuple[str, ...]:
+def _text_tuple(value: object, field: str, *, required: bool = False) -> tuple[str, ...]:
     if isinstance(value, (str, bytes)):
         raise ValueError(f"{field} must be an iterable of strings")
     try:
@@ -69,12 +64,16 @@ def _enum(value: object, enum_type: type[Enum], field: str):
         raise ValueError(f"invalid {field}: {value!r}") from exc
 
 
+def _nonnegative_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
 def _nonnegative_int_or_none(value: object, field: str) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer or None")
-    return value
+    return _nonnegative_int(value, field)
 
 
 def _nonnegative_number_or_none(value: object, field: str) -> float | int | None:
@@ -87,7 +86,7 @@ def _nonnegative_number_or_none(value: object, field: str) -> float | int | None
     return value
 
 
-def _json_round_trip_payload(payload: str, field: str) -> Mapping[str, Any]:
+def _json_payload(payload: str, field: str) -> Mapping[str, Any]:
     if not isinstance(payload, str):
         raise ValueError(f"{field} must be a string")
     try:
@@ -95,6 +94,18 @@ def _json_round_trip_payload(payload: str, field: str) -> Mapping[str, Any]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"{field} must be valid JSON") from exc
     return _mapping(decoded, field)
+
+
+def _objects(value: object, cls: type, field: str) -> tuple:
+    if isinstance(value, (str, bytes, Mapping)):
+        raise ValueError(f"{field} must be an iterable of {cls.__name__}")
+    try:
+        items = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(f"{field} must be an iterable of {cls.__name__}") from exc
+    if any(not isinstance(item, cls) for item in items):
+        raise ValueError(f"{field} must contain only {cls.__name__}")
+    return items
 
 
 class MeasurementKind(str, Enum):
@@ -139,21 +150,13 @@ class ParsingWorkloadRef:
 
     def __post_init__(self) -> None:
         for field in (
-            "corpus",
-            "tablet",
-            "column",
-            "snapshot_id",
-            "snapshot_provenance",
-            "repository_revision",
-            "capability_name",
-            "capability_contract_version",
+            "corpus", "tablet", "column", "snapshot_id", "snapshot_provenance",
+            "repository_revision", "capability_name", "capability_contract_version",
         ):
             object.__setattr__(self, field, _required_text(getattr(self, field), field))
         for field in (
-            "capability_provenance_sha256",
-            "tool_policy_sha256",
-            "evidence_policy_sha256",
-            "permission_policy_sha256",
+            "capability_provenance_sha256", "tool_policy_sha256",
+            "evidence_policy_sha256", "permission_policy_sha256",
         ):
             object.__setattr__(self, field, _sha256(getattr(self, field), field))
 
@@ -175,20 +178,12 @@ class ParsingWorkloadRef:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ParsingWorkloadRef":
-        payload = _mapping(payload, "ParsingWorkloadRef payload")
+        p = _mapping(payload, "ParsingWorkloadRef payload")
         return cls(
-            payload["corpus"],
-            payload["tablet"],
-            payload["column"],
-            payload["snapshot_id"],
-            payload["snapshot_provenance"],
-            payload["repository_revision"],
-            payload["capability_name"],
-            payload["capability_contract_version"],
-            payload["capability_provenance_sha256"],
-            payload["tool_policy_sha256"],
-            payload["evidence_policy_sha256"],
-            payload["permission_policy_sha256"],
+            p["corpus"], p["tablet"], p["column"], p["snapshot_id"],
+            p["snapshot_provenance"], p["repository_revision"], p["capability_name"],
+            p["capability_contract_version"], p["capability_provenance_sha256"],
+            p["tool_policy_sha256"], p["evidence_policy_sha256"], p["permission_policy_sha256"],
         )
 
 
@@ -222,14 +217,10 @@ class ParsingRunIdentity:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ParsingRunIdentity":
-        payload = _mapping(payload, "ParsingRunIdentity payload")
+        p = _mapping(payload, "ParsingRunIdentity payload")
         return cls(
-            payload["run_id"],
-            ParsingWorkloadRef.from_dict(payload["workload"]),
-            payload["model_provider"],
-            payload["model_id"],
-            payload["model_version"],
-            payload["model_config_sha256"],
+            p["run_id"], ParsingWorkloadRef.from_dict(p["workload"]), p["model_provider"],
+            p["model_id"], p["model_version"], p["model_config_sha256"],
         )
 
     def to_json(self) -> str:
@@ -237,7 +228,7 @@ class ParsingRunIdentity:
 
     @classmethod
     def from_json(cls, payload: str) -> "ParsingRunIdentity":
-        return cls.from_dict(_json_round_trip_payload(payload, "ParsingRunIdentity JSON"))
+        return cls.from_dict(_json_payload(payload, "ParsingRunIdentity JSON"))
 
     def model_context_metadata(self) -> dict[str, object]:
         return {
@@ -258,40 +249,24 @@ class ComparabilityReport:
     mismatched_dimensions: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        mismatches = _text_tuple(self.mismatched_dimensions, "mismatched_dimensions")
-        object.__setattr__(self, "mismatched_dimensions", tuple(sorted(mismatches)))
+        mismatches = tuple(sorted(_text_tuple(self.mismatched_dimensions, "mismatched_dimensions")))
         if not isinstance(self.comparable, bool):
             raise ValueError("comparable must be boolean")
         if self.comparable != (not mismatches):
             raise ValueError("comparable must match whether mismatch dimensions are empty")
+        object.__setattr__(self, "mismatched_dimensions", mismatches)
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "comparable": self.comparable,
-            "mismatched_dimensions": list(self.mismatched_dimensions),
-        }
+        return {"comparable": self.comparable, "mismatched_dimensions": list(self.mismatched_dimensions)}
 
 
-_WORKLOAD_COMPARISON_FIELDS = (
-    "corpus",
-    "tablet",
-    "column",
-    "snapshot_id",
-    "snapshot_provenance",
-    "repository_revision",
-    "capability_name",
-    "capability_contract_version",
-    "capability_provenance_sha256",
-    "tool_policy_sha256",
-    "evidence_policy_sha256",
+_WORKLOAD_FIELDS = (
+    "corpus", "tablet", "column", "snapshot_id", "snapshot_provenance",
+    "repository_revision", "capability_name", "capability_contract_version",
+    "capability_provenance_sha256", "tool_policy_sha256", "evidence_policy_sha256",
     "permission_policy_sha256",
 )
-_MODEL_COMPARISON_FIELDS = (
-    "model_provider",
-    "model_id",
-    "model_version",
-    "model_config_sha256",
-)
+_MODEL_FIELDS = ("model_provider", "model_id", "model_version", "model_config_sha256")
 
 
 def compare_run_identities(
@@ -302,19 +277,10 @@ def compare_run_identities(
 ) -> ComparabilityReport:
     if not isinstance(left, ParsingRunIdentity) or not isinstance(right, ParsingRunIdentity):
         raise ValueError("comparability requires ParsingRunIdentity values")
-    mismatches = [
-        field
-        for field in _WORKLOAD_COMPARISON_FIELDS
-        if getattr(left.workload, field) != getattr(right.workload, field)
-    ]
+    mismatches = [field for field in _WORKLOAD_FIELDS if getattr(left.workload, field) != getattr(right.workload, field)]
     if not ignore_model_identity:
-        mismatches.extend(
-            field
-            for field in _MODEL_COMPARISON_FIELDS
-            if getattr(left, field) != getattr(right, field)
-        )
-    ordered = tuple(sorted(mismatches))
-    return ComparabilityReport(not ordered, ordered)
+        mismatches.extend(field for field in _MODEL_FIELDS if getattr(left, field) != getattr(right, field))
+    return ComparabilityReport(not mismatches, tuple(mismatches))
 
 
 @dataclass(frozen=True)
@@ -326,13 +292,7 @@ class EvaluationTarget:
     scorer_provenance: str
 
     def __post_init__(self) -> None:
-        for field in (
-            "target_id",
-            "reviewed_ref",
-            "reviewed_provenance",
-            "scorer_id",
-            "scorer_provenance",
-        ):
+        for field in ("target_id", "reviewed_ref", "reviewed_provenance", "scorer_id", "scorer_provenance"):
             object.__setattr__(self, field, _required_text(getattr(self, field), field))
 
     def to_dict(self) -> dict[str, object]:
@@ -346,14 +306,8 @@ class EvaluationTarget:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "EvaluationTarget":
-        payload = _mapping(payload, "EvaluationTarget payload")
-        return cls(
-            payload["target_id"],
-            payload["reviewed_ref"],
-            payload["reviewed_provenance"],
-            payload["scorer_id"],
-            payload["scorer_provenance"],
-        )
+        p = _mapping(payload, "EvaluationTarget payload")
+        return cls(p["target_id"], p["reviewed_ref"], p["reviewed_provenance"], p["scorer_id"], p["scorer_provenance"])
 
 
 @dataclass(frozen=True)
@@ -374,14 +328,12 @@ class EvaluationMeasurement:
         token_id = _optional_text(self.token_id, "token_id")
         decision_id = _optional_text(self.decision_id, "decision_id")
         if kind is MeasurementKind.NUMERIC:
-            if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
-                raise ValueError("numeric measurement requires int or float, not bool")
-            if not math.isfinite(self.value):
-                raise ValueError("numeric measurement must be finite")
+            if isinstance(self.value, bool) or not isinstance(self.value, (int, float)) or not math.isfinite(self.value):
+                raise ValueError("numeric measurement requires a finite int or float, not bool")
         elif kind is MeasurementKind.BOOLEAN:
             if not isinstance(self.value, bool):
                 raise ValueError("boolean measurement requires bool")
-        elif kind in {MeasurementKind.CATEGORICAL, MeasurementKind.TEXT}:
+        else:
             _required_text(self.value, "measurement value")
         if scope is MeasurementScope.TOKEN:
             if token_id is None or decision_id is None:
@@ -417,17 +369,11 @@ class EvaluationMeasurement:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "EvaluationMeasurement":
-        payload = _mapping(payload, "EvaluationMeasurement payload")
+        p = _mapping(payload, "EvaluationMeasurement payload")
         return cls(
-            payload["name"],
-            MeasurementKind(payload["kind"]),
-            payload["value"],
-            MeasurementScope(payload["scope"]),
-            payload["source"],
-            tuple(payload.get("provenance_refs", ())),
-            payload.get("token_id"),
-            payload.get("decision_id"),
-            payload.get("deterministic", True),
+            p["name"], MeasurementKind(p["kind"]), p["value"], MeasurementScope(p["scope"]),
+            p["source"], tuple(p.get("provenance_refs", ())), p.get("token_id"),
+            p.get("decision_id"), p.get("deterministic", True),
         )
 
 
@@ -448,23 +394,21 @@ class ExpertFeedback:
     def __post_init__(self) -> None:
         scope = _enum(self.scope, FeedbackScope, "scope")
         disposition = _enum(self.disposition, FeedbackDisposition, "disposition")
+        revision = _nonnegative_int(self.decision_revision, "decision_revision")
         token_id = _optional_text(self.token_id, "token_id")
         decision_id = _optional_text(self.decision_id, "decision_id")
-        if isinstance(self.decision_revision, bool) or not isinstance(self.decision_revision, int) or self.decision_revision < 0:
-            raise ValueError("decision_revision must be a non-negative integer")
         corrected = _text_tuple(self.corrected_analyses, "corrected_analyses")
-        if scope is FeedbackScope.TOKEN:
-            if token_id is None or decision_id is None:
-                raise ValueError("token feedback requires token_id and decision_id")
-        elif token_id is not None or decision_id is not None:
+        if scope is FeedbackScope.TOKEN and (token_id is None or decision_id is None):
+            raise ValueError("token feedback requires token_id and decision_id")
+        if scope is FeedbackScope.COLUMN and (token_id is not None or decision_id is not None):
             raise ValueError("column feedback cannot carry token/decision identity")
-        if disposition is FeedbackDisposition.CORRECT:
-            if not corrected:
-                raise ValueError("correction feedback requires corrected analyses")
-        elif corrected:
+        if disposition is FeedbackDisposition.CORRECT and not corrected:
+            raise ValueError("correction feedback requires corrected analyses")
+        if disposition is not FeedbackDisposition.CORRECT and corrected:
             raise ValueError("only correction feedback may contain corrected analyses")
         object.__setattr__(self, "feedback_id", _required_text(self.feedback_id, "feedback_id"))
         object.__setattr__(self, "run_id", _required_text(self.run_id, "run_id"))
+        object.__setattr__(self, "decision_revision", revision)
         object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "disposition", disposition)
         object.__setattr__(self, "reviewer_ref", _required_text(self.reviewer_ref, "reviewer_ref"))
@@ -491,19 +435,12 @@ class ExpertFeedback:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ExpertFeedback":
-        payload = _mapping(payload, "ExpertFeedback payload")
+        p = _mapping(payload, "ExpertFeedback payload")
         return cls(
-            payload["feedback_id"],
-            payload["run_id"],
-            payload["decision_revision"],
-            FeedbackScope(payload["scope"]),
-            FeedbackDisposition(payload["disposition"]),
-            payload["reviewer_ref"],
-            payload["rationale"],
-            tuple(payload["evidence_refs"]),
-            payload.get("token_id"),
-            payload.get("decision_id"),
-            tuple(payload.get("corrected_analyses", ())),
+            p["feedback_id"], p["run_id"], p["decision_revision"], FeedbackScope(p["scope"]),
+            FeedbackDisposition(p["disposition"]), p["reviewer_ref"], p["rationale"],
+            tuple(p["evidence_refs"]), p.get("token_id"), p.get("decision_id"),
+            tuple(p.get("corrected_analyses", ())),
         )
 
     def to_json(self) -> str:
@@ -511,7 +448,7 @@ class ExpertFeedback:
 
     @classmethod
     def from_json(cls, payload: str) -> "ExpertFeedback":
-        return cls.from_dict(_json_round_trip_payload(payload, "ExpertFeedback JSON"))
+        return cls.from_dict(_json_payload(payload, "ExpertFeedback JSON"))
 
 
 @dataclass(frozen=True)
@@ -539,28 +476,17 @@ class EfficiencyMetrics:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "model_calls": self.model_calls,
-            "tool_calls": self.tool_calls,
-            "retries": self.retries,
-            "latency_ms": self.latency_ms,
-            "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens,
-            "cost": self.cost,
-            "currency": self.currency,
+            "model_calls": self.model_calls, "tool_calls": self.tool_calls, "retries": self.retries,
+            "latency_ms": self.latency_ms, "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens, "cost": self.cost, "currency": self.currency,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "EfficiencyMetrics":
-        payload = _mapping(payload, "EfficiencyMetrics payload")
+        p = _mapping(payload, "EfficiencyMetrics payload")
         return cls(
-            payload.get("model_calls"),
-            payload.get("tool_calls"),
-            payload.get("retries"),
-            payload.get("latency_ms"),
-            payload.get("input_tokens"),
-            payload.get("output_tokens"),
-            payload.get("cost"),
-            payload.get("currency"),
+            p.get("model_calls"), p.get("tool_calls"), p.get("retries"), p.get("latency_ms"),
+            p.get("input_tokens"), p.get("output_tokens"), p.get("cost"), p.get("currency"),
         )
 
 
@@ -576,13 +502,8 @@ def measure_morphology_summary(
     provenance = _text_tuple(provenance_refs, "provenance_refs")
     return tuple(
         EvaluationMeasurement(
-            f"{prefix}.{name}",
-            MeasurementKind.NUMERIC,
-            value,
-            MeasurementScope.RUN,
-            "reviewed-morphology-scorer",
-            provenance,
-            deterministic=True,
+            f"{prefix}.{name}", MeasurementKind.NUMERIC, value, MeasurementScope.RUN,
+            "reviewed-morphology-scorer", provenance, deterministic=True,
         )
         for name, value in summary.to_dict().items()
     )
@@ -593,9 +514,9 @@ def _required_finding_is_resolved(state: ColumnRunState, finding) -> bool:
         return True
     resolved = set(state.resolved_revisit_request_ids)
     covered = {
-        request.token_id
-        for request in state.revisit_queue
-        if request.finding_id == finding.finding_id and request.request_id in resolved
+        item.token_id
+        for item in state.revisit_queue
+        if item.finding_id == finding.finding_id and item.request_id in resolved
     }
     return set(finding.token_ids).issubset(covered)
 
@@ -603,59 +524,31 @@ def _required_finding_is_resolved(state: ColumnRunState, finding) -> bool:
 def measure_column_behavior(state: ColumnRunState) -> tuple[EvaluationMeasurement, ...]:
     if not isinstance(state, ColumnRunState):
         raise ValueError("state must be ColumnRunState")
-    latest = {
-        token_id: state.latest_decision(token_id)
-        for token_id in state.snapshot.token_ids
-    }
+    latest = {token_id: state.latest_decision(token_id) for token_id in state.snapshot.token_ids}
     values: tuple[tuple[str, MeasurementKind, int | bool], ...] = (
         ("behavior.expected_token_count", MeasurementKind.NUMERIC, len(state.snapshot.tokens)),
         ("behavior.visited_initial_tokens", MeasurementKind.NUMERIC, state.cursor.next_index),
-        (
-            "behavior.revisit_decision_count",
-            MeasurementKind.NUMERIC,
-            sum(1 for decision in state.decisions if decision.revisit_of is not None),
-        ),
+        ("behavior.revisit_decision_count", MeasurementKind.NUMERIC, sum(1 for d in state.decisions if d.revisit_of is not None)),
         ("behavior.unresolved_revisit_count", MeasurementKind.NUMERIC, len(state.unresolved_revisits)),
+        ("behavior.reconciliation_finding_count", MeasurementKind.NUMERIC, len(state.reconciliation_findings)),
         (
-            "behavior.reconciliation_finding_count",
-            MeasurementKind.NUMERIC,
-            len(state.reconciliation_findings),
+            "behavior.unresolved_required_finding_count", MeasurementKind.NUMERIC,
+            sum(1 for f in state.reconciliation_findings if f.requires_revisit and not _required_finding_is_resolved(state, f)),
         ),
         (
-            "behavior.unresolved_required_finding_count",
-            MeasurementKind.NUMERIC,
-            sum(
-                1
-                for finding in state.reconciliation_findings
-                if finding.requires_revisit and not _required_finding_is_resolved(state, finding)
-            ),
-        ),
-        (
-            "behavior.latest_ambiguous_token_count",
-            MeasurementKind.NUMERIC,
-            sum(1 for decision in latest.values() if decision is not None and len(decision.analyses) > 1),
+            "behavior.latest_ambiguous_token_count", MeasurementKind.NUMERIC,
+            sum(1 for d in latest.values() if d is not None and len(d.analyses) > 1),
         ),
         ("behavior.column_completed", MeasurementKind.BOOLEAN, state.completion is not None),
     )
     provenance = (f"column-state:{state.task.task_id}:revision-{state.decision_revision}",)
     return tuple(
-        EvaluationMeasurement(
-            name,
-            kind,
-            value,
-            MeasurementScope.COLUMN,
-            "column-state",
-            provenance,
-            deterministic=True,
-        )
+        EvaluationMeasurement(name, kind, value, MeasurementScope.COLUMN, "column-state", provenance, deterministic=True)
         for name, kind, value in values
     )
 
 
-def validate_feedback_against_state(
-    feedback: ExpertFeedback,
-    state: ColumnRunState,
-) -> None:
+def validate_feedback_against_state(feedback: ExpertFeedback, state: ColumnRunState) -> None:
     if not isinstance(feedback, ExpertFeedback):
         raise ValueError("feedback must be ExpertFeedback")
     if not isinstance(state, ColumnRunState):
@@ -667,10 +560,7 @@ def validate_feedback_against_state(
     if feedback.scope is FeedbackScope.TOKEN:
         if feedback.token_id not in set(state.snapshot.token_ids):
             raise ValueError("feedback token_id does not exist in column snapshot")
-        decision = next(
-            (item for item in state.decisions if item.decision_id == feedback.decision_id),
-            None,
-        )
+        decision = next((item for item in state.decisions if item.decision_id == feedback.decision_id), None)
         if decision is None:
             raise ValueError("feedback decision_id does not exist in column run")
         if decision.token_id != feedback.token_id:
@@ -687,6 +577,7 @@ class ParsingEvaluationRecord:
     expert_feedback: tuple[ExpertFeedback, ...]
     efficiency: EfficiencyMetrics
     artifact_refs: tuple[str, ...] = ()
+    decision_revision: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version <= 0:
@@ -697,19 +588,24 @@ class ParsingEvaluationRecord:
             raise ValueError("target must be EvaluationTarget")
         if not isinstance(self.efficiency, EfficiencyMetrics):
             raise ValueError("efficiency must be EfficiencyMetrics")
-        deterministic = tuple(self.deterministic_measurements)
-        supplementary = tuple(self.supplementary_measurements)
-        feedback = tuple(self.expert_feedback)
-        if any(not isinstance(item, EvaluationMeasurement) for item in deterministic + supplementary):
-            raise ValueError("measurements must contain EvaluationMeasurement values")
+        deterministic = _objects(self.deterministic_measurements, EvaluationMeasurement, "deterministic_measurements")
+        supplementary = _objects(self.supplementary_measurements, EvaluationMeasurement, "supplementary_measurements")
+        feedback = _objects(self.expert_feedback, ExpertFeedback, "expert_feedback")
         if any(not item.deterministic for item in deterministic):
             raise ValueError("deterministic_measurements cannot contain supplementary measurements")
         if any(item.deterministic for item in supplementary):
             raise ValueError("supplementary_measurements must be marked non-deterministic")
-        if any(not isinstance(item, ExpertFeedback) for item in feedback):
-            raise ValueError("expert_feedback must contain ExpertFeedback values")
         if any(item.run_id != self.identity.run_id for item in feedback):
             raise ValueError("expert feedback run_id must match evaluation identity")
+        revision = self.decision_revision
+        if revision is None:
+            revisions = {item.decision_revision for item in feedback}
+            if len(revisions) > 1:
+                raise ValueError("expert feedback revisions must identify one column-state revision")
+            revision = next(iter(revisions), 0)
+        revision = _nonnegative_int(revision, "decision_revision")
+        if any(item.decision_revision != revision for item in feedback):
+            raise ValueError("expert feedback decision_revision must match evaluation record")
         all_measurements = deterministic + supplementary
         keys = tuple(item.uniqueness_key for item in all_measurements)
         if len(keys) != len(set(keys)):
@@ -721,6 +617,7 @@ class ParsingEvaluationRecord:
         object.__setattr__(self, "supplementary_measurements", supplementary)
         object.__setattr__(self, "expert_feedback", feedback)
         object.__setattr__(self, "artifact_refs", _text_tuple(self.artifact_refs, "artifact_refs"))
+        object.__setattr__(self, "decision_revision", revision)
 
     def model_context_metadata(self) -> dict[str, object]:
         return self.identity.model_context_metadata()
@@ -730,6 +627,7 @@ class ParsingEvaluationRecord:
             "schema_version": self.schema_version,
             "identity": self.identity.to_dict(),
             "target": self.target.to_dict(),
+            "decision_revision": self.decision_revision,
             "deterministic_measurements": [item.to_dict() for item in self.deterministic_measurements],
             "supplementary_measurements": [item.to_dict() for item in self.supplementary_measurements],
             "expert_feedback": [item.to_dict() for item in self.expert_feedback],
@@ -739,16 +637,19 @@ class ParsingEvaluationRecord:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ParsingEvaluationRecord":
-        payload = _mapping(payload, "ParsingEvaluationRecord payload")
+        p = _mapping(payload, "ParsingEvaluationRecord payload")
+        if "decision_revision" not in p:
+            raise ValueError("ParsingEvaluationRecord payload requires decision_revision")
         return cls(
-            payload["schema_version"],
-            ParsingRunIdentity.from_dict(payload["identity"]),
-            EvaluationTarget.from_dict(payload["target"]),
-            tuple(EvaluationMeasurement.from_dict(item) for item in payload.get("deterministic_measurements", ())),
-            tuple(EvaluationMeasurement.from_dict(item) for item in payload.get("supplementary_measurements", ())),
-            tuple(ExpertFeedback.from_dict(item) for item in payload.get("expert_feedback", ())),
-            EfficiencyMetrics.from_dict(payload.get("efficiency", {})),
-            tuple(payload.get("artifact_refs", ())),
+            p["schema_version"],
+            ParsingRunIdentity.from_dict(p["identity"]),
+            EvaluationTarget.from_dict(p["target"]),
+            tuple(EvaluationMeasurement.from_dict(item) for item in p.get("deterministic_measurements", ())),
+            tuple(EvaluationMeasurement.from_dict(item) for item in p.get("supplementary_measurements", ())),
+            tuple(ExpertFeedback.from_dict(item) for item in p.get("expert_feedback", ())),
+            EfficiencyMetrics.from_dict(p.get("efficiency", {})),
+            tuple(p.get("artifact_refs", ())),
+            p["decision_revision"],
         )
 
     def to_json(self) -> str:
@@ -756,4 +657,27 @@ class ParsingEvaluationRecord:
 
     @classmethod
     def from_json(cls, payload: str) -> "ParsingEvaluationRecord":
-        return cls.from_dict(_json_round_trip_payload(payload, "ParsingEvaluationRecord JSON"))
+        return cls.from_dict(_json_payload(payload, "ParsingEvaluationRecord JSON"))
+
+
+_TARGET_FIELDS = ("target_id", "reviewed_ref", "reviewed_provenance", "scorer_id", "scorer_provenance")
+
+
+def compare_evaluation_records(
+    left: ParsingEvaluationRecord,
+    right: ParsingEvaluationRecord,
+    *,
+    ignore_model_identity: bool = False,
+) -> ComparabilityReport:
+    if not isinstance(left, ParsingEvaluationRecord) or not isinstance(right, ParsingEvaluationRecord):
+        raise ValueError("record comparability requires ParsingEvaluationRecord values")
+    identity = compare_run_identities(left.identity, right.identity, ignore_model_identity=ignore_model_identity)
+    mismatches = list(identity.mismatched_dimensions)
+    if left.schema_version != right.schema_version:
+        mismatches.append("schema_version")
+    if left.decision_revision != right.decision_revision:
+        mismatches.append("decision_revision")
+    for field in _TARGET_FIELDS:
+        if getattr(left.target, field) != getattr(right.target, field):
+            mismatches.append(f"target.{field}")
+    return ComparabilityReport(not mismatches, tuple(mismatches))
