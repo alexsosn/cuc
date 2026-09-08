@@ -14,7 +14,7 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.pull_requests[0].base.ref == 'agent-harness-safety' &&
-      github.event.workflow_run.pull_requests[0].head.repo.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].head.repo.id == github.event.workflow_run.head_repository.id &&
       startsWith(github.event.workflow_run.head_branch, 'harn-')
     permissions:
       contents: read
@@ -67,7 +67,7 @@ jobs:
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.pull_requests[0].base.ref == 'agent-harness-safety' &&
-      github.event.workflow_run.pull_requests[0].head.repo.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].head.repo.id == github.event.workflow_run.head_repository.id &&
       startsWith(github.event.workflow_run.head_branch, 'harn-')
     permissions:
       contents: write
