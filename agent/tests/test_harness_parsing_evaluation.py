@@ -68,6 +68,7 @@ class ParsingEvaluationProtocolTest(unittest.TestCase):
             reviewed_provenance="git-blob:abc123",
             scorer_id="score_reviewed_morphology.py",
             scorer_provenance="git-blob:def456",
+            feedback_protocol_sha256="7" * 64,
         )
 
     def column_state(self):
@@ -236,6 +237,7 @@ class ParsingEvaluationProtocolTest(unittest.TestCase):
             1,
             self.identity(api),
             self.target(api),
+            2,
             (measurement,),
             (),
             (feedback,),
@@ -483,6 +485,7 @@ class ParsingEvaluationProtocolTest(unittest.TestCase):
             1,
             self.identity(api),
             self.target(api),
+            2,
             deterministic,
             (),
             (),
@@ -499,6 +502,7 @@ class ParsingEvaluationProtocolTest(unittest.TestCase):
                 1,
                 self.identity(api),
                 self.target(api),
+                2,
                 (duplicate, duplicate),
                 (),
                 (),
