@@ -483,6 +483,13 @@ class ColumnRunState:
         if len(queue_ids) != len(set(queue_ids)):
             raise ValueError("revisit ids must be unique")
         queue_by_id = {item.request_id: item for item in revisit_queue}
+        linked_pairs = tuple(
+            (item.finding_id, item.token_id)
+            for item in revisit_queue
+            if item.finding_id is not None
+        )
+        if len(linked_pairs) != len(set(linked_pairs)):
+            raise ValueError("a reconciliation finding may have only one revisit request per affected token")
         for item in revisit_queue:
             if item.token_id not in token_set:
                 raise ValueError("revisit item references token outside snapshot")
@@ -589,7 +596,12 @@ class ColumnRunState:
         if not finding.requires_revisit:
             return True
         resolved = set(self.resolved_revisit_request_ids)
-        return any(item.finding_id == finding.finding_id and item.request_id in resolved for item in self.revisit_queue)
+        covered_tokens = {
+            item.token_id
+            for item in self.revisit_queue
+            if item.finding_id == finding.finding_id and item.request_id in resolved
+        }
+        return set(finding.token_ids).issubset(covered_tokens)
 
     def _validate_reconciliation_can_close(self) -> None:
         if not self.initial_pass_complete:
@@ -821,8 +833,12 @@ def apply_column_event(state: ColumnRunState, event: object) -> ColumnRunState:
                 raise InvalidColumnTransition(f"unknown reconciliation finding: {event.request.finding_id}")
             if not finding.requires_revisit or event.request.token_id not in finding.token_ids:
                 raise InvalidColumnTransition("revisit does not satisfy the linked finding")
-            if any(item.finding_id == finding.finding_id for item in state.revisit_queue):
-                raise InvalidColumnTransition("required finding already has a revisit item")
+            if any(
+                item.finding_id == finding.finding_id
+                and item.token_id == event.request.token_id
+                for item in state.revisit_queue
+            ):
+                raise InvalidColumnTransition("required finding already has a revisit item for this token")
         return _with_receipt(replace(state, revisit_queue=state.revisit_queue + (event.request,), reconciliation_closed=False), receipt)
 
     if isinstance(event, TokenRevisited):
