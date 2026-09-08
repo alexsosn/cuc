@@ -209,6 +209,91 @@ class ParsingEvaluationReviewFindingTest(unittest.TestCase):
         self.assertFalse(report.comparable)
         self.assertEqual(report.mismatched_dimensions, ("target.feedback_protocol_sha256",))
 
+    def test_feedback_validation_rejects_superseded_decision_at_current_revision(self) -> None:
+        api = self.api()
+        column = importlib.import_module("harness.column_state")
+        task = column.ColumnTask(
+            "run-1",
+            "CUC",
+            "KTU 1.5",
+            "I",
+            "repo-sha",
+            column.CapabilityRef("review-automatic-parsing", "1.0.0", "2" * 64),
+            ("review-status-clean",),
+            (),
+        )
+        snapshot = column.ColumnSnapshot(
+            "snapshot-1",
+            "auto_parsing/example.tsv",
+            "sha256:" + "1" * 64,
+            (column.ColumnToken("t1", 1, "1.5:I:1", "a"),),
+        )
+        state = column.ColumnRunState.initial(task, snapshot)
+        state = column.apply_column_event(
+            state,
+            column.EvidenceRecorded(
+                "evidence-event",
+                column.EvidenceRecord("ev1", "dulat", "entry", "dulat:entry", "Evidence."),
+            ),
+        )
+        state = column.apply_column_event(
+            state,
+            column.TokenReviewed(
+                "initial-review",
+                column.TokenDecision("d1", "t1", ("analysis-a",), ("ev1",), "Initial."),
+            ),
+        )
+        state = column.apply_column_event(
+            state,
+            column.RevisitRequested(
+                "request-revisit",
+                column.RevisitRequest("r1", "t1", "Recheck after reconciliation."),
+            ),
+        )
+        state = column.apply_column_event(
+            state,
+            column.TokenRevisited(
+                "perform-revisit",
+                "r1",
+                column.TokenDecision(
+                    "d2",
+                    "t1",
+                    ("analysis-b",),
+                    ("ev1",),
+                    "Revised.",
+                    revisit_of="d1",
+                ),
+            ),
+        )
+        stale_feedback = api.ExpertFeedback(
+            "fb-stale",
+            "run-1",
+            state.decision_revision,
+            api.FeedbackScope.TOKEN,
+            api.FeedbackDisposition.ACCEPT,
+            "expert:reviewer-1",
+            "Accepted current result.",
+            ("review:artifact",),
+            token_id="t1",
+            decision_id="d1",
+        )
+        with self.assertRaises(ValueError):
+            api.validate_feedback_against_state(stale_feedback, state)
+
+        current_feedback = api.ExpertFeedback(
+            "fb-current",
+            "run-1",
+            state.decision_revision,
+            api.FeedbackScope.TOKEN,
+            api.FeedbackDisposition.ACCEPT,
+            "expert:reviewer-1",
+            "Accepted current result.",
+            ("review:artifact",),
+            token_id="t1",
+            decision_id="d2",
+        )
+        api.validate_feedback_against_state(current_feedback, state)
+
 
 if __name__ == "__main__":
     unittest.main()
