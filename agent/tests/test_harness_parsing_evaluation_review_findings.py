@@ -49,16 +49,25 @@ class ParsingEvaluationReviewFindingTest(unittest.TestCase):
             scorer_provenance,
         )
 
-    def record(
+    def target_with_protocol(
         self,
         api,
         *,
-        target=None,
-        decision_revision: int = 2,
-        model_id: str = "model-a",
-        feedback_revision: int | None = None,
+        reviewed_provenance: str = "git-blob:reviewed-a",
+        scorer_provenance: str = "git-blob:scorer-a",
+        feedback_protocol_sha256: str = "7" * 64,
     ):
-        summary = MetricSummary(
+        return api.EvaluationTarget(
+            target_id="target-1",
+            reviewed_ref="reviewed/KTU 1.5.tsv#column-I",
+            reviewed_provenance=reviewed_provenance,
+            scorer_id="score_reviewed_morphology.py",
+            scorer_provenance=scorer_provenance,
+            feedback_protocol_sha256=feedback_protocol_sha256,
+        )
+
+    def summary(self) -> MetricSummary:
+        return MetricSummary(
             compared_ids=1,
             reviewed_option_count=1,
             auto_option_count=1,
@@ -76,6 +85,16 @@ class ParsingEvaluationReviewFindingTest(unittest.TestCase):
             mean_missing_options=0.0,
             mean_option_count_error=0.0,
         )
+
+    def record(
+        self,
+        api,
+        *,
+        target=None,
+        decision_revision: int = 2,
+        model_id: str = "model-a",
+        feedback_revision: int | None = None,
+    ):
         feedback = ()
         if feedback_revision is not None:
             feedback = (
@@ -95,7 +114,7 @@ class ParsingEvaluationReviewFindingTest(unittest.TestCase):
             identity=self.identity(api, model_id=model_id),
             target=target or self.target(api),
             decision_revision=decision_revision,
-            deterministic_measurements=api.measure_morphology_summary(summary),
+            deterministic_measurements=api.measure_morphology_summary(self.summary()),
             supplementary_measurements=(),
             expert_feedback=feedback,
             efficiency=api.EfficiencyMetrics(),
@@ -149,6 +168,45 @@ class ParsingEvaluationReviewFindingTest(unittest.TestCase):
                 "target.scorer_provenance",
             ),
         )
+
+    def test_evaluation_target_requires_feedback_protocol_provenance(self) -> None:
+        api = self.api()
+        with self.assertRaises(TypeError):
+            api.EvaluationTarget(
+                "target-legacy",
+                "reviewed/KTU 1.5.tsv#column-I",
+                "git-blob:reviewed-a",
+                "score_reviewed_morphology.py",
+                "git-blob:scorer-a",
+            )
+
+        target = self.target_with_protocol(api)
+        self.assertEqual(target.feedback_protocol_sha256, "7" * 64)
+        self.assertEqual(api.EvaluationTarget.from_dict(target.to_dict()), target)
+        with self.assertRaises(ValueError):
+            self.target_with_protocol(api, feedback_protocol_sha256="not-a-digest")
+
+    def test_record_requires_explicit_state_revision_even_without_feedback(self) -> None:
+        api = self.api()
+        with self.assertRaises(TypeError):
+            api.ParsingEvaluationRecord(
+                schema_version=1,
+                identity=self.identity(api),
+                target=self.target_with_protocol(api),
+                deterministic_measurements=api.measure_morphology_summary(self.summary()),
+                supplementary_measurements=(),
+                expert_feedback=(),
+                efficiency=api.EfficiencyMetrics(),
+                artifact_refs=(),
+            )
+
+    def test_record_comparability_rejects_feedback_protocol_drift(self) -> None:
+        api = self.api()
+        baseline = self.record(api, target=self.target_with_protocol(api, feedback_protocol_sha256="7" * 64))
+        drifted = self.record(api, target=self.target_with_protocol(api, feedback_protocol_sha256="8" * 64))
+        report = api.compare_evaluation_records(baseline, drifted)
+        self.assertFalse(report.comparable)
+        self.assertEqual(report.mismatched_dimensions, ("target.feedback_protocol_sha256",))
 
 
 if __name__ == "__main__":
