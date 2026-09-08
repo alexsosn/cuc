@@ -290,10 +290,16 @@ class EvaluationTarget:
     reviewed_provenance: str
     scorer_id: str
     scorer_provenance: str
+    feedback_protocol_sha256: str
 
     def __post_init__(self) -> None:
         for field in ("target_id", "reviewed_ref", "reviewed_provenance", "scorer_id", "scorer_provenance"):
             object.__setattr__(self, field, _required_text(getattr(self, field), field))
+        object.__setattr__(
+            self,
+            "feedback_protocol_sha256",
+            _sha256(self.feedback_protocol_sha256, "feedback_protocol_sha256"),
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -302,12 +308,16 @@ class EvaluationTarget:
             "reviewed_provenance": self.reviewed_provenance,
             "scorer_id": self.scorer_id,
             "scorer_provenance": self.scorer_provenance,
+            "feedback_protocol_sha256": self.feedback_protocol_sha256,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "EvaluationTarget":
         p = _mapping(payload, "EvaluationTarget payload")
-        return cls(p["target_id"], p["reviewed_ref"], p["reviewed_provenance"], p["scorer_id"], p["scorer_provenance"])
+        return cls(
+            p["target_id"], p["reviewed_ref"], p["reviewed_provenance"], p["scorer_id"],
+            p["scorer_provenance"], p["feedback_protocol_sha256"],
+        )
 
 
 @dataclass(frozen=True)
@@ -572,12 +582,12 @@ class ParsingEvaluationRecord:
     schema_version: int
     identity: ParsingRunIdentity
     target: EvaluationTarget
+    decision_revision: int
     deterministic_measurements: tuple[EvaluationMeasurement, ...]
     supplementary_measurements: tuple[EvaluationMeasurement, ...]
     expert_feedback: tuple[ExpertFeedback, ...]
     efficiency: EfficiencyMetrics
     artifact_refs: tuple[str, ...] = ()
-    decision_revision: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version <= 0:
@@ -588,6 +598,7 @@ class ParsingEvaluationRecord:
             raise ValueError("target must be EvaluationTarget")
         if not isinstance(self.efficiency, EfficiencyMetrics):
             raise ValueError("efficiency must be EfficiencyMetrics")
+        revision = _nonnegative_int(self.decision_revision, "decision_revision")
         deterministic = _objects(self.deterministic_measurements, EvaluationMeasurement, "deterministic_measurements")
         supplementary = _objects(self.supplementary_measurements, EvaluationMeasurement, "supplementary_measurements")
         feedback = _objects(self.expert_feedback, ExpertFeedback, "expert_feedback")
@@ -597,13 +608,6 @@ class ParsingEvaluationRecord:
             raise ValueError("supplementary_measurements must be marked non-deterministic")
         if any(item.run_id != self.identity.run_id for item in feedback):
             raise ValueError("expert feedback run_id must match evaluation identity")
-        revision = self.decision_revision
-        if revision is None:
-            revisions = {item.decision_revision for item in feedback}
-            if len(revisions) > 1:
-                raise ValueError("expert feedback revisions must identify one column-state revision")
-            revision = next(iter(revisions), 0)
-        revision = _nonnegative_int(revision, "decision_revision")
         if any(item.decision_revision != revision for item in feedback):
             raise ValueError("expert feedback decision_revision must match evaluation record")
         all_measurements = deterministic + supplementary
@@ -613,11 +617,11 @@ class ParsingEvaluationRecord:
         feedback_ids = tuple(item.feedback_id for item in feedback)
         if len(feedback_ids) != len(set(feedback_ids)):
             raise ValueError("expert feedback ids must be unique")
+        object.__setattr__(self, "decision_revision", revision)
         object.__setattr__(self, "deterministic_measurements", deterministic)
         object.__setattr__(self, "supplementary_measurements", supplementary)
         object.__setattr__(self, "expert_feedback", feedback)
         object.__setattr__(self, "artifact_refs", _text_tuple(self.artifact_refs, "artifact_refs"))
-        object.__setattr__(self, "decision_revision", revision)
 
     def model_context_metadata(self) -> dict[str, object]:
         return self.identity.model_context_metadata()
@@ -638,18 +642,16 @@ class ParsingEvaluationRecord:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ParsingEvaluationRecord":
         p = _mapping(payload, "ParsingEvaluationRecord payload")
-        if "decision_revision" not in p:
-            raise ValueError("ParsingEvaluationRecord payload requires decision_revision")
         return cls(
             p["schema_version"],
             ParsingRunIdentity.from_dict(p["identity"]),
             EvaluationTarget.from_dict(p["target"]),
+            p["decision_revision"],
             tuple(EvaluationMeasurement.from_dict(item) for item in p.get("deterministic_measurements", ())),
             tuple(EvaluationMeasurement.from_dict(item) for item in p.get("supplementary_measurements", ())),
             tuple(ExpertFeedback.from_dict(item) for item in p.get("expert_feedback", ())),
             EfficiencyMetrics.from_dict(p.get("efficiency", {})),
             tuple(p.get("artifact_refs", ())),
-            p["decision_revision"],
         )
 
     def to_json(self) -> str:
@@ -660,7 +662,14 @@ class ParsingEvaluationRecord:
         return cls.from_dict(_json_payload(payload, "ParsingEvaluationRecord JSON"))
 
 
-_TARGET_FIELDS = ("target_id", "reviewed_ref", "reviewed_provenance", "scorer_id", "scorer_provenance")
+_TARGET_FIELDS = (
+    "target_id",
+    "reviewed_ref",
+    "reviewed_provenance",
+    "scorer_id",
+    "scorer_provenance",
+    "feedback_protocol_sha256",
+)
 
 
 def compare_evaluation_records(
