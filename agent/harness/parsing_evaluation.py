@@ -15,3 +15,23 @@ def validate_feedback_against_state(feedback: ExpertFeedback, state: ColumnRunSt
             raise ValueError(
                 "feedback decision_id must reference the latest token decision at the column run revision"
             )
+
+
+def compare_evaluation_records(
+    left: ParsingEvaluationRecord,
+    right: ParsingEvaluationRecord,
+    *,
+    ignore_model_identity: bool = False,
+) -> ComparabilityReport:
+    """Compare benchmark inputs/evaluator policy without treating run outcomes as inputs."""
+    report = _core.compare_evaluation_records(
+        left,
+        right,
+        ignore_model_identity=ignore_model_identity,
+    )
+    mismatches = tuple(
+        dimension
+        for dimension in report.mismatched_dimensions
+        if dimension != "decision_revision"
+    )
+    return ComparabilityReport(not mismatches, mismatches)
