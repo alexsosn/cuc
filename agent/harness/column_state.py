@@ -262,6 +262,7 @@ class TokenDecision:
     evidence_ids: tuple[str, ...]
     summary: str
     revisit_of: str | None = None
+    revisit_request_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "decision_id", _required_text(self.decision_id, "decision_id"))
@@ -270,14 +271,31 @@ class TokenDecision:
         object.__setattr__(self, "evidence_ids", _text_tuple(self.evidence_ids, "evidence_ids", required=True))
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
         object.__setattr__(self, "revisit_of", _optional_text(self.revisit_of, "revisit_of"))
+        object.__setattr__(self, "revisit_request_id", _optional_text(self.revisit_request_id, "revisit_request_id"))
 
     def to_dict(self) -> dict[str, object]:
-        return {"decision_id": self.decision_id, "token_id": self.token_id, "analyses": list(self.analyses), "evidence_ids": list(self.evidence_ids), "summary": self.summary, "revisit_of": self.revisit_of}
+        return {
+            "decision_id": self.decision_id,
+            "token_id": self.token_id,
+            "analyses": list(self.analyses),
+            "evidence_ids": list(self.evidence_ids),
+            "summary": self.summary,
+            "revisit_of": self.revisit_of,
+            "revisit_request_id": self.revisit_request_id,
+        }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "TokenDecision":
         payload = _mapping(payload, "TokenDecision payload")
-        return cls(payload["decision_id"], payload["token_id"], tuple(payload["analyses"]), tuple(payload["evidence_ids"]), payload["summary"], payload.get("revisit_of"))
+        return cls(
+            payload["decision_id"],
+            payload["token_id"],
+            tuple(payload["analyses"]),
+            tuple(payload["evidence_ids"]),
+            payload["summary"],
+            payload.get("revisit_of"),
+            payload.get("revisit_request_id"),
+        )
 
 
 @dataclass(frozen=True)
@@ -460,28 +478,48 @@ class ColumnRunState:
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("evidence ids must be unique")
         evidence_set = set(evidence_ids)
+
+        queue_ids = tuple(item.request_id for item in revisit_queue)
+        if len(queue_ids) != len(set(queue_ids)):
+            raise ValueError("revisit ids must be unique")
+        queue_by_id = {item.request_id: item for item in revisit_queue}
+        for item in revisit_queue:
+            if item.token_id not in token_set:
+                raise ValueError("revisit item references token outside snapshot")
+
         decision_ids = tuple(item.decision_id for item in decisions)
         if len(decision_ids) != len(set(decision_ids)):
             raise ValueError("decision ids must be unique")
+        latest_by_token: dict[str, TokenDecision] = {}
+        resolved_from_decisions: list[str] = []
         for decision in decisions:
             if decision.token_id not in token_set:
                 raise ValueError("decision references token outside snapshot")
             if not set(decision.evidence_ids).issubset(evidence_set):
                 raise ValueError("decision references unknown evidence")
+            if decision.revisit_of is None:
+                if decision.revisit_request_id is not None:
+                    raise ValueError("initial decision cannot claim a revisit request")
+            else:
+                if decision.revisit_request_id is None:
+                    raise ValueError("revisit decision must preserve its authorizing request id")
+                request = queue_by_id.get(decision.revisit_request_id)
+                if request is None:
+                    raise ValueError("revisit decision references unknown revisit request")
+                if request.token_id != decision.token_id:
+                    raise ValueError("revisit decision request token does not match decision token")
+                prior = latest_by_token.get(decision.token_id)
+                if prior is None or prior.decision_id != decision.revisit_of:
+                    raise ValueError("revisit_of must identify the latest prior decision in durable history")
+                resolved_from_decisions.append(decision.revisit_request_id)
+            latest_by_token[decision.token_id] = decision
         if revision != len(decisions):
             raise ValueError("decision_revision must equal append-only decision count")
         initial = tuple(item for item in decisions if item.revisit_of is None)
         if tuple(item.token_id for item in initial) != token_ids[: self.cursor.next_index]:
             raise ValueError("initial decision history must match cursor prefix exactly")
-
-        queue_ids = tuple(item.request_id for item in revisit_queue)
-        if len(queue_ids) != len(set(queue_ids)):
-            raise ValueError("revisit ids must be unique")
-        if not set(resolved).issubset(set(queue_ids)):
-            raise ValueError("resolved revisit ids must refer to known queue items")
-        for item in revisit_queue:
-            if item.token_id not in token_set:
-                raise ValueError("revisit item references token outside snapshot")
+        if tuple(resolved_from_decisions) != resolved:
+            raise ValueError("resolved revisit ids must match persisted revisit decisions in order")
 
         finding_ids = tuple(item.finding_id for item in findings)
         if len(finding_ids) != len(set(finding_ids)):
@@ -760,8 +798,8 @@ def apply_column_event(state: ColumnRunState, event: object) -> ColumnRunState:
     if isinstance(event, TokenReviewed):
         if state.initial_pass_complete:
             raise InvalidColumnTransition("initial pass is complete; use an explicit revisit")
-        if event.decision.revisit_of is not None:
-            raise InvalidColumnTransition("initial decision cannot declare revisit_of")
+        if event.decision.revisit_of is not None or event.decision.revisit_request_id is not None:
+            raise InvalidColumnTransition("initial decision cannot declare revisit provenance")
         if event.decision.token_id != state.next_token_id:
             raise InvalidColumnTransition(f"initial review must target current token {state.next_token_id!r}")
         _validate_decision_evidence(state, event.decision)
@@ -797,13 +835,16 @@ def apply_column_event(state: ColumnRunState, event: object) -> ColumnRunState:
             raise InvalidColumnTransition(f"revisit already resolved: {event.request_id}")
         if event.decision.token_id != request.token_id:
             raise InvalidColumnTransition("revisit decision token does not match queued token")
+        if event.decision.revisit_request_id not in {None, request.request_id}:
+            raise InvalidColumnTransition("revisit decision claims a different authorizing request")
         prior_decision = state.latest_decision(request.token_id)
         if prior_decision is None or event.decision.revisit_of != prior_decision.decision_id:
             raise InvalidColumnTransition("revisit_of must identify the latest prior decision")
         _validate_decision_evidence(state, event.decision)
         if any(item.decision_id == event.decision.decision_id for item in state.decisions):
             raise InvalidColumnTransition(f"decision id already recorded: {event.decision.decision_id}")
-        updated = replace(state, decisions=state.decisions + (event.decision,), resolved_revisit_request_ids=state.resolved_revisit_request_ids + (request.request_id,), decision_revision=state.decision_revision + 1, reconciliation_closed=False)
+        persisted_decision = replace(event.decision, revisit_request_id=request.request_id)
+        updated = replace(state, decisions=state.decisions + (persisted_decision,), resolved_revisit_request_ids=state.resolved_revisit_request_ids + (request.request_id,), decision_revision=state.decision_revision + 1, reconciliation_closed=False)
         return _with_receipt(updated, receipt)
 
     if isinstance(event, ReconciliationFindingRecorded):
