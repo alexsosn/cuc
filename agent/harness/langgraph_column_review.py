@@ -64,6 +64,7 @@ class ReconciliationPlan:
 class ColumnReviewAdapters:
     """Narrow side-effect boundary used by the orchestration graph."""
 
+    initialize_skill_context: Callable[..., Any]
     collect_evidence: Callable[..., tuple[EvidenceRecord, ...]]
     adjudicate: Callable[..., TokenDecision]
     reconcile: Callable[..., ReconciliationPlan]
@@ -73,6 +74,7 @@ class ColumnReviewAdapters:
 
 class _GraphState(TypedDict, total=False):
     column_state: ColumnRunState
+    skill_context: Any
     pending_evidence: tuple[EvidenceRecord, ...]
     evaluation: Any
     terminal_status: str
@@ -205,8 +207,18 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
     if not isinstance(adapters, ColumnReviewAdapters):
         raise ValueError("adapters must be ColumnReviewAdapters")
 
+    def initialize(graph_state: _GraphState) -> _GraphState:
+        state = graph_state["column_state"]
+        operation_id = f"{state.task.task_id}:column:initialize-skill-context"
+        context = adapters.initialize_skill_context(state, operation_id)
+        if context is None:
+            raise ValueError("initialize_skill_context must return checkpointable context")
+        return {"skill_context": context}
+
     def initial_evidence(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
+        if "skill_context" not in graph_state:
+            raise ValueError("token review requires initialized skill context")
         token_id = state.next_token_id
         if token_id is None:
             raise ValueError("initial evidence requested after complete traversal")
@@ -345,6 +357,7 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
         }
 
     builder = StateGraph(_GraphState)
+    builder.add_node("initialize", initialize)
     builder.add_node("initial_evidence", initial_evidence)
     builder.add_node("initial_adjudicate", initial_adjudicate)
     builder.add_node("reconcile", reconcile)
@@ -354,7 +367,8 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
     builder.add_node("completion_gate", completion_gate)
     builder.add_node("complete", complete)
 
-    builder.add_edge(START, "initial_evidence")
+    builder.add_edge(START, "initialize")
+    builder.add_edge("initialize", "initial_evidence")
     builder.add_edge("initial_evidence", "initial_adjudicate")
     builder.add_conditional_edges(
         "initial_adjudicate",
