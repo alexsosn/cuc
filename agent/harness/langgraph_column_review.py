@@ -7,8 +7,10 @@ runtime routing, controlled-effect adapters, and checkpoint boundaries.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 import json
+from pathlib import Path
 from typing import Any, Callable, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -31,7 +33,11 @@ from .column_state import (
     TokenRevisited,
     apply_column_event,
 )
-from .skill_capabilities import SkillCapabilityManifest, SkillProvenance
+from .skill_capabilities import (
+    SkillCapabilityManifest,
+    SkillCapabilityRegistry,
+    SkillProvenance,
+)
 
 
 _REVIEW_SKILL = "review-automatic-parsing"
@@ -80,6 +86,35 @@ def _provenance_digest(provenance: SkillProvenance) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return sha256(encoded).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _canonical_review_contract() -> tuple[SkillCapabilityManifest, CapabilityRef]:
+    """Load the exact repository-backed review capability used for run admission."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    registry = SkillCapabilityRegistry(repo_root)
+    manifest = registry.get(_REVIEW_SKILL)
+    provenance = registry.provenance(_REVIEW_SKILL)
+    capability = CapabilityRef(
+        canonical_name=manifest.canonical_name,
+        contract_version=manifest.contract_version,
+        provenance_sha256=_provenance_digest(provenance),
+    )
+    return manifest, capability
+
+
+def _validate_bound_state(state: ColumnRunState) -> None:
+    manifest, capability = _canonical_review_contract()
+    if state.task.capability != capability:
+        raise ValueError(
+            "column task capability/provenance does not match the canonical "
+            "review-automatic-parsing capability"
+        )
+    if state.task.required_completion_gates != manifest.completion_verifiers:
+        raise ValueError(
+            "column task completion gates do not match the canonical capability contract"
+        )
 
 
 def build_column_task_from_capability(
@@ -133,6 +168,7 @@ def build_column_task_from_capability(
 def initial_graph_input(state: ColumnRunState) -> _GraphState:
     if not isinstance(state, ColumnRunState):
         raise ValueError("state must be ColumnRunState")
+    _validate_bound_state(state)
     return {
         "column_state": state,
         "pending_evidence": (),
@@ -175,9 +211,6 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
         if token_id is None:
             raise ValueError("initial evidence requested after complete traversal")
         token = _token_by_id(state, token_id)
-        # The final segment is phase-specific so simplistic fixture evidence IDs remain
-        # unique across initial and revisit collection while the operation prefix stays
-        # stable and inspectable.
         operation_id = f"{state.task.task_id}:initial:{token_id}:evidence:initial"
         evidence = tuple(adapters.collect_evidence(state, token, operation_id))
         updated = _record_evidence(state, evidence, operation_id)
