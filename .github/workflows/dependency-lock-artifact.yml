@@ -1,0 +1,75 @@
+name: Dependency lock artifact
+
+on:
+  pull_request:
+    branches: ["agent-harness-safety"]
+    paths:
+      - "agent/pyproject.toml"
+      - "agent/uv.lock"
+      - ".github/workflows/dependency-lock-artifact.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-lock-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  generate-lock-artifact:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out PR merge ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.7"
+          enable-cache: false
+
+      - name: Generate lock with pinned uv
+        working-directory: agent
+        run: uv lock
+
+      - name: Verify generated lock
+        working-directory: agent
+        run: uv lock --check
+
+      - name: Record exact artifact provenance
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.sha }}
+          MERGE_REF: ${{ github.ref }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = {
+              "schema_version": 1,
+              "pr_head_sha": os.environ["PR_HEAD_SHA"],
+              "merge_sha": os.environ["MERGE_SHA"],
+              "merge_ref": os.environ["MERGE_REF"],
+              "uv_version":"0.12.7",
+          }
+          Path("agent/lock-artifact-metadata.json").write_text(
+              json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload generated dependency metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: uv-lock-${{ github.event.pull_request.head.sha }}
+          path: |
+            agent/pyproject.toml
+            agent/uv.lock
+            agent/lock-artifact-metadata.json
+          if-no-files-found: error
+          retention-days: 7
