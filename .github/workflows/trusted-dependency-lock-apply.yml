@@ -1,0 +1,50 @@
+name: Trusted dependency lock apply
+
+on:
+  workflow_run:
+    workflows: ["Dependency lock artifact"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-lock:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].base.ref == 'agent-harness-safety' &&
+      github.event.workflow_run.pull_requests[0].head.repo.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'harn-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted default-branch implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: "0.12.7"
+
+      - name: Regenerate and apply exact-head uv lock
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          BASE_BRANCH: ${{ github.event.workflow_run.pull_requests[0].base.ref }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          EXPECTED_HEAD: ${{ github.event.workflow_run.head_sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: python .github/scripts/apply_dependency_lock.py
+
+      # A bot-created lock commit does not count as Agent tests evidence.
+      # A connector-authored follow-up commit must independently trigger Agent tests.
