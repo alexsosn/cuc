@@ -32,6 +32,21 @@ class TrustedDependencyLockJobIsolationTest(unittest.TestCase):
         jobs = re.findall(r"(?m)^  ([a-z0-9][a-z0-9-]*):\n", source.split("jobs:\n", 1)[1])
         self.assertEqual(jobs, ["resolve-lock", "apply-lock"])
 
+    def test_real_workflow_run_payload_uses_repo_id_not_missing_pr_repo_full_name(self) -> None:
+        source = self.workflow()
+        # Live HARN-004 workflow_run payload exposed pull_requests[0].head.repo as
+        # {id, url, name}; full_name was absent, making the previous guard always false.
+        self.assertNotIn("pull_requests[0].head.repo.full_name", source)
+        self.assertIn(
+            "github.event.workflow_run.pull_requests[0].head.repo.id == "
+            "github.event.workflow_run.head_repository.id",
+            source,
+        )
+        self.assertIn(
+            "github.event.workflow_run.head_repository.full_name == github.repository",
+            source,
+        )
+
     def test_resolver_job_is_read_only_and_owns_uv_execution(self) -> None:
         block = job_block(self.workflow(), "resolve-lock")
         self.assertIn("permissions:\n      contents: read", block)
