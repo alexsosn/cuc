@@ -1,0 +1,28 @@
+name: Default branch infra tests
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  trusted-infra-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+          check-latest: false
+      - name: Run trusted dependency lock applier contract
+        run: |
+          python .github/tests/test_trusted_dependency_lock_applier.py -v
+          python .github/tests/test_trusted_dependency_lock_resolver.py -v
+          python .github/tests/test_trusted_dependency_lock_hardening.py -v
+          python .github/tests/test_trusted_dependency_lock_job_isolation.py -v

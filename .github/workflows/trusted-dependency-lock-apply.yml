@@ -1,0 +1,106 @@
+name: Trusted dependency lock apply
+
+on:
+  workflow_run:
+    workflows: ["Dependency lock artifact"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  resolve-lock:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].base.ref == 'agent-harness-safety' &&
+      github.event.workflow_run.pull_requests[0].head.repo.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'harn-')
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out trusted default-branch implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+          check-latest: false
+
+      - name: Set up pinned uv without cache or GitHub token input
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: "0.12.7"
+          enable-cache: false
+          github-token: ""
+
+      - name: Resolve exact-head uv lock with read-only authority
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          BASE_BRANCH: ${{ github.event.workflow_run.pull_requests[0].base.ref }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          EXPECTED_HEAD: ${{ github.event.workflow_run.head_sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: python .github/scripts/resolve_dependency_lock.py
+
+      - name: Upload trusted same-run lock artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: trusted-uv-lock-${{ github.event.workflow_run.head_sha }}
+          path: |
+            trusted-lock-artifact/uv.lock
+            trusted-lock-artifact/metadata.json
+          if-no-files-found: error
+          retention-days: 1
+
+  apply-lock:
+    needs: resolve-lock
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].base.ref == 'agent-harness-safety' &&
+      github.event.workflow_run.pull_requests[0].head.repo.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'harn-')
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out trusted default-branch implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+          check-latest: false
+
+      - name: Download trusted artifact from this workflow run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: trusted-uv-lock-${{ github.event.workflow_run.head_sha }}
+          path: trusted-lock-artifact
+
+      - name: Verify artifact and apply one-path lock commit
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          BASE_BRANCH: ${{ github.event.workflow_run.pull_requests[0].base.ref }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          EXPECTED_HEAD: ${{ github.event.workflow_run.head_sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: python .github/scripts/apply_dependency_lock.py
+
+      # A bot-created lock commit does not count as Agent tests evidence.
+      # A connector-authored follow-up commit must independently trigger Agent tests.
