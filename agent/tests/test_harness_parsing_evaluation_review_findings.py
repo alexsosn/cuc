@@ -132,7 +132,7 @@ class ParsingEvaluationReviewFindingTest(unittest.TestCase):
         self.assertEqual(restored.decision_revision, 2)
         self.assertEqual(restored, record)
 
-    def test_record_comparability_rejects_evaluator_and_state_revision_drift(self) -> None:
+    def test_record_comparability_rejects_evaluator_drift_but_not_outcome_revision(self) -> None:
         api = self.api()
         baseline = self.record(api, model_id="model-a")
         other_model = self.record(api, model_id="model-b")
@@ -164,7 +164,6 @@ class ParsingEvaluationReviewFindingTest(unittest.TestCase):
         self.assertEqual(
             comparison.mismatched_dimensions,
             (
-                "decision_revision",
                 "target.reviewed_provenance",
                 "target.scorer_provenance",
             ),
