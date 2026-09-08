@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Regenerate and commit only agent/uv.lock from a trusted default-branch workflow."""
+"""Verify a trusted lock artifact and commit only agent/uv.lock."""
 
 from __future__ import annotations
 
 import base64
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import re
-import subprocess
-from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -18,14 +17,28 @@ from urllib.request import Request, urlopen
 
 PROJECT_PATH = "agent/pyproject.toml"
 LOCK_PATH = "agent/uv.lock"
+ARTIFACT_LOCK_PATH = "trusted-lock-artifact/uv.lock"
+ARTIFACT_METADATA_PATH = "trusted-lock-artifact/metadata.json"
+UV_VERSION = "0.12.7"
 BRANCH_RE = re.compile(r"^harn-[A-Za-z0-9._-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 FORBIDDEN_BRANCHES = {"main", "agent-harness-safety"}
 API_VERSION = "2026-03-10"
+METADATA_KEYS = {
+    "schema_version",
+    "repository",
+    "base_branch",
+    "head_branch",
+    "expected_head",
+    "uv_version",
+    "pyproject_sha256",
+    "old_lock_sha256",
+    "uv_lock_sha256",
+}
 
 
 class ApplyError(RuntimeError):
-    """Raised when any trusted-writer invariant fails."""
+    """Raised when a trusted-writer invariant fails."""
 
 
 class GitHubApi:
@@ -65,12 +78,12 @@ class GitHubApi:
         branch = quote(head_branch, safe="")
         payload = self.request("GET", f"/git/ref/heads/{branch}")
         try:
-            sha = payload["object"]["sha"]
+            commit_sha = payload["object"]["sha"]
         except (KeyError, TypeError) as exc:
             raise ApplyError("branch ref response lacks object.sha") from exc
-        if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
+        if not isinstance(commit_sha, str) or not SHA_RE.fullmatch(commit_sha):
             raise ApplyError("branch ref returned an invalid commit SHA")
-        return sha
+        return commit_sha
 
     def fetch_file(self, path: str, ref: str) -> bytes:
         if path not in {PROJECT_PATH, LOCK_PATH}:
@@ -113,18 +126,53 @@ def validate_inputs(
         raise ApplyError("head branch does not match the trusted harn-* policy")
     if head_branch in FORBIDDEN_BRANCHES:
         raise ApplyError("refusing to write a protected integration/default branch")
-    if not re.fullmatch(r"^[0-9a-f]{40}$", expected_head):
+    if not SHA_RE.fullmatch(expected_head):
         raise ApplyError("expected head must be a lowercase 40-character Git SHA")
 
 
-def regenerate_lock(project_bytes: bytes, lock_bytes: bytes) -> bytes:
-    with TemporaryDirectory(prefix="cuc-trusted-lock-") as temporary:
-        root = Path(temporary)
-        (root / "pyproject.toml").write_bytes(project_bytes)
-        (root / "uv.lock").write_bytes(lock_bytes)
-        subprocess.run(["uv", "lock"], cwd=root, check=True)
-        subprocess.run(["uv", "lock", "--check"], cwd=root, check=True)
-        return (root / "uv.lock").read_bytes()
+def _digest(data: bytes) -> str:
+    return sha256(data).hexdigest()
+
+
+def verify_artifact(
+    *,
+    artifact_lock_path: Path,
+    artifact_metadata_path: Path,
+    repository: str,
+    base_branch: str,
+    head_branch: str,
+    expected_head: str,
+    project_bytes: bytes,
+    old_lock: bytes,
+) -> bytes:
+    try:
+        lock_bytes = artifact_lock_path.read_bytes()
+        metadata_raw = artifact_metadata_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ApplyError(f"trusted lock artifact is unreadable: {exc}") from exc
+
+    try:
+        metadata = json.loads(metadata_raw)
+    except json.JSONDecodeError as exc:
+        raise ApplyError("trusted lock artifact metadata is not valid JSON") from exc
+    if not isinstance(metadata, dict) or set(metadata) != METADATA_KEYS:
+        raise ApplyError("trusted lock artifact metadata schema mismatch")
+
+    expected_values = {
+        "schema_version": 1,
+        "repository": repository,
+        "base_branch": base_branch,
+        "head_branch": head_branch,
+        "expected_head": expected_head,
+        "uv_version": UV_VERSION,
+        "pyproject_sha256": _digest(project_bytes),
+        "old_lock_sha256": _digest(old_lock),
+        "uv_lock_sha256": _digest(lock_bytes),
+    }
+    for key, expected in expected_values.items():
+        if metadata.get(key) != expected:
+            raise ApplyError(f"trusted lock artifact metadata mismatch: {key}")
+    return lock_bytes
 
 
 def apply_lock_update(
@@ -135,6 +183,8 @@ def apply_lock_update(
     base_branch: str,
     head_branch: str,
     expected_head: str,
+    artifact_lock_path: Path = Path(ARTIFACT_LOCK_PATH),
+    artifact_metadata_path: Path = Path(ARTIFACT_METADATA_PATH),
 ) -> str | None:
     validate_inputs(
         repository=repository,
@@ -145,11 +195,20 @@ def apply_lock_update(
     )
 
     if api.current_head(head_branch) != expected_head:
-        raise ApplyError("branch moved before trusted lock generation")
+        raise ApplyError("branch moved before trusted lock apply")
 
     project_bytes = api.fetch_file(PROJECT_PATH, expected_head)
     old_lock = api.fetch_file(LOCK_PATH, expected_head)
-    new_lock = regenerate_lock(project_bytes, old_lock)
+    new_lock = verify_artifact(
+        artifact_lock_path=artifact_lock_path,
+        artifact_metadata_path=artifact_metadata_path,
+        repository=repository,
+        base_branch=base_branch,
+        head_branch=head_branch,
+        expected_head=expected_head,
+        project_bytes=project_bytes,
+        old_lock=old_lock,
+    )
     if new_lock == old_lock:
         print("uv.lock is already current; no trusted write required")
         return None
@@ -196,9 +255,8 @@ def apply_lock_update(
     if not isinstance(commit_sha, str) or not SHA_RE.fullmatch(commit_sha):
         raise ApplyError("created lock commit returned an invalid SHA")
 
-    # Second compare-and-swap check closes the race between generation and ref update.
     if api.current_head(head_branch) != expected_head:
-        raise ApplyError("branch moved during trusted lock generation; refusing stale ref update")
+        raise ApplyError("branch moved during trusted lock apply; refusing stale ref update")
 
     api.request(
         "PATCH",
@@ -240,6 +298,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (ApplyError, subprocess.CalledProcessError) as exc:
+    except ApplyError as exc:
         print(f"trusted dependency lock apply failed: {exc}", file=os.sys.stderr)
         raise SystemExit(2) from exc
