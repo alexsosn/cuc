@@ -192,7 +192,7 @@ class ParsingEvaluationReviewFindingTest(unittest.TestCase):
             api.ParsingEvaluationRecord(
                 schema_version=1,
                 identity=self.identity(api),
-                target=self.target_with_protocol(api),
+                target=self.target(api),
                 deterministic_measurements=api.measure_morphology_summary(self.summary()),
                 supplementary_measurements=(),
                 expert_feedback=(),
