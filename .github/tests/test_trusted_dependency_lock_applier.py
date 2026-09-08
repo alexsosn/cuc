@@ -55,7 +55,7 @@ class TrustedDependencyLockApplierTest(unittest.TestCase):
 
     def test_writer_token_scope_is_contents_write_only(self) -> None:
         source = self.writer_workflow()
-        match = re.search(r"(?ms)^permissions:\n(?P<body>(?:\s{2}.+\n)+)", source)
+        match = re.search(r"(?m)^permissions:\n(?P<body>(?: {2}[^\n]+\n)+)", source)
         self.assertIsNotNone(match)
         body = match.group("body")
         self.assertEqual(body.strip(), "contents: write")
