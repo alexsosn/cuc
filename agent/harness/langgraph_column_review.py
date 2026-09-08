@@ -219,24 +219,35 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
         state = graph_state["column_state"]
         if "skill_context" not in graph_state:
             raise ValueError("token review requires initialized skill context")
+        skill_context = graph_state["skill_context"]
         token_id = state.next_token_id
         if token_id is None:
             raise ValueError("initial evidence requested after complete traversal")
         token = _token_by_id(state, token_id)
         operation_id = f"{state.task.task_id}:initial:{token_id}:evidence:initial"
-        evidence = tuple(adapters.collect_evidence(state, token, operation_id))
+        evidence = tuple(
+            adapters.collect_evidence(state, token, skill_context, operation_id)
+        )
         updated = _record_evidence(state, evidence, operation_id)
         return {"column_state": updated, "pending_evidence": evidence}
 
     def initial_adjudicate(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
+        skill_context = graph_state["skill_context"]
         token_id = state.next_token_id
         if token_id is None:
             raise ValueError("initial adjudication requested after complete traversal")
         token = _token_by_id(state, token_id)
         evidence = tuple(graph_state.get("pending_evidence", ()))
         operation_id = f"{state.task.task_id}:initial:{token_id}:adjudicate"
-        decision = adapters.adjudicate(state, token, evidence, operation_id, None)
+        decision = adapters.adjudicate(
+            state,
+            token,
+            evidence,
+            skill_context,
+            operation_id,
+            None,
+        )
         if not isinstance(decision, TokenDecision):
             raise ValueError("adjudication adapter must return TokenDecision")
         updated = apply_column_event(state, TokenReviewed(operation_id, decision))
@@ -247,8 +258,9 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
 
     def reconcile(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
+        skill_context = graph_state["skill_context"]
         operation_id = f"{state.task.task_id}:column:reconcile"
-        plan = adapters.reconcile(state, operation_id)
+        plan = adapters.reconcile(state, skill_context, operation_id)
         if not isinstance(plan, ReconciliationPlan):
             raise ValueError("reconciliation adapter must return ReconciliationPlan")
         updated = state
@@ -271,6 +283,7 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
 
     def revisit_evidence(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
+        skill_context = graph_state["skill_context"]
         if not state.unresolved_revisits:
             raise ValueError("revisit evidence requested with no unresolved revisit")
         request = state.unresolved_revisits[0]
@@ -278,19 +291,29 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
         operation_id = (
             f"{state.task.task_id}:revisit:{request.request_id}:evidence:{request.request_id}"
         )
-        evidence = tuple(adapters.collect_evidence(state, token, operation_id))
+        evidence = tuple(
+            adapters.collect_evidence(state, token, skill_context, operation_id)
+        )
         updated = _record_evidence(state, evidence, operation_id)
         return {"column_state": updated, "pending_evidence": evidence}
 
     def revisit_adjudicate(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
+        skill_context = graph_state["skill_context"]
         if not state.unresolved_revisits:
             raise ValueError("revisit adjudication requested with no unresolved revisit")
         request = state.unresolved_revisits[0]
         token = _token_by_id(state, request.token_id)
         evidence = tuple(graph_state.get("pending_evidence", ()))
         operation_id = f"{state.task.task_id}:revisit:{request.request_id}:adjudicate"
-        decision = adapters.adjudicate(state, token, evidence, operation_id, request)
+        decision = adapters.adjudicate(
+            state,
+            token,
+            evidence,
+            skill_context,
+            operation_id,
+            request,
+        )
         if not isinstance(decision, TokenDecision):
             raise ValueError("adjudication adapter must return TokenDecision")
         updated = apply_column_event(
@@ -310,6 +333,7 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
 
     def completion_gate(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
+        skill_context = graph_state["skill_context"]
         current = {
             item.gate_id: item
             for item in state.gate_results
@@ -322,7 +346,12 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
         if gate_id is None:
             return {"column_state": state}
         operation_id = f"{state.task.task_id}:gate:{gate_id}"
-        result = adapters.verify_completion(state, gate_id, operation_id)
+        result = adapters.verify_completion(
+            state,
+            gate_id,
+            skill_context,
+            operation_id,
+        )
         updated = apply_column_event(
             state,
             CompletionGateRecorded(operation_id, result),
@@ -346,10 +375,11 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
 
     def complete(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
+        skill_context = graph_state["skill_context"]
         completion_id = f"{state.task.task_id}:column:completed"
         completed = apply_column_event(state, ColumnCompleted(completion_id))
         operation_id = f"{state.task.task_id}:column:evaluate"
-        evaluation = adapters.evaluate(completed, operation_id)
+        evaluation = adapters.evaluate(completed, skill_context, operation_id)
         return {
             "column_state": completed,
             "evaluation": evaluation,
