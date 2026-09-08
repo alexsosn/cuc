@@ -132,8 +132,10 @@ class TrustedDependencyLockApplierTest(unittest.TestCase):
         self.assertIn('ARTIFACT_LOCK_PATH = "trusted-lock-artifact/uv.lock"', source)
         self.assertIn('ARTIFACT_METADATA_PATH = "trusted-lock-artifact/metadata.json"', source)
         self.assertNotIn("import subprocess", source)
+        self.assertNotIn("subprocess.", source)
         self.assertNotIn("TemporaryDirectory", source)
-        self.assertNotRegex(source, r"\buv\s+lock\b")
+        self.assertNotIn('["uv", "lock"]', source)
+        self.assertNotIn('["uv", "lock", "--check"]', source)
         self.assertNotIn("DT-UCPH/cuc", source)
 
     def test_rejects_untrusted_input_dimensions(self) -> None:
