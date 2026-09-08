@@ -47,6 +47,7 @@ class ParsingEvaluationReviewFindingTest(unittest.TestCase):
             reviewed_provenance,
             "score_reviewed_morphology.py",
             scorer_provenance,
+            "7" * 64,
         )
 
     def target_with_protocol(
