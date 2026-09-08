@@ -23,5 +23,6 @@ jobs:
       - name: Run trusted dependency lock applier contract
         run: |
           python .github/tests/test_trusted_dependency_lock_applier.py -v
+          python .github/tests/test_trusted_dependency_lock_resolver.py -v
           python .github/tests/test_trusted_dependency_lock_hardening.py -v
           python .github/tests/test_trusted_dependency_lock_job_isolation.py -v
