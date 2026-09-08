@@ -53,12 +53,14 @@ class DependencyLockArtifactWorkflowTest(unittest.TestCase):
         self.assertIn("agent/pyproject.toml", source)
         self.assertIn("agent/lock-artifact-metadata.json", source)
 
-    def test_artifact_metadata_binds_head_merge_ref_and_uv_version(self) -> None:
+    def test_artifact_metadata_binds_identity_and_generated_file_hashes(self) -> None:
         source = self.workflow()
         self.assertIn("github.event.pull_request.head.sha", source)
         self.assertIn("github.sha", source)
         self.assertIn("github.ref", source)
         self.assertIn('"uv_version":"0.12.7"', source.replace(" ", ""))
+        self.assertIn('"pyproject_sha256"', source)
+        self.assertIn('"uv_lock_sha256"', source)
 
     def test_authoritative_agent_tests_remain_frozen(self) -> None:
         source = TEST_WORKFLOW.read_text(encoding="utf-8")
