@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import os
 from pathlib import Path
 import re
+import sys
 import unittest
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -13,6 +17,49 @@ TEST_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "default-branch-infra-test
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 SETUP_PYTHON_SHA = "5fda3b95a4ea91299a34e894583c3862153e4b97"
 SETUP_UV_SHA = "20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
+EXPECTED_HEAD = "a" * 40
+MOVED_HEAD = "f" * 40
+
+
+def load_writer_module():
+    spec = importlib.util.spec_from_file_location("trusted_lock_applier_under_test", WRITER_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise AssertionError("cannot load trusted lock applier module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeApi:
+    def __init__(self, heads: list[str]) -> None:
+        self.heads = iter(heads)
+        self.fetches: list[tuple[str, str]] = []
+        self.requests: list[tuple[str, str, object]] = []
+
+    def current_head(self, head_branch: str) -> str:
+        self.requests.append(("HEAD-CAS", head_branch, None))
+        return next(self.heads)
+
+    def fetch_file(self, path: str, ref: str) -> bytes:
+        self.fetches.append((path, ref))
+        return b"old-lock" if path.endswith("uv.lock") else b"[project]\nname='fixture'\n"
+
+    def parent_tree(self, expected_head: str) -> str:
+        self.requests.append(("PARENT-TREE", expected_head, None))
+        return "b" * 40
+
+    def request(self, method: str, path: str, payload=None):
+        self.requests.append((method, path, payload))
+        if path == "/git/blobs":
+            return {"sha": "c" * 40}
+        if path == "/git/trees":
+            return {"sha": "d" * 40}
+        if path == "/git/commits":
+            return {"sha": "e" * 40}
+        if method == "PATCH":
+            return {}
+        raise AssertionError(f"unexpected request: {method} {path}")
 
 
 class TrustedDependencyLockApplierTest(unittest.TestCase):
@@ -138,6 +185,131 @@ class TrustedDependencyLockApplierTest(unittest.TestCase):
         source = self.writer_workflow()
         self.assertIn("does not count as Agent tests evidence", source)
         self.assertIn("connector-authored follow-up commit", source)
+
+    def test_uv_subprocess_does_not_inherit_write_or_runtime_tokens(self) -> None:
+        module = load_writer_module()
+        seen_envs = []
+
+        def fake_run(args, *, cwd, check, env):
+            self.assertTrue(check)
+            self.assertEqual(Path(cwd).name.startswith("cuc-trusted-lock-"), True)
+            seen_envs.append(dict(env))
+
+        secret_env = {
+            "GITHUB_TOKEN": "write-token",
+            "GH_TOKEN": "gh-token",
+            "ACTIONS_RUNTIME_TOKEN": "runtime-token",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "oidc-token",
+        }
+        with patch.dict(os.environ, secret_env, clear=False):
+            with patch.object(module.subprocess, "run", side_effect=fake_run):
+                module.regenerate_lock(b"[project]\nname='fixture'\n", b"old-lock")
+
+        self.assertEqual(len(seen_envs), 2)
+        for child_env in seen_envs:
+            for secret_name in secret_env:
+                self.assertNotIn(secret_name, child_env)
+            self.assertIn("PATH", child_env)
+
+    def test_behavior_pre_generation_head_drift_fails_before_fetch_or_write(self) -> None:
+        module = load_writer_module()
+        api = FakeApi([MOVED_HEAD])
+        with patch.object(module, "regenerate_lock") as regenerate:
+            with self.assertRaisesRegex(module.ApplyError, "moved before"):
+                module.apply_lock_update(
+                    api=api,
+                    repository="alexsosn/cuc",
+                    expected_repository="alexsosn/cuc",
+                    base_branch="agent-harness-safety",
+                    head_branch="harn-fixture",
+                    expected_head=EXPECTED_HEAD,
+                )
+        regenerate.assert_not_called()
+        self.assertEqual(api.fetches, [])
+        self.assertFalse(any(method in {"POST", "PATCH"} for method, _, _ in api.requests))
+
+    def test_behavior_unchanged_lock_produces_no_git_write(self) -> None:
+        module = load_writer_module()
+        api = FakeApi([EXPECTED_HEAD])
+        with patch.object(module, "regenerate_lock", return_value=b"old-lock"):
+            result = module.apply_lock_update(
+                api=api,
+                repository="alexsosn/cuc",
+                expected_repository="alexsosn/cuc",
+                base_branch="agent-harness-safety",
+                head_branch="harn-fixture",
+                expected_head=EXPECTED_HEAD,
+            )
+        self.assertIsNone(result)
+        self.assertEqual(
+            api.fetches,
+            [("agent/pyproject.toml", EXPECTED_HEAD), ("agent/uv.lock", EXPECTED_HEAD)],
+        )
+        self.assertFalse(any(method in {"POST", "PATCH"} for method, _, _ in api.requests))
+
+    def test_behavior_post_generation_head_drift_never_updates_ref(self) -> None:
+        module = load_writer_module()
+        api = FakeApi([EXPECTED_HEAD, MOVED_HEAD])
+        with patch.object(module, "regenerate_lock", return_value=b"new-lock"):
+            with self.assertRaisesRegex(module.ApplyError, "moved during"):
+                module.apply_lock_update(
+                    api=api,
+                    repository="alexsosn/cuc",
+                    expected_repository="alexsosn/cuc",
+                    base_branch="agent-harness-safety",
+                    head_branch="harn-fixture",
+                    expected_head=EXPECTED_HEAD,
+                )
+        self.assertFalse(any(method == "PATCH" for method, _, _ in api.requests))
+
+    def test_behavior_success_commits_one_lock_path_with_exact_parent_and_nonforce_ref(self) -> None:
+        module = load_writer_module()
+        api = FakeApi([EXPECTED_HEAD, EXPECTED_HEAD])
+        with patch.object(module, "regenerate_lock", return_value=b"new-lock"):
+            result = module.apply_lock_update(
+                api=api,
+                repository="alexsosn/cuc",
+                expected_repository="alexsosn/cuc",
+                base_branch="agent-harness-safety",
+                head_branch="harn-fixture",
+                expected_head=EXPECTED_HEAD,
+            )
+        self.assertEqual(result, "e" * 40)
+        tree_requests = [payload for method, path, payload in api.requests if path == "/git/trees"]
+        self.assertEqual(len(tree_requests), 1)
+        self.assertEqual(
+            tree_requests[0]["tree"],
+            [{"path": "agent/uv.lock", "mode": "100644", "type": "blob", "sha": "c" * 40}],
+        )
+        commit_requests = [payload for method, path, payload in api.requests if path == "/git/commits"]
+        self.assertEqual(commit_requests[0]["parents"], [EXPECTED_HEAD])
+        patch_requests = [(path, payload) for method, path, payload in api.requests if method == "PATCH"]
+        self.assertEqual(
+            patch_requests,
+            [("/git/refs/heads/harn-fixture", {"sha": "e" * 40, "force": False})],
+        )
+
+    def test_behavior_rejects_untrusted_input_dimensions(self) -> None:
+        module = load_writer_module()
+        common = dict(
+            repository="alexsosn/cuc",
+            expected_repository="alexsosn/cuc",
+            base_branch="agent-harness-safety",
+            head_branch="harn-fixture",
+            expected_head=EXPECTED_HEAD,
+        )
+        bad_cases = [
+            {"expected_repository": "attacker/cuc"},
+            {"base_branch": "main"},
+            {"head_branch": "feature/not-harn"},
+            {"head_branch": "main"},
+            {"expected_head": "not-a-sha"},
+        ]
+        for overrides in bad_cases:
+            case = {**common, **overrides}
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(module.ApplyError):
+                    module.validate_inputs(**case)
 
 
 if __name__ == "__main__":
