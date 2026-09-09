@@ -255,6 +255,11 @@ def build_development_trace_projection(
         raise ValueError("context must be DevelopmentTraceContext")
 
     latest_change = state.latest_change
+    all_operation_ids = tuple(
+        operation_id
+        for change in state.changes
+        for operation_id in change.operation_ids
+    )
     metadata: dict[str, _MetadataValue] = {
         "run_type": TelemetryRunType.DEVELOPMENT.value,
         "task_id": state.task.task_id,
@@ -267,6 +272,8 @@ def build_development_trace_projection(
         "head_sha": context.head_sha,
         "executed_sha": context.executed_sha,
         "change_count": len(state.changes),
+        "change_ids": tuple(change.change_id for change in state.changes),
+        "operation_ids": all_operation_ids,
         "test_result_count": len(state.test_results),
         "eval_result_count": len(state.eval_results),
         "verified_head_sha": state.verified_head_sha,
