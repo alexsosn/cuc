@@ -224,10 +224,15 @@ class LangfuseSidecar:
         try:
             client = self._client()
             trace_id = self._trace_id(client, projection.run_type, projection.run_id)
+            transport_value = (
+                float(projection.value)
+                if projection.data_type == "BOOLEAN" and isinstance(projection.value, bool)
+                else projection.value
+            )
             client.create_score(
                 trace_id=trace_id,
                 name=projection.name,
-                value=projection.value,
+                value=transport_value,
                 data_type=projection.data_type,
                 metadata=dict(projection.metadata),
             )
