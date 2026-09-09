@@ -1,6 +1,6 @@
 """Optional best-effort Langfuse transport for provider-neutral CUC telemetry.
 
-Importing this module does not import Langfuse.  The optional SDK is loaded lazily only
+Importing this module does not import Langfuse. The optional SDK is loaded lazily only
 when CUC telemetry is explicitly enabled and credentials are present.
 """
 
@@ -10,11 +10,18 @@ import importlib
 import os
 from typing import Any, Callable, Mapping
 
+from .contracts import RunState
+from .langgraph_column_review import ColumnReviewAdapters
+from .parsing_evaluation import ParsingEvaluationRecord
 from .telemetry import (
+    DevelopmentTraceContext,
     ObservationProjection,
     ScoreProjection,
     TelemetryOutcome,
+    TelemetryRunType,
     TraceProjection,
+    build_development_trace_projection,
+    project_parsing_scores,
 )
 
 
@@ -48,8 +55,52 @@ def _safe_failure(enabled: bool, exc: BaseException) -> TelemetryOutcome:
 
 def _default_client_factory(**kwargs: Any):
     module = importlib.import_module("langfuse")
+    span_filter = importlib.import_module("langfuse.span_filter")
     client_type = getattr(module, "Langfuse")
-    return client_type(**kwargs)
+    is_langfuse_span = getattr(span_filter, "is_langfuse_span")
+    # Langfuse v4 otherwise exports Langfuse + GenAI/known LLM spans by default.
+    # CUC intentionally exports only the curated observations created by this sidecar.
+    safe_kwargs = dict(kwargs)
+    safe_kwargs["should_export_span"] = is_langfuse_span
+    return client_type(**safe_kwargs)
+
+
+def _sidecar_enabled(sidecar: Any) -> bool:
+    return bool(getattr(sidecar, "enabled", True))
+
+
+def _emit_safely(sidecar: Any, method: str, projection: Any) -> TelemetryOutcome:
+    """Contain every optional telemetry failure outside the domain execution path."""
+
+    try:
+        outcome = getattr(sidecar, method)(projection)
+        if isinstance(outcome, TelemetryOutcome):
+            return outcome
+        return TelemetryOutcome(_sidecar_enabled(sidecar), True)
+    except Exception as exc:  # optional sidecar/projection transport boundary
+        return _safe_failure(_sidecar_enabled(sidecar), exc)
+
+
+def _observation(
+    state: Any,
+    operation_id: str,
+    name: str,
+    observation_type: str,
+    **metadata: Any,
+) -> ObservationProjection:
+    base = {
+        "decision_revision": state.decision_revision,
+        "next_token_index": state.cursor.next_index,
+    }
+    base.update(metadata)
+    return ObservationProjection(
+        TelemetryRunType.PARSING,
+        state.task.task_id,
+        operation_id,
+        name,
+        observation_type,
+        base,
+    )
 
 
 class LangfuseSidecar:
@@ -192,3 +243,152 @@ class LangfuseSidecar:
             return TelemetryOutcome(True, True)
         except Exception as exc:  # external optional transport boundary
             return _safe_failure(True, exc)
+
+
+def wrap_column_review_adapters(
+    adapters: ColumnReviewAdapters,
+    sidecar: Any,
+) -> ColumnReviewAdapters:
+    """Wrap HARN-004 effects without changing their inputs, results, or exceptions."""
+
+    if not isinstance(adapters, ColumnReviewAdapters):
+        raise ValueError("adapters must be ColumnReviewAdapters")
+
+    def initialize_skill_context(state, operation_id):
+        result = adapters.initialize_skill_context(state, operation_id)
+        _emit_safely(
+            sidecar,
+            "emit_observation",
+            _observation(
+                state,
+                operation_id,
+                "cuc.parsing.initialize-skill-context",
+                "span",
+            ),
+        )
+        return result
+
+    def collect_evidence(state, token, skill_context, operation_id):
+        result = adapters.collect_evidence(state, token, skill_context, operation_id)
+        try:
+            projection = _observation(
+                state,
+                operation_id,
+                "cuc.parsing.collect-evidence",
+                "tool",
+                token_id=token.token_id,
+                evidence_count=len(result),
+                priority_hint=token.token_id in state.task.evidence_priority_token_ids,
+            )
+            _emit_safely(sidecar, "emit_observation", projection)
+        except Exception:
+            pass
+        return result
+
+    def adjudicate(
+        state,
+        token,
+        evidence,
+        skill_context,
+        operation_id,
+        revisit_request=None,
+    ):
+        result = adapters.adjudicate(
+            state,
+            token,
+            evidence,
+            skill_context,
+            operation_id,
+            revisit_request,
+        )
+        try:
+            projection = _observation(
+                state,
+                operation_id,
+                "cuc.parsing.adjudicate",
+                "agent",
+                token_id=token.token_id,
+                revisit_request_id=(
+                    None if revisit_request is None else revisit_request.request_id
+                ),
+            )
+            _emit_safely(sidecar, "emit_observation", projection)
+        except Exception:
+            pass
+        return result
+
+    def reconcile(state, skill_context, operation_id):
+        result = adapters.reconcile(state, skill_context, operation_id)
+        try:
+            projection = _observation(
+                state,
+                operation_id,
+                "cuc.parsing.reconcile",
+                "span",
+                finding_count=len(result.findings),
+                revisit_request_count=len(result.revisit_requests),
+            )
+            _emit_safely(sidecar, "emit_observation", projection)
+        except Exception:
+            pass
+        return result
+
+    def verify_completion(state, gate_id, skill_context, operation_id):
+        result = adapters.verify_completion(state, gate_id, skill_context, operation_id)
+        try:
+            projection = _observation(
+                state,
+                operation_id,
+                "cuc.parsing.completion-gate",
+                "evaluator",
+                gate_id=gate_id,
+                passed=bool(result.passed),
+            )
+            _emit_safely(sidecar, "emit_observation", projection)
+        except Exception:
+            pass
+        return result
+
+    def evaluate(state, skill_context, operation_id):
+        result = adapters.evaluate(state, skill_context, operation_id)
+        try:
+            projection = _observation(
+                state,
+                operation_id,
+                "cuc.parsing.evaluate",
+                "evaluator",
+                evaluation_artifact_refs=(
+                    result.artifact_refs
+                    if isinstance(result, ParsingEvaluationRecord)
+                    else ()
+                ),
+            )
+            _emit_safely(sidecar, "emit_observation", projection)
+            if isinstance(result, ParsingEvaluationRecord):
+                for score in project_parsing_scores(result):
+                    _emit_safely(sidecar, "emit_score", score)
+        except Exception:
+            # Projection/transport is removable; HARN-004 remains responsible for
+            # validating the scholarly evaluation result itself.
+            pass
+        return result
+
+    return ColumnReviewAdapters(
+        initialize_skill_context,
+        collect_evidence,
+        adjudicate,
+        reconcile,
+        verify_completion,
+        evaluate,
+    )
+
+
+def emit_development_run(
+    state: RunState,
+    context: DevelopmentTraceContext,
+    sidecar: Any,
+) -> TelemetryOutcome:
+    """Emit one data-minimized development trace; transport failure is non-fatal."""
+
+    projection = build_development_trace_projection(state, context)
+    return _emit_safely(sidecar, "emit_trace", projection)
