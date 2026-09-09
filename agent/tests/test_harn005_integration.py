@@ -175,6 +175,30 @@ def test_wrapper_preserves_domain_calls_and_operation_ids_while_telemetry_is_bes
     ]
 
 
+def test_final_evaluation_exports_one_bound_parsing_root_trace():
+    state = _column_state()
+    calls: list[tuple[str, str]] = []
+    sink = RecordingSidecar()
+    wrapped = sidecar_api.wrap_column_review_adapters(_adapters(calls), sink)
+
+    result = wrapped.evaluate(state, ("worklist:all-four-passes",), "op:evaluate")
+
+    assert isinstance(result, ParsingEvaluationRecord)
+    assert len(sink.traces) == 1
+    trace = sink.traces[0]
+    assert trace.run_type is telemetry.TelemetryRunType.PARSING
+    assert trace.trace_name == "cuc.parsing.column-review"
+    assert trace.run_id == state.task.task_id
+    assert trace.metadata["model_provider"] == "provider"
+    assert trace.metadata["model_id"] == "model"
+    assert trace.metadata["model_version"] == "v1"
+    assert trace.metadata["tool_policy_sha256"] == SHA
+    assert trace.metadata["evidence_policy_sha256"] == SHA
+    assert trace.metadata["permission_policy_sha256"] == SHA
+    assert trace.metadata["evaluation_artifact_refs"] == ("artifact:evaluation",)
+    assert "surface-must-not-be-exported" not in repr(trace.metadata)
+
+
 def test_development_emitter_is_best_effort_and_uses_development_projection():
     if not hasattr(sidecar_api, "emit_development_run"):
         pytest.fail("HARN-005 requires emit_development_run")
