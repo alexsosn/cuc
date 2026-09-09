@@ -175,6 +175,45 @@ def test_wrapper_preserves_domain_calls_and_operation_ids_while_telemetry_is_bes
     ]
 
 
+def test_failed_domain_operation_is_observed_without_masking_or_leaking_exception():
+    state = _column_state()
+    token = state.snapshot.tokens[0]
+    sink = RecordingSidecar()
+    sentinel = RuntimeError("RAW-FAILURE-MESSAGE-MUST-NOT-LEAK")
+
+    def fail_adjudicate(
+        state,
+        token,
+        evidence_records,
+        skill_context,
+        operation_id,
+        revisit_request=None,
+    ):
+        raise sentinel
+
+    wrapped = sidecar_api.wrap_column_review_adapters(
+        replace(_adapters([]), adjudicate=fail_adjudicate),
+        sink,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        wrapped.adjudicate(state, token, (), ("worklist:all-four-passes",), "op:failed", None)
+
+    assert caught.value is sentinel
+    assert len(sink.observations) == 1
+    observation = sink.observations[0]
+    assert observation.operation_id == "op:failed"
+    assert observation.name == "cuc.parsing.adjudicate"
+    assert observation.metadata["outcome"] == "error"
+    assert observation.metadata["error_type"] == "RuntimeError"
+    assert observation.metadata["corpus"] == "CUC"
+    assert observation.metadata["tablet"] == "KTU 1.1"
+    assert observation.metadata["column"] == "I"
+    assert observation.metadata["repository_revision"] == "repo-rev"
+    assert observation.metadata["capability_name"] == "review-automatic-parsing"
+    assert "RAW-FAILURE-MESSAGE-MUST-NOT-LEAK" not in repr(observation.metadata)
+
+
 def test_final_evaluation_exports_one_bound_parsing_root_trace():
     state = _column_state()
     calls: list[tuple[str, str]] = []
