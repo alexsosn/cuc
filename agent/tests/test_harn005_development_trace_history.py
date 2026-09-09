@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from harness.contracts import (
     ChangeSet,
+    EvalResult,
+    GateOutcome,
     PlanArtifact,
     ResearchArtifact,
     RunPhase,
@@ -9,6 +11,7 @@ from harness.contracts import (
     TaskSpec,
     TestIntent as HarnessTestIntent,
     TestKind as HarnessTestKind,
+    TestResult,
 )
 from harness.telemetry import DevelopmentTraceContext, build_development_trace_projection
 
@@ -48,10 +51,34 @@ def _state() -> RunState:
                 ("op:second:test", "op:second:write"),
             ),
         ),
+        test_results=(
+            TestResult(
+                "intent-1",
+                "change-2",
+                GateOutcome.SUCCESS,
+                "head-change-2",
+                "executed-change-2",
+                0,
+                1167,
+                0,
+                "full suite green",
+            ),
+        ),
+        eval_results=(
+            EvalResult(
+                "eval-1",
+                "change-2",
+                GateOutcome.SUCCESS,
+                "head-change-2",
+                "executed-change-2",
+                "evaluation green",
+                (("quality", 1.0),),
+            ),
+        ),
     )
 
 
-def test_development_projection_preserves_full_phase_and_change_identity() -> None:
+def test_development_projection_preserves_full_phase_change_and_gate_identity() -> None:
     state = _state()
     context = DevelopmentTraceContext(
         "alexsosn/cuc",
@@ -84,3 +111,14 @@ def test_development_projection_preserves_full_phase_and_change_identity() -> No
         "op:second:test",
         "op:second:write",
     )
+
+    # A global PR head/executed pair is insufficient for a multi-iteration run: each
+    # durable gate result must retain the revision on which it actually executed.
+    assert projection.metadata["test_result_intent_ids"] == ("intent-1",)
+    assert projection.metadata["test_result_change_ids"] == ("change-2",)
+    assert projection.metadata["test_result_head_shas"] == ("head-change-2",)
+    assert projection.metadata["test_result_executed_shas"] == ("executed-change-2",)
+    assert projection.metadata["eval_result_ids"] == ("eval-1",)
+    assert projection.metadata["eval_result_change_ids"] == ("change-2",)
+    assert projection.metadata["eval_result_head_shas"] == ("head-change-2",)
+    assert projection.metadata["eval_result_executed_shas"] == ("executed-change-2",)
