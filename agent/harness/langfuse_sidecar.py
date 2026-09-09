@@ -21,6 +21,7 @@ from .telemetry import (
     TelemetryRunType,
     TraceProjection,
     build_development_trace_projection,
+    build_parsing_trace_projection,
     project_parsing_scores,
 )
 
@@ -365,6 +366,8 @@ def wrap_column_review_adapters(
             )
             _emit_safely(sidecar, "emit_observation", projection)
             if isinstance(result, ParsingEvaluationRecord):
+                root_trace = build_parsing_trace_projection(state, result)
+                _emit_safely(sidecar, "emit_trace", root_trace)
                 for score in project_parsing_scores(result):
                     _emit_safely(sidecar, "emit_score", score)
         except Exception:
