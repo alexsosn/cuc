@@ -51,7 +51,7 @@ def _state() -> RunState:
     )
 
 
-def test_development_projection_preserves_all_change_and_operation_ids() -> None:
+def test_development_projection_preserves_full_phase_and_change_identity() -> None:
     state = _state()
     context = DevelopmentTraceContext(
         "alexsosn/cuc",
@@ -63,6 +63,12 @@ def test_development_projection_preserves_all_change_and_operation_ids() -> None
     )
 
     projection = build_development_trace_projection(state, context)
+
+    # Research -> plan -> TDD identity must remain queryable independently of the
+    # current phase; change history alone cannot identify the artifacts that led to it.
+    assert projection.metadata["research_artifact_id"] == "research-1"
+    assert projection.metadata["plan_id"] == "plan-1"
+    assert projection.metadata["test_intent_ids"] == ("intent-1",)
 
     assert projection.metadata["change_count"] == 2
     assert projection.metadata["change_ids"] == ("change-1", "change-2")
