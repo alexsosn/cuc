@@ -11,7 +11,7 @@ from harness.contracts import (
     TaskSpec,
     TestIntent as HarnessTestIntent,
     TestKind as HarnessTestKind,
-    TestResult,
+    TestResult as HarnessTestResult,
 )
 from harness.telemetry import DevelopmentTraceContext, build_development_trace_projection
 
@@ -52,7 +52,7 @@ def _state() -> RunState:
             ),
         ),
         test_results=(
-            TestResult(
+            HarnessTestResult(
                 "intent-1",
                 "change-2",
                 GateOutcome.SUCCESS,
