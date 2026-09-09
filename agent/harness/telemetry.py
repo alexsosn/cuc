@@ -12,8 +12,8 @@ from enum import Enum
 from typing import Any, Mapping
 
 from .column_state import ColumnRunState
-from .contracts import RunState
-from .parsing_evaluation import MeasurementKind, ParsingEvaluationRecord
+from .contracts import RunPhase, RunState
+from .parsing_evaluation import ParsingEvaluationRecord
 
 
 class TelemetryRunType(str, Enum):
@@ -247,16 +247,19 @@ def build_development_trace_projection(
     state: RunState,
     context: DevelopmentTraceContext,
 ) -> TraceProjection:
+    """Project the existing HARN-002 state without inventing a second status model."""
+
     if not isinstance(state, RunState):
         raise ValueError("state must be RunState")
     if not isinstance(context, DevelopmentTraceContext):
         raise ValueError("context must be DevelopmentTraceContext")
 
+    latest_change = state.latest_change
     metadata: dict[str, _MetadataValue] = {
         "run_type": TelemetryRunType.DEVELOPMENT.value,
         "task_id": state.task.task_id,
         "phase": state.phase.value,
-        "status": state.status,
+        "resume_phase": None if state.resume_phase is None else state.resume_phase.value,
         "repository": context.repository,
         "issue_ref": context.issue_ref,
         "base_branch": context.base_branch,
@@ -266,11 +269,19 @@ def build_development_trace_projection(
         "change_count": len(state.changes),
         "test_result_count": len(state.test_results),
         "eval_result_count": len(state.eval_results),
-        "review_revision_count": state.review_revisions,
         "verified_head_sha": state.verified_head_sha,
-        "awaiting_human_action": state.awaiting_human_action,
-        "blocked": state.blocked_reason is not None,
-        "final_disposition": state.final_disposition,
+        "blocked": state.phase is RunPhase.BLOCKED,
+        "awaiting_human_action": state.phase is RunPhase.AWAITING_HUMAN,
+        "run_complete": state.phase is RunPhase.COMPLETE,
+        "has_pause_reason": state.pause_reason is not None,
+        "latest_change_id": None if latest_change is None else latest_change.change_id,
+        "latest_operation_ids": () if latest_change is None else latest_change.operation_ids,
+        "test_gate_outcomes": tuple(
+            f"{item.intent_id}:{item.outcome.value}" for item in state.test_results
+        ),
+        "eval_gate_outcomes": tuple(
+            f"{item.eval_id}:{item.outcome.value}" for item in state.eval_results
+        ),
     }
     if context.model_provider is not None:
         metadata["model_provider"] = context.model_provider
@@ -279,13 +290,21 @@ def build_development_trace_projection(
     if context.model_version is not None:
         metadata["model_version"] = context.model_version
     if state.review is not None:
+        review = state.review
         metadata.update(
             {
-                "development_reviewer_id": state.review.reviewer_id,
-                "development_review_context_id": state.review.independent_context_id,
-                "development_reviewed_head_sha": state.review.inspected_head_sha,
-                "development_review_disposition": state.review.disposition.value,
-                "development_review_finding_count": len(state.review.findings),
+                "development_review_id": review.review_id,
+                "development_reviewer_id": review.reviewer_id,
+                "development_review_context_id": review.review_context_id,
+                "development_reviewed_head_sha": review.inspected_sha,
+                "development_review_disposition": review.disposition.value,
+                "development_review_finding_count": len(review.findings),
+                "development_review_blocking_count": sum(
+                    1 for finding in review.findings if finding.blocking
+                ),
+                "development_review_finding_severities": tuple(
+                    finding.severity.value for finding in review.findings
+                ),
             }
         )
 
