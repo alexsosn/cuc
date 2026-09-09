@@ -7,8 +7,8 @@ from harness.contracts import (
     RunPhase,
     RunState,
     TaskSpec,
-    TestIntent,
-    TestKind,
+    TestIntent as HarnessTestIntent,
+    TestKind as HarnessTestKind,
 )
 from harness.telemetry import DevelopmentTraceContext, build_development_trace_projection
 
@@ -26,9 +26,9 @@ def _state() -> RunState:
         research=ResearchArtifact("research-1", "research complete"),
         plan=PlanArtifact("plan-1", "plan complete", ("test", "implement")),
         test_intents=(
-            TestIntent(
+            HarnessTestIntent(
                 "intent-1",
-                TestKind.REGRESSION,
+                HarnessTestKind.REGRESSION,
                 ("pytest", "-q"),
                 "agent",
                 "regression suite",
