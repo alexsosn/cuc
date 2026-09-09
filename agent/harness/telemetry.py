@@ -278,7 +278,19 @@ def build_development_trace_projection(
         "change_ids": tuple(change.change_id for change in state.changes),
         "operation_ids": all_operation_ids,
         "test_result_count": len(state.test_results),
+        "test_result_intent_ids": tuple(item.intent_id for item in state.test_results),
+        "test_result_change_ids": tuple(item.change_id for item in state.test_results),
+        "test_result_head_shas": tuple(item.head_sha or "" for item in state.test_results),
+        "test_result_executed_shas": tuple(
+            item.executed_sha or "" for item in state.test_results
+        ),
         "eval_result_count": len(state.eval_results),
+        "eval_result_ids": tuple(item.eval_id for item in state.eval_results),
+        "eval_result_change_ids": tuple(item.change_id for item in state.eval_results),
+        "eval_result_head_shas": tuple(item.head_sha or "" for item in state.eval_results),
+        "eval_result_executed_shas": tuple(
+            item.executed_sha or "" for item in state.eval_results
+        ),
         "verified_head_sha": state.verified_head_sha,
         "blocked": state.phase is RunPhase.BLOCKED,
         "awaiting_human_action": state.phase is RunPhase.AWAITING_HUMAN,
