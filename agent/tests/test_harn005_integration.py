@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -197,6 +197,20 @@ def test_final_evaluation_exports_one_bound_parsing_root_trace():
     assert trace.metadata["permission_policy_sha256"] == SHA
     assert trace.metadata["evaluation_artifact_refs"] == ("artifact:evaluation",)
     assert "surface-must-not-be-exported" not in repr(trace.metadata)
+
+
+def test_wrapper_propagates_pure_projection_contract_errors():
+    state = _column_state()
+    bad = _evaluation(state)
+    bad = replace(bad, identity=replace(bad.identity, run_id="wrong-run"))
+    adapters = replace(
+        _adapters([]),
+        evaluate=lambda state, skill_context, operation_id: bad,
+    )
+    wrapped = sidecar_api.wrap_column_review_adapters(adapters, RecordingSidecar())
+
+    with pytest.raises(ValueError, match="evaluation does not match column state"):
+        wrapped.evaluate(state, ("worklist:all-four-passes",), "op:evaluate")
 
 
 def test_development_emitter_is_best_effort_and_uses_development_projection():
