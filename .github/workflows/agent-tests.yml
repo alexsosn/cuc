@@ -45,3 +45,36 @@ jobs:
 
       - name: Run full agent test suite
         run: .venv/bin/python -m pytest -q
+
+  langfuse-sdk-smoke:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.7"
+
+      - name: Sync locked observability dependencies
+        run: uv sync --locked --extra observability --no-install-project
+
+      - name: Install pinned test runner
+        run: >-
+          uv pip install --python .venv/bin/python
+          pytest==9.1.1 iniconfig==2.3.0 pluggy==1.6.0
+
+      - name: Run Langfuse SDK smoke test
+        run: .venv/bin/python -m pytest -q tests/test_langfuse_sdk_smoke.py
