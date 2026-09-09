@@ -33,6 +33,7 @@ from .column_state import (
     TokenRevisited,
     apply_column_event,
 )
+from .parsing_evaluation import ParsingEvaluationRecord
 from .skill_capabilities import (
     SkillCapabilityManifest,
     SkillCapabilityRegistry,
@@ -116,6 +117,45 @@ def _validate_bound_state(state: ColumnRunState) -> None:
     if state.task.required_completion_gates != manifest.completion_verifiers:
         raise ValueError(
             "column task completion gates do not match the canonical capability contract"
+        )
+
+
+def _validate_evaluation_binding(
+    evaluation: ParsingEvaluationRecord,
+    state: ColumnRunState,
+) -> None:
+    """Require the forwarded evaluation to describe this exact completed column state."""
+
+    if not isinstance(evaluation, ParsingEvaluationRecord):
+        raise ValueError("evaluation adapter must return ParsingEvaluationRecord")
+    if evaluation.decision_revision != state.decision_revision:
+        raise ValueError("evaluation decision revision does not match completed column state")
+
+    identity = evaluation.identity
+    workload = identity.workload
+    if identity.run_id != state.task.task_id:
+        raise ValueError("evaluation workload/run identity does not match completed column state")
+
+    expected = {
+        "corpus": state.task.corpus,
+        "tablet": state.task.tablet,
+        "column": state.task.column,
+        "snapshot_id": state.snapshot.snapshot_id,
+        "snapshot_provenance": state.snapshot.source_provenance,
+        "repository_revision": state.task.repository_revision,
+        "capability_name": state.task.capability.canonical_name,
+        "capability_contract_version": state.task.capability.contract_version,
+        "capability_provenance_sha256": state.task.capability.provenance_sha256,
+    }
+    mismatches = tuple(
+        field
+        for field, expected_value in expected.items()
+        if getattr(workload, field) != expected_value
+    )
+    if mismatches:
+        raise ValueError(
+            "evaluation workload does not match completed column state: "
+            + ", ".join(mismatches)
         )
 
 
@@ -254,7 +294,11 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
         return {"column_state": updated, "pending_evidence": ()}
 
     def after_initial(graph_state: _GraphState) -> str:
-        return "reconcile" if graph_state["column_state"].initial_pass_complete else "initial_evidence"
+        return (
+            "reconcile"
+            if graph_state["column_state"].initial_pass_complete
+            else "initial_evidence"
+        )
 
     def reconcile(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
@@ -274,12 +318,18 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
         for request in plan.revisit_requests:
             updated = apply_column_event(
                 updated,
-                RevisitRequested(f"{operation_id}:request:{request.request_id}", request),
+                RevisitRequested(
+                    f"{operation_id}:request:{request.request_id}", request
+                ),
             )
         return {"column_state": updated}
 
     def after_reconcile(graph_state: _GraphState) -> str:
-        return "revisit_evidence" if graph_state["column_state"].unresolved_revisits else "close_reconciliation"
+        return (
+            "revisit_evidence"
+            if graph_state["column_state"].unresolved_revisits
+            else "close_reconciliation"
+        )
 
     def revisit_evidence(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
@@ -323,7 +373,11 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
         return {"column_state": updated, "pending_evidence": ()}
 
     def after_revisit(graph_state: _GraphState) -> str:
-        return "revisit_evidence" if graph_state["column_state"].unresolved_revisits else "close_reconciliation"
+        return (
+            "revisit_evidence"
+            if graph_state["column_state"].unresolved_revisits
+            else "close_reconciliation"
+        )
 
     def close_reconciliation(graph_state: _GraphState) -> _GraphState:
         state = graph_state["column_state"]
@@ -340,7 +394,11 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
             if item.decision_revision == state.decision_revision
         }
         gate_id = next(
-            (gate for gate in state.task.required_completion_gates if gate not in current),
+            (
+                gate
+                for gate in state.task.required_completion_gates
+                if gate not in current
+            ),
             None,
         )
         if gate_id is None:
@@ -369,7 +427,9 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
             for item in state.gate_results
             if item.decision_revision == state.decision_revision and item.passed
         }
-        if all(gate in current_passed for gate in state.task.required_completion_gates):
+        if all(
+            gate in current_passed for gate in state.task.required_completion_gates
+        ):
             return "complete"
         return "completion_gate"
 
@@ -380,6 +440,7 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
         completed = apply_column_event(state, ColumnCompleted(completion_id))
         operation_id = f"{state.task.task_id}:column:evaluate"
         evaluation = adapters.evaluate(completed, skill_context, operation_id)
+        _validate_evaluation_binding(evaluation, completed)
         return {
             "column_state": completed,
             "evaluation": evaluation,
@@ -426,14 +487,23 @@ def compile_column_review_graph(adapters: ColumnReviewAdapters):
     builder.add_conditional_edges(
         "completion_gate",
         after_gate,
-        {"completion_gate": "completion_gate", "complete": "complete", "end": END},
+        {
+            "completion_gate": "completion_gate",
+            "complete": "complete",
+            "end": END,
+        },
     )
     builder.add_edge("complete", END)
 
     compiled = builder.compile(checkpointer=InMemorySaver())
 
     class _BoundedGraph:
-        def invoke(self, input: Any, config: dict[str, Any] | None = None, **kwargs: Any):
+        def invoke(
+            self,
+            input: Any,
+            config: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ):
             effective = dict(config or {})
             effective.setdefault("recursion_limit", _DEFAULT_RECURSION_LIMIT)
             return compiled.invoke(input, config=effective, **kwargs)
