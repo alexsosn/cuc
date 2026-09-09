@@ -90,7 +90,16 @@ def _observation(
     observation_type: str,
     **metadata: Any,
 ) -> ObservationProjection:
+    # Keep enough stable identity on every child observation for incomplete/failed
+    # runs to remain queryable without exporting scholarly payloads.
     base = {
+        "corpus": state.task.corpus,
+        "tablet": state.task.tablet,
+        "column": state.task.column,
+        "repository_revision": state.task.repository_revision,
+        "capability_name": state.task.capability.canonical_name,
+        "capability_contract_version": state.task.capability.contract_version,
+        "capability_provenance_sha256": state.task.capability.provenance_sha256,
         "decision_revision": state.decision_revision,
         "next_token_index": state.cursor.next_index,
     }
@@ -103,6 +112,32 @@ def _observation(
         observation_type,
         base,
     )
+
+
+def _emit_failed_operation(
+    sidecar: Any,
+    state: Any,
+    operation_id: str,
+    name: str,
+    observation_type: str,
+    exc: BaseException,
+    **metadata: Any,
+) -> TelemetryOutcome:
+    """Record only safe failure identity; never let telemetry mask the domain error."""
+
+    try:
+        projection = _observation(
+            state,
+            operation_id,
+            name,
+            observation_type,
+            outcome="error",
+            error_type=type(exc).__name__,
+            **metadata,
+        )
+    except Exception as telemetry_exc:
+        return _safe_failure(_sidecar_enabled(sidecar), telemetry_exc)
+    return _emit_safely(sidecar, "emit_observation", projection)
 
 
 def _run_type_value(run_type: Any) -> str:
@@ -308,26 +343,54 @@ def wrap_column_review_adapters(
         raise ValueError("adapters must be ColumnReviewAdapters")
 
     def initialize_skill_context(state, operation_id):
-        result = adapters.initialize_skill_context(state, operation_id)
+        try:
+            result = adapters.initialize_skill_context(state, operation_id)
+        except Exception as exc:
+            _emit_failed_operation(
+                sidecar,
+                state,
+                operation_id,
+                "cuc.parsing.initialize-skill-context",
+                "span",
+                exc,
+            )
+            raise
         projection = _observation(
             state,
             operation_id,
             "cuc.parsing.initialize-skill-context",
             "span",
+            outcome="success",
         )
         _emit_safely(sidecar, "emit_observation", projection)
         return result
 
     def collect_evidence(state, token, skill_context, operation_id):
-        result = adapters.collect_evidence(state, token, skill_context, operation_id)
+        metadata = {
+            "token_id": token.token_id,
+            "priority_hint": token.token_id in state.task.evidence_priority_token_ids,
+        }
+        try:
+            result = adapters.collect_evidence(state, token, skill_context, operation_id)
+        except Exception as exc:
+            _emit_failed_operation(
+                sidecar,
+                state,
+                operation_id,
+                "cuc.parsing.collect-evidence",
+                "tool",
+                exc,
+                **metadata,
+            )
+            raise
         projection = _observation(
             state,
             operation_id,
             "cuc.parsing.collect-evidence",
             "tool",
-            token_id=token.token_id,
+            outcome="success",
             evidence_count=len(result),
-            priority_hint=token.token_id in state.task.evidence_priority_token_ids,
+            **metadata,
         )
         _emit_safely(sidecar, "emit_observation", projection)
         return result
@@ -340,34 +403,62 @@ def wrap_column_review_adapters(
         operation_id,
         revisit_request=None,
     ):
-        result = adapters.adjudicate(
-            state,
-            token,
-            evidence,
-            skill_context,
-            operation_id,
-            revisit_request,
-        )
+        metadata = {
+            "token_id": token.token_id,
+            "revisit_request_id": (
+                None if revisit_request is None else revisit_request.request_id
+            ),
+        }
+        try:
+            result = adapters.adjudicate(
+                state,
+                token,
+                evidence,
+                skill_context,
+                operation_id,
+                revisit_request,
+            )
+        except Exception as exc:
+            _emit_failed_operation(
+                sidecar,
+                state,
+                operation_id,
+                "cuc.parsing.adjudicate",
+                "agent",
+                exc,
+                **metadata,
+            )
+            raise
         projection = _observation(
             state,
             operation_id,
             "cuc.parsing.adjudicate",
             "agent",
-            token_id=token.token_id,
-            revisit_request_id=(
-                None if revisit_request is None else revisit_request.request_id
-            ),
+            outcome="success",
+            **metadata,
         )
         _emit_safely(sidecar, "emit_observation", projection)
         return result
 
     def reconcile(state, skill_context, operation_id):
-        result = adapters.reconcile(state, skill_context, operation_id)
+        try:
+            result = adapters.reconcile(state, skill_context, operation_id)
+        except Exception as exc:
+            _emit_failed_operation(
+                sidecar,
+                state,
+                operation_id,
+                "cuc.parsing.reconcile",
+                "span",
+                exc,
+            )
+            raise
         projection = _observation(
             state,
             operation_id,
             "cuc.parsing.reconcile",
             "span",
+            outcome="success",
             finding_count=len(result.findings),
             revisit_request_count=len(result.revisit_requests),
         )
@@ -375,12 +466,25 @@ def wrap_column_review_adapters(
         return result
 
     def verify_completion(state, gate_id, skill_context, operation_id):
-        result = adapters.verify_completion(state, gate_id, skill_context, operation_id)
+        try:
+            result = adapters.verify_completion(state, gate_id, skill_context, operation_id)
+        except Exception as exc:
+            _emit_failed_operation(
+                sidecar,
+                state,
+                operation_id,
+                "cuc.parsing.completion-gate",
+                "evaluator",
+                exc,
+                gate_id=gate_id,
+            )
+            raise
         projection = _observation(
             state,
             operation_id,
             "cuc.parsing.completion-gate",
             "evaluator",
+            outcome="success",
             gate_id=gate_id,
             passed=bool(result.passed),
         )
@@ -388,12 +492,24 @@ def wrap_column_review_adapters(
         return result
 
     def evaluate(state, skill_context, operation_id):
-        result = adapters.evaluate(state, skill_context, operation_id)
+        try:
+            result = adapters.evaluate(state, skill_context, operation_id)
+        except Exception as exc:
+            _emit_failed_operation(
+                sidecar,
+                state,
+                operation_id,
+                "cuc.parsing.evaluate",
+                "evaluator",
+                exc,
+            )
+            raise
         projection = _observation(
             state,
             operation_id,
             "cuc.parsing.evaluate",
             "evaluator",
+            outcome="success",
             evaluation_artifact_refs=(
                 result.artifact_refs
                 if isinstance(result, ParsingEvaluationRecord)
