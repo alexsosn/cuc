@@ -257,33 +257,27 @@ def wrap_column_review_adapters(
 
     def initialize_skill_context(state, operation_id):
         result = adapters.initialize_skill_context(state, operation_id)
-        _emit_safely(
-            sidecar,
-            "emit_observation",
-            _observation(
-                state,
-                operation_id,
-                "cuc.parsing.initialize-skill-context",
-                "span",
-            ),
+        projection = _observation(
+            state,
+            operation_id,
+            "cuc.parsing.initialize-skill-context",
+            "span",
         )
+        _emit_safely(sidecar, "emit_observation", projection)
         return result
 
     def collect_evidence(state, token, skill_context, operation_id):
         result = adapters.collect_evidence(state, token, skill_context, operation_id)
-        try:
-            projection = _observation(
-                state,
-                operation_id,
-                "cuc.parsing.collect-evidence",
-                "tool",
-                token_id=token.token_id,
-                evidence_count=len(result),
-                priority_hint=token.token_id in state.task.evidence_priority_token_ids,
-            )
-            _emit_safely(sidecar, "emit_observation", projection)
-        except Exception:
-            pass
+        projection = _observation(
+            state,
+            operation_id,
+            "cuc.parsing.collect-evidence",
+            "tool",
+            token_id=token.token_id,
+            evidence_count=len(result),
+            priority_hint=token.token_id in state.task.evidence_priority_token_ids,
+        )
+        _emit_safely(sidecar, "emit_observation", projection)
         return result
 
     def adjudicate(
@@ -302,78 +296,64 @@ def wrap_column_review_adapters(
             operation_id,
             revisit_request,
         )
-        try:
-            projection = _observation(
-                state,
-                operation_id,
-                "cuc.parsing.adjudicate",
-                "agent",
-                token_id=token.token_id,
-                revisit_request_id=(
-                    None if revisit_request is None else revisit_request.request_id
-                ),
-            )
-            _emit_safely(sidecar, "emit_observation", projection)
-        except Exception:
-            pass
+        projection = _observation(
+            state,
+            operation_id,
+            "cuc.parsing.adjudicate",
+            "agent",
+            token_id=token.token_id,
+            revisit_request_id=(
+                None if revisit_request is None else revisit_request.request_id
+            ),
+        )
+        _emit_safely(sidecar, "emit_observation", projection)
         return result
 
     def reconcile(state, skill_context, operation_id):
         result = adapters.reconcile(state, skill_context, operation_id)
-        try:
-            projection = _observation(
-                state,
-                operation_id,
-                "cuc.parsing.reconcile",
-                "span",
-                finding_count=len(result.findings),
-                revisit_request_count=len(result.revisit_requests),
-            )
-            _emit_safely(sidecar, "emit_observation", projection)
-        except Exception:
-            pass
+        projection = _observation(
+            state,
+            operation_id,
+            "cuc.parsing.reconcile",
+            "span",
+            finding_count=len(result.findings),
+            revisit_request_count=len(result.revisit_requests),
+        )
+        _emit_safely(sidecar, "emit_observation", projection)
         return result
 
     def verify_completion(state, gate_id, skill_context, operation_id):
         result = adapters.verify_completion(state, gate_id, skill_context, operation_id)
-        try:
-            projection = _observation(
-                state,
-                operation_id,
-                "cuc.parsing.completion-gate",
-                "evaluator",
-                gate_id=gate_id,
-                passed=bool(result.passed),
-            )
-            _emit_safely(sidecar, "emit_observation", projection)
-        except Exception:
-            pass
+        projection = _observation(
+            state,
+            operation_id,
+            "cuc.parsing.completion-gate",
+            "evaluator",
+            gate_id=gate_id,
+            passed=bool(result.passed),
+        )
+        _emit_safely(sidecar, "emit_observation", projection)
         return result
 
     def evaluate(state, skill_context, operation_id):
         result = adapters.evaluate(state, skill_context, operation_id)
-        try:
-            projection = _observation(
-                state,
-                operation_id,
-                "cuc.parsing.evaluate",
-                "evaluator",
-                evaluation_artifact_refs=(
-                    result.artifact_refs
-                    if isinstance(result, ParsingEvaluationRecord)
-                    else ()
-                ),
-            )
-            _emit_safely(sidecar, "emit_observation", projection)
-            if isinstance(result, ParsingEvaluationRecord):
-                root_trace = build_parsing_trace_projection(state, result)
-                _emit_safely(sidecar, "emit_trace", root_trace)
-                for score in project_parsing_scores(result):
-                    _emit_safely(sidecar, "emit_score", score)
-        except Exception:
-            # Projection/transport is removable; HARN-004 remains responsible for
-            # validating the scholarly evaluation result itself.
-            pass
+        projection = _observation(
+            state,
+            operation_id,
+            "cuc.parsing.evaluate",
+            "evaluator",
+            evaluation_artifact_refs=(
+                result.artifact_refs
+                if isinstance(result, ParsingEvaluationRecord)
+                else ()
+            ),
+        )
+        _emit_safely(sidecar, "emit_observation", projection)
+        if isinstance(result, ParsingEvaluationRecord):
+            root_trace = build_parsing_trace_projection(state, result)
+            _emit_safely(sidecar, "emit_trace", root_trace)
+            for score in project_parsing_scores(result):
+                _emit_safely(sidecar, "emit_score", score)
         return result
 
     return ColumnReviewAdapters(
