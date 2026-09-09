@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import os
 from typing import Any, Callable, Mapping
+from uuid import NAMESPACE_URL, uuid5
 
 from .contracts import RunState
 from .langgraph_column_review import ColumnReviewAdapters
@@ -102,6 +103,30 @@ def _observation(
         observation_type,
         base,
     )
+
+
+def _score_id(projection: ScoreProjection) -> str:
+    """Derive the Langfuse idempotency key from HARN-015 measurement identity.
+
+    EvaluationMeasurement uniqueness is scope + token + metric name + source.  Add
+    run type/run id so independent parsing/development runs cannot collide.  Value,
+    provenance and decision revision deliberately stay out of the key: replaying or
+    updating the same logical measurement should update one Langfuse score.
+    """
+
+    metadata = projection.metadata
+    run_type = getattr(projection.run_type, "value", projection.run_type)
+    identity = "\x1f".join(
+        (
+            str(run_type),
+            projection.run_id,
+            projection.name,
+            str(metadata.get("source", "")),
+            str(metadata.get("scope", "")),
+            str(metadata.get("token_id", "")),
+        )
+    )
+    return str(uuid5(NAMESPACE_URL, f"cuc-langfuse-score:{identity}"))
 
 
 class LangfuseSidecar:
@@ -231,6 +256,7 @@ class LangfuseSidecar:
             )
             client.create_score(
                 trace_id=trace_id,
+                score_id=_score_id(projection),
                 name=projection.name,
                 value=transport_value,
                 data_type=projection.data_type,
