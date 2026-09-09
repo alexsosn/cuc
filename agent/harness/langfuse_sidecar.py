@@ -105,6 +105,28 @@ def _observation(
     )
 
 
+def _run_type_value(run_type: Any) -> str:
+    return str(getattr(run_type, "value", run_type))
+
+
+def _transport_metadata(
+    projection: TraceProjection | ObservationProjection | ScoreProjection,
+) -> dict[str, Any]:
+    """Add authoritative query identity after caller metadata is copied.
+
+    The structural projection fields are the source of truth.  Writing them last
+    prevents arbitrary metadata from spoofing parsing/development run identity or an
+    observation's deterministic operation identity.
+    """
+
+    metadata = dict(projection.metadata)
+    metadata["run_type"] = _run_type_value(projection.run_type)
+    metadata["run_id"] = projection.run_id
+    if isinstance(projection, ObservationProjection):
+        metadata["operation_id"] = projection.operation_id
+    return metadata
+
+
 def _score_id(projection: ScoreProjection) -> str:
     """Derive the Langfuse idempotency key from HARN-015 measurement identity.
 
@@ -115,10 +137,10 @@ def _score_id(projection: ScoreProjection) -> str:
     """
 
     metadata = projection.metadata
-    run_type = getattr(projection.run_type, "value", projection.run_type)
+    run_type = _run_type_value(projection.run_type)
     identity = "\x1f".join(
         (
-            str(run_type),
+            run_type,
             projection.run_id,
             projection.name,
             str(metadata.get("source", "")),
@@ -194,8 +216,7 @@ class LangfuseSidecar:
 
     @staticmethod
     def _seed(run_type: Any, run_id: str) -> str:
-        value = getattr(run_type, "value", run_type)
-        return f"{value}:{run_id}"
+        return f"{_run_type_value(run_type)}:{run_id}"
 
     def _trace_id(self, client: Any, run_type: Any, run_id: str) -> str:
         return client.create_trace_id(seed=self._seed(run_type, run_id))
@@ -213,7 +234,7 @@ class LangfuseSidecar:
                 name=projection.trace_name,
                 as_type="span",
                 trace_context={"trace_id": trace_id},
-                metadata=dict(projection.metadata),
+                metadata=_transport_metadata(projection),
             )
             observation.end()
             return TelemetryOutcome(True, True)
@@ -233,7 +254,7 @@ class LangfuseSidecar:
                 name=projection.name,
                 as_type=projection.observation_type,
                 trace_context={"trace_id": trace_id},
-                metadata=dict(projection.metadata),
+                metadata=_transport_metadata(projection),
             )
             observation.end()
             return TelemetryOutcome(True, True)
@@ -260,7 +281,7 @@ class LangfuseSidecar:
                 name=projection.name,
                 value=transport_value,
                 data_type=projection.data_type,
-                metadata=dict(projection.metadata),
+                metadata=_transport_metadata(projection),
             )
             return TelemetryOutcome(True, True)
         except Exception as exc:  # external optional transport boundary
