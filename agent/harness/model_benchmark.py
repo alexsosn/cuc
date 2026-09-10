@@ -1,8 +1,9 @@
 """Provider-neutral benchmarking for complete-column parsing backends.
 
 HARN-004 remains the execution engine and HARN-015 remains the evaluation and
-comparability authority.  This module only freezes benchmark inputs, schedules
-fresh trials, composes adapters, and records results.
+comparability authority. This module freezes benchmark inputs, schedules fresh
+trials, composes adapters, and records results; it does not implement morphology
+scoring or provider clients.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import json
 import re
 from typing import Any, Callable, Mapping
 
-from .column_state import ColumnRunState
+from .column_state import ColumnRunState, TokenDecision
 from .langgraph_column_review import (
     ColumnReviewAdapters,
     ReconciliationPlan,
@@ -58,6 +59,16 @@ def _json_dump(payload: Mapping[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _json_load(payload: str, field: str) -> Mapping[str, Any]:
+    if not isinstance(payload, str):
+        raise ValueError(f"{field} must be a string")
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field} must be valid JSON") from exc
+    return _mapping(decoded, field)
+
+
 def _is_pristine(state: ColumnRunState) -> bool:
     return (
         state.cursor.next_index == 0
@@ -94,7 +105,9 @@ class BenchmarkCase:
         if not isinstance(self.initial_state, ColumnRunState):
             raise ValueError("initial_state must be ColumnRunState")
         if not _is_pristine(self.initial_state):
-            raise ValueError("benchmark initial_state must be pristine; partial/resumed state is not comparable")
+            raise ValueError(
+                "benchmark initial_state must be pristine; partial/resumed state is not comparable"
+            )
         if not isinstance(self.evaluation_target, EvaluationTarget):
             raise ValueError("evaluation_target must be EvaluationTarget")
         object.__setattr__(self, "case_id", _required_text(self.case_id, "case_id"))
@@ -134,13 +147,7 @@ class BenchmarkCase:
 
     @classmethod
     def from_json(cls, payload: str) -> "BenchmarkCase":
-        if not isinstance(payload, str):
-            raise ValueError("BenchmarkCase JSON must be a string")
-        try:
-            decoded = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise ValueError("BenchmarkCase JSON must be valid JSON") from exc
-        return cls.from_dict(decoded)
+        return cls.from_dict(_json_load(payload, "BenchmarkCase JSON"))
 
 
 @dataclass(frozen=True)
@@ -158,6 +165,15 @@ class BenchmarkBackendSpec:
             self,
             "model_config_sha256",
             _sha256(self.model_config_sha256, "model_config_sha256"),
+        )
+
+    @property
+    def model_identity(self) -> tuple[str, str, str, str]:
+        return (
+            self.model_provider,
+            self.model_id,
+            self.model_version,
+            self.model_config_sha256,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -185,13 +201,7 @@ class BenchmarkBackendSpec:
 
     @classmethod
     def from_json(cls, payload: str) -> "BenchmarkBackendSpec":
-        if not isinstance(payload, str):
-            raise ValueError("BenchmarkBackendSpec JSON must be a string")
-        try:
-            decoded = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise ValueError("BenchmarkBackendSpec JSON must be valid JSON") from exc
-        return cls.from_dict(decoded)
+        return cls.from_dict(_json_load(payload, "BenchmarkBackendSpec JSON"))
 
 
 @dataclass(frozen=True)
@@ -213,6 +223,10 @@ class BackendDecisionAdapters:
     adjudicate: Callable[..., Any]
     reconcile: Callable[..., ReconciliationPlan]
 
+    def __post_init__(self) -> None:
+        if not callable(self.adjudicate) or not callable(self.reconcile):
+            raise ValueError("backend decision adapters must be callable")
+
 
 @dataclass(frozen=True)
 class BenchmarkBackendBinding:
@@ -233,6 +247,16 @@ class SharedBenchmarkAdapters:
     verify_completion: Callable[..., Any]
     evaluate: Callable[..., ParsingEvaluationRecord]
 
+    def __post_init__(self) -> None:
+        for field in (
+            "initialize_skill_context",
+            "collect_evidence",
+            "verify_completion",
+            "evaluate",
+        ):
+            if not callable(getattr(self, field)):
+                raise ValueError(f"{field} must be callable")
+
 
 @dataclass(frozen=True)
 class BenchmarkTrialResult:
@@ -250,7 +274,9 @@ class BenchmarkTrialResult:
     def __post_init__(self) -> None:
         object.__setattr__(self, "case_id", _required_text(self.case_id, "case_id"))
         object.__setattr__(self, "backend_id", _required_text(self.backend_id, "backend_id"))
-        object.__setattr__(self, "terminal_status", _required_text(self.terminal_status, "terminal_status"))
+        object.__setattr__(
+            self, "terminal_status", _required_text(self.terminal_status, "terminal_status")
+        )
         for field in ("trial_index", "schedule_position"):
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -259,16 +285,21 @@ class BenchmarkTrialResult:
             raise ValueError("identity must be ParsingRunIdentity")
         if self.final_state is not None and not isinstance(self.final_state, ColumnRunState):
             raise ValueError("final_state must be ColumnRunState or None")
-        if self.evaluation is not None and not isinstance(self.evaluation, ParsingEvaluationRecord):
+        if self.evaluation is not None and not isinstance(
+            self.evaluation, ParsingEvaluationRecord
+        ):
             raise ValueError("evaluation must be ParsingEvaluationRecord or None")
-        error_type = None if self.error_type is None else _required_text(self.error_type, "error_type")
+        error_type = (
+            None if self.error_type is None else _required_text(self.error_type, "error_type")
+        )
         refs = tuple(self.provider_artifact_refs)
         if any(not isinstance(item, str) or not item.strip() for item in refs):
             raise ValueError("provider_artifact_refs must contain non-empty strings")
+        refs = tuple(item.strip() for item in refs)
         if len(refs) != len(set(refs)):
             raise ValueError("provider_artifact_refs must not contain duplicates")
         object.__setattr__(self, "error_type", error_type)
-        object.__setattr__(self, "provider_artifact_refs", tuple(item.strip() for item in refs))
+        object.__setattr__(self, "provider_artifact_refs", refs)
 
         if self.terminal_status == "completed":
             if self.final_state is None or self.final_state.completion is None:
@@ -276,15 +307,23 @@ class BenchmarkTrialResult:
             if not self.final_state.initial_pass_complete:
                 raise ValueError("completed benchmark trial requires complete initial traversal")
             if not self.final_state.reconciliation_closed or self.final_state.unresolved_revisits:
-                raise ValueError("completed benchmark trial requires resolved closed reconciliation")
+                raise ValueError(
+                    "completed benchmark trial requires resolved closed reconciliation"
+                )
             if self.evaluation is None:
                 raise ValueError("completed benchmark trial requires evaluation")
             if self.evaluation.identity != self.identity:
-                raise ValueError("completed benchmark evaluation identity does not match trial identity")
+                raise ValueError(
+                    "completed benchmark evaluation identity does not match trial identity"
+                )
             if self.evaluation.decision_revision != self.final_state.decision_revision:
-                raise ValueError("completed benchmark evaluation revision does not match final state")
+                raise ValueError(
+                    "completed benchmark evaluation revision does not match final state"
+                )
             if self.final_state.task.task_id != self.identity.run_id:
-                raise ValueError("completed benchmark final state run id does not match trial identity")
+                raise ValueError(
+                    "completed benchmark final state run id does not match trial identity"
+                )
             if self.error_type is not None:
                 raise ValueError("completed benchmark trial cannot carry error_type")
         elif self.terminal_status == "backend-error":
@@ -323,6 +362,12 @@ class BenchmarkRunResult:
             raise ValueError("results must contain BenchmarkTrialResult values")
         object.__setattr__(self, "results", results)
 
+    def to_dict(self) -> dict[str, object]:
+        return {"case_id": self.case_id, "results": [item.to_dict() for item in self.results]}
+
+    def to_json(self) -> str:
+        return _json_dump(self.to_dict())
+
 
 class ComparisonMode(str, Enum):
     MODEL_ONLY = "model-only"
@@ -349,7 +394,7 @@ class BenchmarkComparison:
 class _BackendExecutionError(RuntimeError):
     def __init__(self, error_type: str) -> None:
         super().__init__("backend execution failed")
-        self.error_type = error_type
+        self.error_type = _required_text(error_type, "error_type")
 
 
 def build_trial_schedule(
@@ -359,7 +404,11 @@ def build_trial_schedule(
     specs = tuple(backends)
     if not specs or any(not isinstance(item, BenchmarkBackendSpec) for item in specs):
         raise ValueError("backends must contain at least one BenchmarkBackendSpec")
-    if isinstance(trials_per_backend, bool) or not isinstance(trials_per_backend, int) or trials_per_backend <= 0:
+    if (
+        isinstance(trials_per_backend, bool)
+        or not isinstance(trials_per_backend, int)
+        or trials_per_backend <= 0
+    ):
         raise ValueError("trials_per_backend must be a positive integer")
     ids = tuple(item.backend_id for item in specs)
     if len(ids) != len(set(ids)):
@@ -371,17 +420,6 @@ def build_trial_schedule(
             schedule.append(ScheduledTrial(spec.backend_id, trial_index, position))
             position += 1
     return tuple(schedule)
-
-
-def _trial_run_id(case: BenchmarkCase, spec: BenchmarkBackendSpec, trial_index: int) -> str:
-    payload = {
-        "protocol_version": case.protocol_version,
-        "case_id": case.case_id,
-        "backend_id": spec.backend_id,
-        "trial_index": trial_index,
-    }
-    digest = sha256(_json_dump(payload).encode("utf-8")).hexdigest()
-    return f"benchmark-{digest}"
 
 
 def _workload(case: BenchmarkCase, state: ColumnRunState) -> ParsingWorkloadRef:
@@ -401,6 +439,26 @@ def _workload(case: BenchmarkCase, state: ColumnRunState) -> ParsingWorkloadRef:
     )
 
 
+def _trial_run_id(case: BenchmarkCase, spec: BenchmarkBackendSpec, trial_index: int) -> str:
+    # Bind the run ID to the exact model and model-visible workload, not to the
+    # scheduler alias. The evaluator target is deliberately excluded: changing a
+    # held-out target must not change the model execution identity.
+    payload = {
+        "protocol_version": case.protocol_version,
+        "case_id": case.case_id,
+        "workload": _workload(case, case.initial_state).to_dict(),
+        "model": {
+            "provider": spec.model_provider,
+            "id": spec.model_id,
+            "version": spec.model_version,
+            "config_sha256": spec.model_config_sha256,
+        },
+        "trial_index": trial_index,
+    }
+    digest = sha256(_json_dump(payload).encode("utf-8")).hexdigest()
+    return f"benchmark-{digest}"
+
+
 def _identity(
     case: BenchmarkCase,
     spec: BenchmarkBackendSpec,
@@ -417,16 +475,41 @@ def _identity(
     )
 
 
-def _backend_wrapper(function: Callable[..., Any]) -> Callable[..., Any]:
+def _backend_wrapper(
+    function: Callable[..., Any],
+    expected_type: type,
+) -> Callable[..., Any]:
+    """Classify only backend-owned execution and malformed outputs as backend errors."""
+
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         try:
-            return function(*args, **kwargs)
+            result = function(*args, **kwargs)
         except _BackendExecutionError:
             raise
-        except Exception as exc:  # provider/runtime exceptions are benchmark outcomes
+        except Exception as exc:
             raise _BackendExecutionError(type(exc).__name__) from None
+        if not isinstance(result, expected_type):
+            raise _BackendExecutionError("ValueError")
+        return result
 
     return wrapped
+
+
+def _checkpointed_column_state(graph: Any, config: Mapping[str, Any]) -> ColumnRunState | None:
+    """Recover the latest durable HARN-004 state without masking a backend failure."""
+
+    try:
+        snapshot = graph.get_state(config)
+        values = getattr(snapshot, "values", None)
+        if isinstance(values, Mapping):
+            state = values.get("column_state")
+            if isinstance(state, ColumnRunState):
+                return state
+    except Exception:
+        # State recovery is diagnostic. The original backend error remains the
+        # authoritative trial outcome if checkpoint inspection itself fails.
+        return None
+    return None
 
 
 def _validate_completed_graph_output(
@@ -464,9 +547,18 @@ def run_benchmark(
     if not isinstance(shared_adapters, SharedBenchmarkAdapters):
         raise ValueError("shared_adapters must be SharedBenchmarkAdapters")
     bindings_tuple = tuple(bindings)
-    if not bindings_tuple or any(not isinstance(item, BenchmarkBackendBinding) for item in bindings_tuple):
+    if not bindings_tuple or any(
+        not isinstance(item, BenchmarkBackendBinding) for item in bindings_tuple
+    ):
         raise ValueError("bindings must contain at least one BenchmarkBackendBinding")
+
     specs = tuple(item.spec for item in bindings_tuple)
+    model_identities = tuple(item.model_identity for item in specs)
+    if len(model_identities) != len(set(model_identities)):
+        raise ValueError(
+            "duplicate model identity cannot be represented as distinct benchmark arms"
+        )
+
     schedule = build_trial_schedule(specs, trials_per_backend)
     by_id = {item.spec.backend_id: item for item in bindings_tuple}
     results: list[BenchmarkTrialResult] = []
@@ -477,6 +569,8 @@ def run_benchmark(
         task = replace(case.initial_state.task, task_id=run_id)
         trial_state = ColumnRunState.initial(task, case.initial_state.snapshot)
         identity = _identity(case, binding.spec, trial_state, scheduled.trial_index)
+        graph: Any | None = None
+        config: dict[str, Any] = {"configurable": {"thread_id": run_id}}
 
         try:
             try:
@@ -498,17 +592,17 @@ def run_benchmark(
             graph_adapters = ColumnReviewAdapters(
                 initialize_skill_context=shared_adapters.initialize_skill_context,
                 collect_evidence=shared_adapters.collect_evidence,
-                adjudicate=_backend_wrapper(decision_adapters.adjudicate),
-                reconcile=_backend_wrapper(decision_adapters.reconcile),
+                adjudicate=_backend_wrapper(decision_adapters.adjudicate, TokenDecision),
+                reconcile=_backend_wrapper(decision_adapters.reconcile, ReconciliationPlan),
                 verify_completion=shared_adapters.verify_completion,
                 evaluate=evaluate,
             )
             graph = compile_column_review_graph(graph_adapters)
-            output = graph.invoke(
-                initial_graph_input(trial_state),
-                config={"configurable": {"thread_id": run_id}},
-            )
+            output = graph.invoke(initial_graph_input(trial_state), config=config)
         except _BackendExecutionError as exc:
+            partial_state = (
+                _checkpointed_column_state(graph, config) if graph is not None else None
+            )
             results.append(
                 BenchmarkTrialResult(
                     case.case_id,
@@ -517,7 +611,7 @@ def run_benchmark(
                     scheduled.schedule_position,
                     identity,
                     "backend-error",
-                    None,
+                    partial_state,
                     None,
                     exc.error_type,
                 )
@@ -564,7 +658,9 @@ def _require_completed_pair(
     left: BenchmarkTrialResult,
     right: BenchmarkTrialResult,
 ) -> tuple[ParsingEvaluationRecord, ParsingEvaluationRecord]:
-    if not isinstance(left, BenchmarkTrialResult) or not isinstance(right, BenchmarkTrialResult):
+    if not isinstance(left, BenchmarkTrialResult) or not isinstance(
+        right, BenchmarkTrialResult
+    ):
         raise ValueError("comparison requires BenchmarkTrialResult values")
     if left.terminal_status != "completed" or right.terminal_status != "completed":
         raise ValueError("comparison requires completed benchmark trials")
@@ -573,7 +669,9 @@ def _require_completed_pair(
     return left.evaluation, right.evaluation
 
 
-def _target_mismatches(left: EvaluationTarget, right: EvaluationTarget) -> tuple[str, ...]:
+def _target_mismatches(
+    left: EvaluationTarget, right: EvaluationTarget
+) -> tuple[str, ...]:
     fields = (
         "target_id",
         "reviewed_ref",
@@ -583,7 +681,9 @@ def _target_mismatches(left: EvaluationTarget, right: EvaluationTarget) -> tuple
         "feedback_protocol_sha256",
     )
     return tuple(
-        f"target.{field}" for field in fields if getattr(left, field) != getattr(right, field)
+        f"target.{field}"
+        for field in fields
+        if getattr(left, field) != getattr(right, field)
     )
 
 
