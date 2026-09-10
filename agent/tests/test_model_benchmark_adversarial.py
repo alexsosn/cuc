@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from harness.column_state import (
     ColumnRunState,
     ColumnSnapshot,
@@ -217,3 +219,16 @@ def test_backend_error_retains_checkpointed_partial_column_state() -> None:
     assert [item.token_id for item in trial.final_state.initial_decisions] == ["t1"]
     assert trial.evaluation is None
     assert "backend-private failure text" not in trial.to_json()
+
+
+def test_duplicate_model_identity_cannot_masquerade_as_two_arms() -> None:
+    first = replace(_spec(), backend_id="alias-a")
+    second = replace(_spec(), backend_id="alias-b")
+
+    with pytest.raises(ValueError, match="duplicate|model identity|distinct"):
+        run_benchmark(
+            _case(),
+            (_binding(first), _binding(second)),
+            shared_adapters=_shared(),
+            trials_per_backend=1,
+        )
