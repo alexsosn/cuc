@@ -142,6 +142,7 @@ def _binding(
     spec: BenchmarkBackendSpec,
     *,
     malformed: bool = False,
+    wrong_token: bool = False,
     fail_on: str | None = None,
 ) -> BenchmarkBackendBinding:
     def factory(model_context):
@@ -151,9 +152,10 @@ def _binding(
             if malformed:
                 return object()
             prior = state.latest_decision(token.token_id)
+            decision_token = "not-in-this-column" if wrong_token else token.token_id
             return TokenDecision(
                 f"decision-{state.task.task_id}-{token.token_id}-{len(state.decisions)}",
-                token.token_id,
+                decision_token,
                 (f"parse:{token.token_id}",),
                 tuple(item.evidence_id for item in evidence),
                 "fixture decision",
@@ -205,6 +207,26 @@ def test_malformed_backend_output_isolated_and_later_backend_still_runs() -> Non
     assert result.results[1].terminal_status == "completed"
 
 
+def test_semantically_invalid_backend_decision_isolated_and_later_backend_runs() -> None:
+    bad_spec = replace(_spec(), backend_id="bad")
+    good_spec = replace(_spec(), backend_id="good", model_version="v2")
+    result = run_benchmark(
+        _case(),
+        (
+            _binding(bad_spec, wrong_token=True),
+            _binding(good_spec),
+        ),
+        shared_adapters=_shared(),
+        trials_per_backend=1,
+    )
+
+    assert [item.backend_id for item in result.results] == ["bad", "good"]
+    assert result.results[0].terminal_status == "backend-error"
+    assert result.results[0].error_type in {"InvalidColumnTransition", "ValueError"}
+    assert result.results[0].evaluation is None
+    assert result.results[1].terminal_status == "completed"
+
+
 def test_backend_error_retains_checkpointed_partial_column_state() -> None:
     trial = run_benchmark(
         _case(),
@@ -230,5 +252,33 @@ def test_duplicate_model_identity_cannot_masquerade_as_two_arms() -> None:
             _case(),
             (_binding(first), _binding(second)),
             shared_adapters=_shared(),
+            trials_per_backend=1,
+        )
+
+
+def test_completed_trial_rejects_evaluator_target_drift() -> None:
+    case = _case()
+    shared = _shared()
+
+    def drifted_evaluate(state, skill_context, operation_id, identity, target):
+        wrong_target = replace(target, target_id="wrong-target")
+        return ParsingEvaluationRecord(
+            1,
+            identity,
+            wrong_target,
+            state.decision_revision,
+            measure_column_behavior(state),
+            (),
+            (),
+            EfficiencyMetrics(),
+            (f"evaluation:{identity.run_id}",),
+        )
+
+    drifted = replace(shared, evaluate=drifted_evaluate)
+    with pytest.raises(ValueError, match="target"):
+        run_benchmark(
+            case,
+            (_binding(_spec()),),
+            shared_adapters=drifted,
             trials_per_backend=1,
         )
