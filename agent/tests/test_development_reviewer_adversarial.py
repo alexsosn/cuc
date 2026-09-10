@@ -263,5 +263,5 @@ def test_nested_context_deserialization_rejects_scalar_collection_smuggling() ->
 
     payload = context.to_dict()
     payload["test_evidence"] = "not-an-array"
-    with pytest.raises(ValueError, match="test_evidence|iterable|array"):
+    with pytest.raises(ValueError, match="test.evidence|test_evidence|iterable|array"):
         type(context).from_dict(payload)
