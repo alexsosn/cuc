@@ -4,7 +4,6 @@ import inspect
 
 import pytest
 
-from harness import contracts
 from harness.contracts import (
     ChangeSet,
     EvalResult,
@@ -13,8 +12,6 @@ from harness.contracts import (
     PlanArtifact,
     ResearchArtifact,
     ReviewDisposition,
-    ReviewFinding,
-    ReviewResult,
     RunState,
     TaskSpec,
     TestIntent as HarnessTestIntent,
@@ -22,6 +19,9 @@ from harness.contracts import (
     TestResult as HarnessTestResult,
 )
 from harness.development_reviewer import (
+    DevelopmentFindingCategory,
+    DevelopmentReviewFinding,
+    DevelopmentReviewReport,
     IndependentReviewer,
     apply_development_review,
     build_development_review_context,
@@ -134,15 +134,15 @@ def _context():
     )
 
 
-def _approve(context, *, review_id: str = "independent-review") -> ReviewResult:
-    return ReviewResult(
-        review_id,
-        "reviewer-b",
-        context.review_context_id,
-        context.head_sha,
-        ReviewDisposition.APPROVE,
-        "approved",
-        (),
+def _approve(context, *, review_id: str = "independent-review") -> DevelopmentReviewReport:
+    return DevelopmentReviewReport.create(
+        review_id=review_id,
+        reviewer_id="reviewer-b",
+        review_context_id=context.review_context_id,
+        inspected_sha=context.head_sha,
+        disposition=ReviewDisposition.APPROVE,
+        summary="approved",
+        findings=(),
     )
 
 
@@ -168,22 +168,24 @@ def test_reviewer_revalidates_context_before_exposing_it_to_adapter() -> None:
     assert not called
 
 
-def test_reviewer_revalidates_returned_review_contract_after_adapter_boundary() -> None:
+def test_reviewer_revalidates_returned_structured_report_after_adapter_boundary() -> None:
     context = _context()
 
     def reviewer(packet):
-        result = _approve(packet)
-        blocker = ReviewFinding(
-            "late-blocker",
-            FindingSeverity.CRITICAL,
-            "blocking finding injected after construction",
-            ("diff:x.py",),
-            True,
+        report = _approve(packet)
+        blocker = DevelopmentReviewFinding(
+            finding_id="late-blocker",
+            category=DevelopmentFindingCategory.INVARIANT_RISK,
+            severity=FindingSeverity.CRITICAL,
+            summary="blocking finding injected after construction",
+            evidence_refs=("diff:x.py",),
+            location="x.py:1",
+            blocking=True,
         )
-        object.__setattr__(result, "findings", (blocker,))
-        return result
+        object.__setattr__(report, "findings", (blocker,))
+        return report
 
-    with pytest.raises(ValueError, match="approved|blocking|review"):
+    with pytest.raises(ValueError, match="report|finding|review|projection"):
         run_independent_development_review(
             context,
             IndependentReviewer("reviewer-b", reviewer),
@@ -193,12 +195,12 @@ def test_reviewer_revalidates_returned_review_contract_after_adapter_boundary() 
 def test_apply_requires_the_exact_clean_context_and_revalidates_binding() -> None:
     context = _context()
     state = _review_ready_state()
-    result = _approve(context)
+    report = _approve(context)
 
     parameters = inspect.signature(apply_development_review).parameters
-    assert tuple(parameters) == ("state", "context", "result")
-    completed = apply_development_review(state, context, result)
-    assert completed.review == result
+    assert tuple(parameters) == ("state", "context", "report")
+    completed = apply_development_review(state, context, report)
+    assert completed.review == report.review
 
     other = build_development_review_context(
         state,
@@ -209,48 +211,79 @@ def test_apply_requires_the_exact_clean_context_and_revalidates_binding() -> Non
         rubric=context.rubric,
     )
     with pytest.raises(ValueError, match="context|binding"):
-        apply_development_review(state, other, result)
+        apply_development_review(state, other, report)
 
 
-def test_review_findings_have_structured_category_and_location() -> None:
-    FindingCategory = getattr(contracts, "FindingCategory", None)
-    assert FindingCategory is not None, "HARN-006 requires structured finding categories"
-
-    cases = (
-        (FindingCategory.MISSING_TEST, "agent/tests/test_x.py"),
-        (FindingCategory.INVARIANT_RISK, "agent/harness/state_machine.py:review"),
-        (FindingCategory.REGRESSION_RISK, "agent/harness/contracts.py:ReviewResult"),
+def test_structured_report_carries_category_location_and_lossless_core_projection() -> None:
+    context = _context()
+    categories = (
+        DevelopmentFindingCategory.MISSING_TEST,
+        DevelopmentFindingCategory.INVARIANT_RISK,
+        DevelopmentFindingCategory.REGRESSION_RISK,
     )
-    for index, (category, location) in enumerate(cases):
-        finding = ReviewFinding(
-            f"finding-{index}",
-            FindingSeverity.MAJOR,
-            "structured risk",
-            ("review:evidence",),
-            False,
+    findings = tuple(
+        DevelopmentReviewFinding(
+            finding_id=f"finding-{index}",
             category=category,
-            location=location,
+            severity=FindingSeverity.MAJOR,
+            summary="structured risk",
+            evidence_refs=("review:evidence",),
+            location=f"agent/file-{index}.py:10",
+            blocking=False,
         )
-        payload = finding.to_dict()
-        assert payload["category"] == category.value
-        assert payload["location"] == location
-        restored = ReviewFinding.from_dict(payload)
-        assert restored.category is category
-        assert restored.location == location
+        for index, category in enumerate(categories)
+    )
+    report = DevelopmentReviewReport.create(
+        review_id="structured-review",
+        reviewer_id="reviewer-b",
+        review_context_id=context.review_context_id,
+        inspected_sha=context.head_sha,
+        disposition=ReviewDisposition.APPROVE,
+        summary="structured review",
+        findings=findings,
+    )
+
+    restored = DevelopmentReviewReport.from_json(report.to_json())
+    assert restored == report
+    assert tuple(item.category for item in restored.findings) == categories
+    assert tuple(item.location for item in restored.findings) == (
+        "agent/file-0.py:10",
+        "agent/file-1.py:10",
+        "agent/file-2.py:10",
+    )
+    assert tuple(item.finding_id for item in restored.review.findings) == tuple(
+        item.finding_id for item in findings
+    )
+    assert tuple(item.evidence_refs for item in restored.review.findings) == tuple(
+        item.evidence_refs for item in findings
+    )
 
 
-def test_old_review_finding_payload_remains_backward_compatible() -> None:
-    payload = {
-        "finding_id": "legacy-finding",
-        "severity": "minor",
-        "summary": "legacy payload",
-        "evidence_refs": ["legacy:evidence"],
-        "blocking": False,
-    }
-    restored = ReviewFinding.from_dict(payload)
-    assert restored.finding_id == "legacy-finding"
-    assert restored.location is None
-    assert restored.category.value == "general"
+def test_structured_report_rejects_mismatched_core_projection() -> None:
+    context = _context()
+    finding = DevelopmentReviewFinding(
+        finding_id="missing-regression",
+        category=DevelopmentFindingCategory.MISSING_TEST,
+        severity=FindingSeverity.MAJOR,
+        summary="regression test missing",
+        evidence_refs=("issue:7",),
+        location="agent/tests/",
+        blocking=True,
+    )
+    report = DevelopmentReviewReport.create(
+        review_id="projection-review",
+        reviewer_id="reviewer-b",
+        review_context_id=context.review_context_id,
+        inspected_sha=context.head_sha,
+        disposition=ReviewDisposition.REQUEST_CHANGES,
+        summary="changes required",
+        findings=(finding,),
+    )
+    payload = report.to_dict()
+    payload["review"] = dict(payload["review"])
+    payload["review"]["findings"] = []
+    with pytest.raises(ValueError, match="projection|finding|request-changes"):
+        DevelopmentReviewReport.from_dict(payload)
 
 
 def test_nested_context_deserialization_rejects_scalar_collection_smuggling() -> None:
