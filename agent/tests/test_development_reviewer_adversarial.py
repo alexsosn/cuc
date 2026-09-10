@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from hashlib import sha256
 import inspect
+import json
 
 import pytest
 
@@ -144,6 +146,18 @@ def _approve(context, *, review_id: str = "independent-review") -> DevelopmentRe
         summary="approved",
         findings=(),
     )
+
+
+def _rehash_context_payload(payload: dict) -> dict:
+    identity = {key: value for key, value in payload.items() if key != "review_context_id"}
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload["review_context_id"] = "review-context-" + sha256(encoded).hexdigest()
+    return payload
 
 
 def test_reviewer_revalidates_context_before_exposing_it_to_adapter() -> None:
@@ -297,4 +311,26 @@ def test_nested_context_deserialization_rejects_scalar_collection_smuggling() ->
     payload = context.to_dict()
     payload["test_evidence"] = "not-an-array"
     with pytest.raises(ValueError, match="test.evidence|test_evidence|iterable|array"):
+        type(context).from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    (
+        ("test_evidence", "outcome", GateOutcome.TEST_FAILURE.value),
+        ("test_evidence", "head_sha", "9" * 40),
+        ("eval_evidence", "executed_sha", "8" * 40),
+    ),
+)
+def test_rehashed_serialized_context_cannot_weaken_verified_evidence(
+    section: str,
+    field: str,
+    value: str,
+) -> None:
+    context = _context()
+    payload = context.to_dict()
+    payload[section] = [dict(item) for item in payload[section]]
+    payload[section][0][field] = value
+    _rehash_context_payload(payload)
+    with pytest.raises(ValueError, match="success|head|executed|verification|context"):
         type(context).from_dict(payload)
