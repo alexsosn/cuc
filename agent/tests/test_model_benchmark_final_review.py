@@ -225,3 +225,21 @@ def test_exact_snapshot_content_is_bound_even_if_declared_ids_are_reused() -> No
     report = compare_trials(baseline, changed, mode=ComparisonMode.MODEL_ONLY)
     assert not report.comparable
     assert "snapshot_content" in report.mismatched_dimensions
+
+
+def test_deterministic_measurement_schema_drift_is_not_comparable() -> None:
+    left = _run(_case())
+    right = _run(_case())
+    assert right.evaluation is not None
+    assert len(right.evaluation.deterministic_measurements) > 1
+
+    drifted_evaluation = replace(
+        right.evaluation,
+        deterministic_measurements=right.evaluation.deterministic_measurements[:-1],
+    )
+    drifted = replace(right, evaluation=drifted_evaluation)
+
+    for mode in (ComparisonMode.MODEL_ONLY, ComparisonMode.SYSTEM_VARIANT):
+        report = compare_trials(left, drifted, mode=mode)
+        assert not report.comparable
+        assert "deterministic_measurement_schema" in report.mismatched_dimensions
