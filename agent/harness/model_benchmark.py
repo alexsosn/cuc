@@ -797,6 +797,32 @@ def _execution_input_mismatches(
     return tuple(mismatches)
 
 
+def _deterministic_measurement_schema(record: ParsingEvaluationRecord) -> tuple[tuple[object, ...], ...]:
+    """Return an order-independent schema signature without comparing outcome values."""
+
+    return tuple(
+        sorted(
+            (
+                item.name,
+                item.kind.value,
+                item.scope.value,
+                item.source,
+                item.token_id,
+            )
+            for item in record.deterministic_measurements
+        )
+    )
+
+
+def _evaluation_schema_mismatches(
+    left: ParsingEvaluationRecord,
+    right: ParsingEvaluationRecord,
+) -> tuple[str, ...]:
+    if _deterministic_measurement_schema(left) != _deterministic_measurement_schema(right):
+        return ("deterministic_measurement_schema",)
+    return ()
+
+
 def compare_trials(
     left: BenchmarkTrialResult,
     right: BenchmarkTrialResult,
@@ -810,13 +836,18 @@ def compare_trials(
         raise ValueError(f"invalid comparison mode: {mode!r}") from exc
 
     execution_mismatches = _execution_input_mismatches(left, right)
+    evaluation_schema_mismatches = _evaluation_schema_mismatches(left_eval, right_eval)
     if comparison_mode is ComparisonMode.MODEL_ONLY:
         report: ComparabilityReport = compare_evaluation_records(
             left_eval,
             right_eval,
             ignore_model_identity=True,
         )
-        mismatches = tuple(report.mismatched_dimensions) + execution_mismatches
+        mismatches = (
+            tuple(report.mismatched_dimensions)
+            + execution_mismatches
+            + evaluation_schema_mismatches
+        )
         return BenchmarkComparison(not mismatches, mismatches, ())
 
     lw = left.identity.workload
@@ -850,6 +881,7 @@ def compare_trials(
         if getattr(lw, field) != getattr(rw, field)
     ]
     mismatches.extend(execution_mismatches)
+    mismatches.extend(evaluation_schema_mismatches)
     mismatches.extend(_target_mismatches(left_eval.target, right_eval.target))
     if left_eval.schema_version != right_eval.schema_version:
         mismatches.append("schema_version")
