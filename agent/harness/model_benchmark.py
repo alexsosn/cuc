@@ -15,7 +15,16 @@ import json
 import re
 from typing import Any, Callable, Mapping
 
-from .column_state import ColumnRunState, TokenDecision
+from .column_state import (
+    ColumnRunState,
+    InvalidColumnTransition,
+    ReconciliationFindingRecorded,
+    RevisitRequested,
+    TokenDecision,
+    TokenReviewed,
+    TokenRevisited,
+    apply_column_event,
+)
 from .langgraph_column_review import (
     ColumnReviewAdapters,
     ReconciliationPlan,
@@ -475,22 +484,91 @@ def _identity(
     )
 
 
-def _backend_wrapper(
-    function: Callable[..., Any],
-    expected_type: type,
-) -> Callable[..., Any]:
-    """Classify only backend-owned execution and malformed outputs as backend errors."""
+def _call_backend(function: Callable[..., Any], *args: Any) -> Any:
+    try:
+        return function(*args)
+    except _BackendExecutionError:
+        raise
+    except Exception as exc:
+        raise _BackendExecutionError(type(exc).__name__) from None
 
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
-        try:
-            result = function(*args, **kwargs)
-        except _BackendExecutionError:
-            raise
-        except Exception as exc:
-            raise _BackendExecutionError(type(exc).__name__) from None
-        if not isinstance(result, expected_type):
+
+def _validate_backend_transition(validation: Callable[[], Any]) -> None:
+    try:
+        validation()
+    except (InvalidColumnTransition, ValueError) as exc:
+        raise _BackendExecutionError(type(exc).__name__) from None
+
+
+def _adjudication_wrapper(function: Callable[..., Any]) -> Callable[..., TokenDecision]:
+    """Validate provider decisions against the authoritative domain transition."""
+
+    def wrapped(
+        state: ColumnRunState,
+        token: Any,
+        evidence: Any,
+        skill_context: Any,
+        operation_id: str,
+        revisit_request: Any = None,
+    ) -> TokenDecision:
+        decision = _call_backend(
+            function,
+            state,
+            token,
+            evidence,
+            skill_context,
+            operation_id,
+            revisit_request,
+        )
+        if not isinstance(decision, TokenDecision):
             raise _BackendExecutionError("ValueError")
-        return result
+        if revisit_request is None:
+            _validate_backend_transition(
+                lambda: apply_column_event(state, TokenReviewed(operation_id, decision))
+            )
+        else:
+            _validate_backend_transition(
+                lambda: apply_column_event(
+                    state,
+                    TokenRevisited(operation_id, revisit_request.request_id, decision),
+                )
+            )
+        return decision
+
+    return wrapped
+
+
+def _reconciliation_wrapper(function: Callable[..., Any]) -> Callable[..., ReconciliationPlan]:
+    """Validate provider reconciliation output without reimplementing state rules."""
+
+    def wrapped(
+        state: ColumnRunState,
+        skill_context: Any,
+        operation_id: str,
+    ) -> ReconciliationPlan:
+        plan = _call_backend(function, state, skill_context, operation_id)
+        if not isinstance(plan, ReconciliationPlan):
+            raise _BackendExecutionError("ValueError")
+
+        def validate() -> None:
+            updated = state
+            for finding in plan.findings:
+                updated = apply_column_event(
+                    updated,
+                    ReconciliationFindingRecorded(
+                        f"{operation_id}:finding:{finding.finding_id}", finding
+                    ),
+                )
+            for request in plan.revisit_requests:
+                updated = apply_column_event(
+                    updated,
+                    RevisitRequested(
+                        f"{operation_id}:request:{request.request_id}", request
+                    ),
+                )
+
+        _validate_backend_transition(validate)
+        return plan
 
     return wrapped
 
@@ -506,8 +584,6 @@ def _checkpointed_column_state(graph: Any, config: Mapping[str, Any]) -> ColumnR
             if isinstance(state, ColumnRunState):
                 return state
     except Exception:
-        # State recovery is diagnostic. The original backend error remains the
-        # authoritative trial outcome if checkpoint inspection itself fails.
         return None
     return None
 
@@ -515,6 +591,7 @@ def _checkpointed_column_state(graph: Any, config: Mapping[str, Any]) -> ColumnR
 def _validate_completed_graph_output(
     output: Mapping[str, Any],
     identity: ParsingRunIdentity,
+    expected_target: EvaluationTarget,
 ) -> tuple[ColumnRunState, ParsingEvaluationRecord]:
     state = output.get("column_state")
     evaluation = output.get("evaluation")
@@ -530,6 +607,8 @@ def _validate_completed_graph_output(
         raise ValueError("completed graph output used incomplete completion gates")
     if evaluation.identity != identity:
         raise ValueError("evaluation identity does not match benchmark trial")
+    if evaluation.target != expected_target:
+        raise ValueError("evaluation target does not match frozen benchmark target")
     if evaluation.decision_revision != state.decision_revision:
         raise ValueError("evaluation revision does not match completed state")
     return state, evaluation
@@ -592,8 +671,8 @@ def run_benchmark(
             graph_adapters = ColumnReviewAdapters(
                 initialize_skill_context=shared_adapters.initialize_skill_context,
                 collect_evidence=shared_adapters.collect_evidence,
-                adjudicate=_backend_wrapper(decision_adapters.adjudicate, TokenDecision),
-                reconcile=_backend_wrapper(decision_adapters.reconcile, ReconciliationPlan),
+                adjudicate=_adjudication_wrapper(decision_adapters.adjudicate),
+                reconcile=_reconciliation_wrapper(decision_adapters.reconcile),
                 verify_completion=shared_adapters.verify_completion,
                 evaluate=evaluate,
             )
@@ -620,7 +699,9 @@ def run_benchmark(
 
         status = output.get("terminal_status")
         if status == "completed":
-            final_state, evaluation = _validate_completed_graph_output(output, identity)
+            final_state, evaluation = _validate_completed_graph_output(
+                output, identity, case.evaluation_target
+            )
             results.append(
                 BenchmarkTrialResult(
                     case.case_id,
