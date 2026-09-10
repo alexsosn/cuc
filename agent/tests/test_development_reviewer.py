@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import importlib
 import inspect
 
@@ -19,9 +18,9 @@ from harness.contracts import (
     RunPhase,
     RunState,
     TaskSpec,
-    TestIntent,
-    TestKind,
-    TestResult,
+    TestIntent as HarnessTestIntent,
+    TestKind as HarnessTestKind,
+    TestResult as HarnessTestResult,
 )
 from harness.state_machine import (
     ChangeRecorded,
@@ -30,8 +29,8 @@ from harness.state_machine import (
     ResearchRecorded,
     ResumeRequested,
     ReviewRecorded,
-    TestsDeclared,
-    TestRecorded,
+    TestsDeclared as HarnessTestsDeclared,
+    TestRecorded as HarnessTestRecorded,
     VerificationPassed,
     apply_event,
 )
@@ -95,18 +94,18 @@ def _review_ready_state() -> RunState:
     )
     state = apply_event(
         state,
-        TestsDeclared(
+        HarnessTestsDeclared(
             (
-                TestIntent(
+                HarnessTestIntent(
                     "unit",
-                    TestKind.TARGETED,
+                    HarnessTestKind.TARGETED,
                     ("python", "-m", "pytest", "tests/test_development_reviewer.py"),
                     "agent",
                     "HARN-006 targeted tests",
                 ),
-                TestIntent(
+                HarnessTestIntent(
                     "full",
-                    TestKind.REGRESSION,
+                    HarnessTestKind.REGRESSION,
                     ("python", "-m", "pytest", "-q"),
                     "agent",
                     "full agent regression suite",
@@ -125,40 +124,27 @@ def _review_ready_state() -> RunState:
             )
         ),
     )
-    state = apply_event(
-        state,
-        TestRecorded(
-            TestResult(
-                "unit",
-                "change-1",
-                GateOutcome.SUCCESS,
-                HEAD,
-                EXECUTED,
-                0,
-                12,
-                0,
-                TEST_NARRATIVE,
-                ("ci:unit",),
-            )
-        ),
-    )
-    state = apply_event(
-        state,
-        TestRecorded(
-            TestResult(
-                "full",
-                "change-1",
-                GateOutcome.SUCCESS,
-                HEAD,
-                EXECUTED,
-                0,
-                1187,
-                0,
-                TEST_NARRATIVE,
-                ("ci:full",),
-            )
-        ),
-    )
+    for intent_id, passed, evidence_ref in (
+        ("unit", 12, "ci:unit"),
+        ("full", 1187, "ci:full"),
+    ):
+        state = apply_event(
+            state,
+            HarnessTestRecorded(
+                HarnessTestResult(
+                    intent_id,
+                    "change-1",
+                    GateOutcome.SUCCESS,
+                    HEAD,
+                    EXECUTED,
+                    0,
+                    passed,
+                    0,
+                    TEST_NARRATIVE,
+                    (evidence_ref,),
+                )
+            ),
+        )
     state = apply_event(
         state,
         EvalRecorded(
@@ -187,17 +173,21 @@ def _context(state: RunState | None = None, **overrides):
         rubric=RUBRIC,
     )
     values.update(overrides)
-    return runtime.build_development_review_context(state or _review_ready_state(), **values)
+    return runtime.build_development_review_context(
+        _review_ready_state() if state is None else state,
+        **values,
+    )
 
 
 def test_clean_context_is_deterministic_roundtrippable_and_reviewable() -> None:
     runtime = _runtime()
     context = _context()
-
     assert context.review_context_id.startswith("review-context-")
-    assert context.head_sha == HEAD
-    assert context.executed_sha == EXECUTED
-    assert context.base_sha == BASE
+    assert (context.base_sha, context.head_sha, context.executed_sha) == (
+        BASE,
+        HEAD,
+        EXECUTED,
+    )
     assert context.final_diff == FINAL_DIFF
     assert context.policy_refs == POLICIES
     assert context.rubric == RUBRIC
@@ -207,11 +197,11 @@ def test_clean_context_is_deterministic_roundtrippable_and_reviewable() -> None:
     )
     assert tuple(item.intent_id for item in context.test_evidence) == ("unit", "full")
     assert tuple(item.eval_id for item in context.eval_evidence) == ("safety-eval",)
-    assert context.to_json() == context.to_json()
     assert runtime.DevelopmentReviewContext.from_json(context.to_json()) == context
+    assert context.to_json() == context.to_json()
 
 
-def test_context_default_packet_excludes_implementer_and_prior_review_narrative() -> None:
+def test_default_context_excludes_implementation_and_prior_review_narrative() -> None:
     runtime = _runtime()
     state = _review_ready_state()
     escalated = ReviewResult(
@@ -223,11 +213,8 @@ def test_context_default_packet_excludes_implementer_and_prior_review_narrative(
         PRIOR_REVIEW_NARRATIVE,
         (),
     )
-    paused = apply_event(state, ReviewRecorded(escalated))
-    resumed = apply_event(paused, ResumeRequested())
-    context = _context(resumed)
-    serialized = context.to_json()
-
+    resumed = apply_event(apply_event(state, ReviewRecorded(escalated)), ResumeRequested())
+    serialized = _context(resumed).to_json()
     for forbidden in (
         RESEARCH_NARRATIVE,
         PLAN_NARRATIVE,
@@ -241,10 +228,12 @@ def test_context_default_packet_excludes_implementer_and_prior_review_narrative(
     parameters = inspect.signature(runtime.build_development_review_context).parameters
     assert "metadata" not in parameters
     assert "implementation_context" not in parameters
-    assert not any(param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+    assert not any(
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    )
 
 
-def test_context_identity_binds_diff_head_policy_and_rubric_and_cannot_be_forged() -> None:
+def test_context_identity_binds_diff_policy_rubric_and_rejects_forgery() -> None:
     runtime = _runtime()
     original = _context()
     variants = (
@@ -266,20 +255,24 @@ def test_context_identity_binds_diff_head_policy_and_rubric_and_cannot_be_forged
 
 
 def test_context_rejects_wrong_phase_and_stale_head() -> None:
-    state = _review_ready_state()
+    non_review = RunState(
+        "fresh-run",
+        TaskSpec("task", "title", "objective", ("criterion",)),
+    )
     with pytest.raises(ValueError, match="review"):
-        _context(replace(state, phase=RunPhase.COMPLETE))
+        _context(non_review)
     with pytest.raises(ValueError, match="head|verified|stale"):
         _context(head_sha="d" * 40)
 
 
-def test_context_fails_closed_on_mixed_or_non_success_verification_evidence() -> None:
-    state = _review_ready_state()
-    mixed = replace(
-        state,
-        test_results=state.test_results
+def test_context_defensively_rejects_tampered_verification_evidence() -> None:
+    mixed = _review_ready_state()
+    object.__setattr__(
+        mixed,
+        "test_results",
+        mixed.test_results
         + (
-            TestResult(
+            HarnessTestResult(
                 "unit",
                 "change-1",
                 GateOutcome.SUCCESS,
@@ -288,7 +281,7 @@ def test_context_fails_closed_on_mixed_or_non_success_verification_evidence() ->
                 0,
                 1,
                 0,
-                "newer rerun",
+                "tampered rerun",
                 ("ci:rerun",),
             ),
         ),
@@ -296,11 +289,13 @@ def test_context_fails_closed_on_mixed_or_non_success_verification_evidence() ->
     with pytest.raises(ValueError, match="executed|verification|mixed"):
         _context(mixed)
 
-    failed = replace(
-        state,
-        test_results=state.test_results
+    failed = _review_ready_state()
+    object.__setattr__(
+        failed,
+        "test_results",
+        failed.test_results
         + (
-            TestResult(
+            HarnessTestResult(
                 "unit",
                 "change-1",
                 GateOutcome.TEST_FAILURE,
@@ -309,17 +304,16 @@ def test_context_fails_closed_on_mixed_or_non_success_verification_evidence() ->
                 1,
                 11,
                 1,
-                "fresh failure",
+                "tampered failure",
                 ("ci:failure",),
             ),
         ),
-        verified_head_sha=HEAD,
     )
     with pytest.raises(ValueError, match="success|test|verification"):
         _context(failed)
 
 
-def test_reviewer_receives_only_serializable_clean_context_and_result_is_bound() -> None:
+def test_reviewer_receives_only_clean_context_and_result_is_bound() -> None:
     runtime = _runtime()
     context = _context()
     seen = []
@@ -338,8 +332,8 @@ def test_reviewer_receives_only_serializable_clean_context_and_result_is_bound()
 
     binding = runtime.IndependentReviewer(
         reviewer_id="reviewer-clean",
-        implementer_id="implementer-runner",
         review=review,
+        implementer_id="implementer-runner",
     )
     result = runtime.run_independent_development_review(context, binding)
     assert seen == [context]
@@ -347,12 +341,15 @@ def test_reviewer_receives_only_serializable_clean_context_and_result_is_bound()
     assert result.inspected_sha == HEAD
 
 
-def test_reviewer_identity_and_returned_context_head_are_fail_closed() -> None:
+def test_reviewer_identity_and_return_binding_fail_closed() -> None:
     runtime = _runtime()
     context = _context()
-
     with pytest.raises(ValueError, match="independent|implementer|reviewer"):
-        runtime.IndependentReviewer("same-agent", lambda _: None, implementer_id="same-agent")
+        runtime.IndependentReviewer(
+            reviewer_id="same-agent",
+            review=lambda _: None,
+            implementer_id="same-agent",
+        )
 
     def wrong(packet):
         return ReviewResult(
@@ -365,54 +362,50 @@ def test_reviewer_identity_and_returned_context_head_are_fail_closed() -> None:
             (),
         )
 
-    binding = runtime.IndependentReviewer("reviewer-clean", wrong)
     with pytest.raises(ValueError, match="reviewer|context|head"):
-        runtime.run_independent_development_review(context, binding)
+        runtime.run_independent_development_review(
+            context,
+            runtime.IndependentReviewer("reviewer-clean", wrong),
+        )
 
 
-def test_seeded_defect_becomes_structured_blocker_and_routes_via_harn002() -> None:
+def test_seeded_defect_becomes_blocker_and_request_changes_uses_harn002() -> None:
     runtime = _runtime()
-    unsafe_diff = "diff --git a/x.py b/x.py\n+subprocess.run(user_input, shell=True)\n"
-    context = _context(final_diff=unsafe_diff)
+    context = _context(
+        final_diff="diff --git a/x.py b/x.py\n+subprocess.run(user_input, shell=True)\n"
+    )
 
     def deterministic_reviewer(packet):
-        findings = ()
-        disposition = ReviewDisposition.APPROVE
-        if "shell=True" in packet.final_diff:
-            findings = (
-                ReviewFinding(
-                    "unsafe-shell",
-                    FindingSeverity.CRITICAL,
-                    "Untrusted input reaches a shell",
-                    ("diff:x.py",),
-                    True,
-                ),
-            )
-            disposition = ReviewDisposition.REQUEST_CHANGES
+        finding = ReviewFinding(
+            "unsafe-shell",
+            FindingSeverity.CRITICAL,
+            "Untrusted input reaches a shell",
+            ("diff:x.py",),
+            True,
+        )
+        assert "shell=True" in packet.final_diff
         return ReviewResult(
             "review-defect",
             "reviewer-clean",
             packet.review_context_id,
             packet.head_sha,
-            disposition,
+            ReviewDisposition.REQUEST_CHANGES,
             "Synthetic independent review",
-            findings,
+            (finding,),
         )
 
     result = runtime.run_independent_development_review(
         context,
         runtime.IndependentReviewer("reviewer-clean", deterministic_reviewer),
     )
-    assert result.disposition is ReviewDisposition.REQUEST_CHANGES
-    assert result.findings[0].finding_id == "unsafe-shell"
-
     revised = runtime.apply_development_review(_review_ready_state(), result)
+    assert result.findings[0].finding_id == "unsafe-shell"
     assert revised.phase is RunPhase.IMPLEMENT
     assert revised.review == result
     assert revised.verified_head_sha is None
 
 
-def test_approve_routes_via_existing_harn002_state_machine() -> None:
+def test_approve_uses_existing_harn002_state_machine() -> None:
     runtime = _runtime()
     context = _context()
     result = ReviewResult(
