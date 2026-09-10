@@ -448,6 +448,15 @@ def _workload(case: BenchmarkCase, state: ColumnRunState) -> ParsingWorkloadRef:
     )
 
 
+def _execution_input(state: ColumnRunState) -> dict[str, object]:
+    """Canonical model-visible inputs not represented by ParsingWorkloadRef."""
+
+    return {
+        "evidence_priority_token_ids": list(state.task.evidence_priority_token_ids),
+        "snapshot_content": state.snapshot.to_dict(),
+    }
+
+
 def _trial_run_id(case: BenchmarkCase, spec: BenchmarkBackendSpec, trial_index: int) -> str:
     # Bind the run ID to the exact model and model-visible workload, not to the
     # scheduler alias. The evaluator target is deliberately excluded: changing a
@@ -456,6 +465,7 @@ def _trial_run_id(case: BenchmarkCase, spec: BenchmarkBackendSpec, trial_index: 
         "protocol_version": case.protocol_version,
         "case_id": case.case_id,
         "workload": _workload(case, case.initial_state).to_dict(),
+        "execution_input": _execution_input(case.initial_state),
         "model": {
             "provider": spec.model_provider,
             "id": spec.model_id,
@@ -657,7 +667,7 @@ def run_benchmark(
             except Exception as exc:
                 raise _BackendExecutionError(type(exc).__name__) from None
             if not isinstance(decision_adapters, BackendDecisionAdapters):
-                raise ValueError("backend factory must return BackendDecisionAdapters")
+                raise _BackendExecutionError("ValueError")
 
             def evaluate(state: ColumnRunState, skill_context: Any, operation_id: str):
                 return shared_adapters.evaluate(
@@ -768,6 +778,25 @@ def _target_mismatches(
     )
 
 
+def _execution_input_mismatches(
+    left: BenchmarkTrialResult,
+    right: BenchmarkTrialResult,
+) -> tuple[str, ...]:
+    """Compare exact model-visible column inputs omitted from ParsingWorkloadRef."""
+
+    if left.final_state is None or right.final_state is None:
+        raise ValueError("execution-input comparison requires completed final states")
+    mismatches: list[str] = []
+    if (
+        left.final_state.task.evidence_priority_token_ids
+        != right.final_state.task.evidence_priority_token_ids
+    ):
+        mismatches.append("evidence_priority_token_ids")
+    if left.final_state.snapshot.to_dict() != right.final_state.snapshot.to_dict():
+        mismatches.append("snapshot_content")
+    return tuple(mismatches)
+
+
 def compare_trials(
     left: BenchmarkTrialResult,
     right: BenchmarkTrialResult,
@@ -780,13 +809,15 @@ def compare_trials(
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid comparison mode: {mode!r}") from exc
 
+    execution_mismatches = _execution_input_mismatches(left, right)
     if comparison_mode is ComparisonMode.MODEL_ONLY:
         report: ComparabilityReport = compare_evaluation_records(
             left_eval,
             right_eval,
             ignore_model_identity=True,
         )
-        return BenchmarkComparison(report.comparable, report.mismatched_dimensions, ())
+        mismatches = tuple(report.mismatched_dimensions) + execution_mismatches
+        return BenchmarkComparison(not mismatches, mismatches, ())
 
     lw = left.identity.workload
     rw = right.identity.workload
@@ -818,6 +849,7 @@ def compare_trials(
         for field in frozen_workload_fields
         if getattr(lw, field) != getattr(rw, field)
     ]
+    mismatches.extend(execution_mismatches)
     mismatches.extend(_target_mismatches(left_eval.target, right_eval.target))
     if left_eval.schema_version != right_eval.schema_version:
         mismatches.append("schema_version")
