@@ -13,7 +13,6 @@ from harness.contracts import (
     PlanArtifact,
     ResearchArtifact,
     ReviewDisposition,
-    ReviewFinding,
     ReviewResult,
     RunPhase,
     RunState,
@@ -179,6 +178,31 @@ def _context(state: RunState | None = None, **overrides):
     )
 
 
+def _report(
+    context,
+    *,
+    review_id: str,
+    reviewer_id: str = "reviewer-clean",
+    inspected_sha: str | None = None,
+    review_context_id: str | None = None,
+    disposition: ReviewDisposition = ReviewDisposition.APPROVE,
+    summary: str = "No blockers",
+    findings=(),
+):
+    runtime = _runtime()
+    return runtime.DevelopmentReviewReport.create(
+        review_id=review_id,
+        reviewer_id=reviewer_id,
+        review_context_id=(
+            context.review_context_id if review_context_id is None else review_context_id
+        ),
+        inspected_sha=context.head_sha if inspected_sha is None else inspected_sha,
+        disposition=disposition,
+        summary=summary,
+        findings=tuple(findings),
+    )
+
+
 def test_clean_context_is_deterministic_roundtrippable_and_reviewable() -> None:
     runtime = _runtime()
     context = _context()
@@ -320,25 +344,17 @@ def test_reviewer_receives_only_clean_context_and_result_is_bound() -> None:
 
     def review(packet):
         seen.append(packet)
-        return ReviewResult(
-            "review-1",
-            "reviewer-clean",
-            packet.review_context_id,
-            packet.head_sha,
-            ReviewDisposition.APPROVE,
-            "No blockers",
-            (),
-        )
+        return _report(packet, review_id="review-1")
 
     binding = runtime.IndependentReviewer(
         reviewer_id="reviewer-clean",
         review=review,
         implementer_id="implementer-runner",
     )
-    result = runtime.run_independent_development_review(context, binding)
+    report = runtime.run_independent_development_review(context, binding)
     assert seen == [context]
-    assert result.review_context_id == context.review_context_id
-    assert result.inspected_sha == HEAD
+    assert report.review_context_id == context.review_context_id
+    assert report.inspected_sha == HEAD
 
 
 def test_reviewer_identity_and_return_binding_fail_closed() -> None:
@@ -352,14 +368,13 @@ def test_reviewer_identity_and_return_binding_fail_closed() -> None:
         )
 
     def wrong(packet):
-        return ReviewResult(
-            "review-2",
-            "other-reviewer",
-            "wrong-context",
-            "f" * 40,
-            ReviewDisposition.APPROVE,
-            "wrong binding",
-            (),
+        return _report(
+            packet,
+            review_id="review-2",
+            reviewer_id="other-reviewer",
+            review_context_id="wrong-context",
+            inspected_sha="f" * 40,
+            summary="wrong binding",
         )
 
     with pytest.raises(ValueError, match="reviewer|context|head"):
@@ -376,50 +391,42 @@ def test_seeded_defect_becomes_blocker_and_request_changes_uses_harn002() -> Non
     )
 
     def deterministic_reviewer(packet):
-        finding = ReviewFinding(
-            "unsafe-shell",
-            FindingSeverity.CRITICAL,
-            "Untrusted input reaches a shell",
-            ("diff:x.py",),
-            True,
+        finding = runtime.DevelopmentReviewFinding(
+            finding_id="unsafe-shell",
+            category=runtime.DevelopmentFindingCategory.INVARIANT_RISK,
+            severity=FindingSeverity.CRITICAL,
+            summary="Untrusted input reaches a shell",
+            evidence_refs=("diff:x.py",),
+            location="x.py:1",
+            blocking=True,
         )
         assert "shell=True" in packet.final_diff
-        return ReviewResult(
-            "review-defect",
-            "reviewer-clean",
-            packet.review_context_id,
-            packet.head_sha,
-            ReviewDisposition.REQUEST_CHANGES,
-            "Synthetic independent review",
-            (finding,),
+        return _report(
+            packet,
+            review_id="review-defect",
+            disposition=ReviewDisposition.REQUEST_CHANGES,
+            summary="Synthetic independent review",
+            findings=(finding,),
         )
 
-    result = runtime.run_independent_development_review(
+    report = runtime.run_independent_development_review(
         context,
         runtime.IndependentReviewer("reviewer-clean", deterministic_reviewer),
     )
-    revised = runtime.apply_development_review(_review_ready_state(), context, result)
-    assert result.findings[0].finding_id == "unsafe-shell"
+    revised = runtime.apply_development_review(_review_ready_state(), context, report)
+    assert report.findings[0].finding_id == "unsafe-shell"
     assert revised.phase is RunPhase.IMPLEMENT
-    assert revised.review == result
+    assert revised.review == report.review
     assert revised.verified_head_sha is None
 
 
 def test_approve_uses_existing_harn002_state_machine() -> None:
     runtime = _runtime()
     context = _context()
-    result = ReviewResult(
-        "review-ok",
-        "reviewer-clean",
-        context.review_context_id,
-        context.head_sha,
-        ReviewDisposition.APPROVE,
-        "Approved",
-        (),
-    )
-    completed = runtime.apply_development_review(_review_ready_state(), context, result)
+    report = _report(context, review_id="review-ok", summary="Approved")
+    completed = runtime.apply_development_review(_review_ready_state(), context, report)
     assert completed.phase is RunPhase.COMPLETE
-    assert completed.review == result
+    assert completed.review == report.review
 
 
 def test_reviewer_core_is_framework_provider_and_scholarly_feedback_free() -> None:
