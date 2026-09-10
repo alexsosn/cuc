@@ -398,7 +398,7 @@ def test_seeded_defect_becomes_blocker_and_request_changes_uses_harn002() -> Non
         context,
         runtime.IndependentReviewer("reviewer-clean", deterministic_reviewer),
     )
-    revised = runtime.apply_development_review(_review_ready_state(), result)
+    revised = runtime.apply_development_review(_review_ready_state(), context, result)
     assert result.findings[0].finding_id == "unsafe-shell"
     assert revised.phase is RunPhase.IMPLEMENT
     assert revised.review == result
@@ -417,7 +417,7 @@ def test_approve_uses_existing_harn002_state_machine() -> None:
         "Approved",
         (),
     )
-    completed = runtime.apply_development_review(_review_ready_state(), result)
+    completed = runtime.apply_development_review(_review_ready_state(), context, result)
     assert completed.phase is RunPhase.COMPLETE
     assert completed.review == result
 
