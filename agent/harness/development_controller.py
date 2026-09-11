@@ -384,6 +384,8 @@ class DevelopmentControllerState:
         )
         if self.stop_code is not None and not isinstance(self.stop_code, ControllerStopCode):
             object.__setattr__(self, "stop_code", ControllerStopCode(self.stop_code))
+        if self.stop_code is ControllerStopCode.COMPLETE and self.core.phase is not RunPhase.COMPLETE:
+            raise ValueError("COMPLETE terminal code requires HARN-002 COMPLETE phase")
         object.__setattr__(self, "stop_reason", _optional_text(self.stop_reason, "stop_reason"))
         object.__setattr__(self, "audit_events", _text_sequence(self.audit_events, "audit_events"))
 
