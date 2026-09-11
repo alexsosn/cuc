@@ -1,9 +1,7 @@
 """Runtime safety boundary for development-controller GitHub operations.
 
 The model/controller receives typed operation intents, never a generic HTTP/GraphQL/CLI
-escape hatch.  This module is deliberately framework- and provider-neutral: a trusted
-adapter performs the actual provider operation only after destination policy, exact
-human approval (when required), and replay checks have succeeded.
+escape hatch. A trusted host owns the human-approval registry and provider adapter.
 """
 
 from __future__ import annotations
@@ -13,11 +11,12 @@ from enum import Enum
 from hashlib import sha256
 import json
 import math
+from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 
 
 JsonScalar = str | int | float | bool | None
-FrozenJson = JsonScalar | tuple["FrozenJson", ...] | tuple[tuple[str, "FrozenJson"], ...]
+FrozenJson = JsonScalar | tuple["FrozenJson", ...] | Mapping[str, "FrozenJson"]
 
 _FORK = ("alexsosn", "cuc")
 _UPSTREAM = ("dt-ucph", "cuc")
@@ -29,11 +28,11 @@ class SideEffectDenied(PermissionError):
 
 
 class ApprovalRequired(PermissionError):
-    """Raised when an operation lacks an exact human approval grant."""
+    """Raised when an operation lacks a trusted exact human approval."""
 
 
 class OperationReplayConflict(RuntimeError):
-    """Raised when an operation ID is reused for a different immutable intent."""
+    """Raised when an operation ID is reused for another immutable intent."""
 
 
 class GitHubDestination(str, Enum):
@@ -96,6 +95,7 @@ def _exact_keys(payload: Mapping[str, Any], expected: set[str], field: str) -> N
 
 
 def _freeze_json(value: object, field: str = "payload") -> FrozenJson:
+    """Copy JSON into immutable values while preserving object/array types."""
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
@@ -103,40 +103,21 @@ def _freeze_json(value: object, field: str = "payload") -> FrozenJson:
             raise ValueError(f"{field} contains a non-finite float")
         return value
     if isinstance(value, Mapping):
-        items: list[tuple[str, FrozenJson]] = []
-        seen: set[str] = set()
-        for key, item in value.items():
-            key = _required_text(key, f"{field} key")
-            if key in seen:
+        frozen: dict[str, FrozenJson] = {}
+        for raw_key, item in value.items():
+            key = _required_text(raw_key, f"{field} key")
+            if key in frozen:
                 raise ValueError(f"{field} contains duplicate key {key!r}")
-            seen.add(key)
-            items.append((key, _freeze_json(item, f"{field}.{key}")))
-        items.sort(key=lambda item: item[0])
-        return tuple(items)
+            frozen[key] = _freeze_json(item, f"{field}.{key}")
+        return MappingProxyType(dict(sorted(frozen.items())))
     if isinstance(value, (list, tuple)):
-        # A tuple of (str, value) pairs is accepted as the immutable mapping form used
-        # by an already-normalized intent and by dict(intent.payload) callers.
-        if isinstance(value, tuple) and all(
-            isinstance(item, tuple)
-            and len(item) == 2
-            and isinstance(item[0], str)
-            for item in value
-        ):
-            return _freeze_json(dict(value), field)
         return tuple(_freeze_json(item, f"{field}[]") for item in value)
     raise ValueError(f"{field} contains non-JSON value {type(value).__name__}")
 
 
-def _is_mapping_form(value: FrozenJson) -> bool:
-    return isinstance(value, tuple) and all(
-        isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
-        for item in value
-    )
-
-
 def _thaw_json(value: FrozenJson) -> object:
-    if _is_mapping_form(value):
-        return {key: _thaw_json(item) for key, item in value}  # type: ignore[misc]
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw_json(item) for item in value]
     return value
@@ -194,7 +175,7 @@ class GitHubOperationIntent:
         if not isinstance(self.target, GitHubTarget):
             raise ValueError("target must be GitHubTarget")
         frozen = _freeze_json(self.payload)
-        if not _is_mapping_form(frozen):
+        if not isinstance(frozen, Mapping):
             raise ValueError("payload must be a JSON mapping")
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "payload", frozen)
@@ -242,25 +223,15 @@ class HumanApprovalGrant:
     issued_at: str
 
     def __post_init__(self) -> None:
-        for field in (
-            "approval_id",
-            "approved_by",
-            "operation_id",
-            "operation_fingerprint",
-            "issued_at",
-        ):
+        for field in ("approval_id", "approved_by", "operation_id", "operation_fingerprint", "issued_at"):
             object.__setattr__(self, field, _required_text(getattr(self, field), field))
-        if len(self.operation_fingerprint) != 64 or any(
-            char not in "0123456789abcdef" for char in self.operation_fingerprint.lower()
-        ):
+        digest = self.operation_fingerprint.lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise ValueError("operation_fingerprint must be a SHA-256 hex digest")
-        object.__setattr__(self, "operation_fingerprint", self.operation_fingerprint.lower())
+        object.__setattr__(self, "operation_fingerprint", digest)
 
     def matches(self, intent: GitHubOperationIntent) -> bool:
-        return (
-            self.operation_id == intent.operation_id
-            and self.operation_fingerprint == intent.fingerprint
-        )
+        return self.operation_id == intent.operation_id and self.operation_fingerprint == intent.fingerprint
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -287,6 +258,68 @@ class HumanApprovalGrant:
             payload["operation_fingerprint"],
             payload["issued_at"],
         )
+
+
+class HumanApprovalRegistry:
+    """Trusted host-owned store of human-issued exact operation approvals.
+
+    Caller-provided approval-shaped values are not authoritative unless the exact grant
+    already exists here. Registration belongs to host/orchestration code outside the
+    model-facing capability.
+    """
+
+    def __init__(self) -> None:
+        self._grants: dict[str, HumanApprovalGrant] = {}
+
+    def register(self, grant: HumanApprovalGrant) -> None:
+        if not isinstance(grant, HumanApprovalGrant):
+            raise ValueError("grant must be HumanApprovalGrant")
+        existing = self._grants.get(grant.approval_id)
+        if existing is not None and existing != grant:
+            raise ValueError(f"approval ID {grant.approval_id!r} cannot be rebound")
+        self._grants[grant.approval_id] = grant
+
+    def resolve(self, approval: HumanApprovalGrant | str | None) -> HumanApprovalGrant | None:
+        if approval is None:
+            return None
+        if isinstance(approval, HumanApprovalGrant):
+            registered = self._grants.get(approval.approval_id)
+            return registered if registered == approval else None
+        if isinstance(approval, str):
+            return self._grants.get(_required_text(approval, "approval_id"))
+        return None
+
+    def get(self, approval_id: str | None) -> HumanApprovalGrant | None:
+        if approval_id is None:
+            return None
+        return self._grants.get(_required_text(approval_id, "approval_id"))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "grants": [self._grants[key].to_dict() for key in sorted(self._grants)],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "HumanApprovalRegistry":
+        if not isinstance(payload, Mapping):
+            raise ValueError("approval registry must be a mapping")
+        _exact_keys(payload, {"schema_version", "grants"}, "approval registry")
+        if payload["schema_version"] != 1:
+            raise ValueError("unsupported approval registry schema_version")
+        raw_grants = payload["grants"]
+        if isinstance(raw_grants, (str, bytes, Mapping)):
+            raise ValueError("approval registry grants must be a list")
+        try:
+            items = tuple(raw_grants)
+        except TypeError as exc:
+            raise ValueError("approval registry grants must be iterable") from exc
+        registry = cls()
+        for raw in items:
+            if not isinstance(raw, Mapping):
+                raise ValueError("approval registry grants must contain mappings")
+            registry.register(HumanApprovalGrant.from_dict(raw))
+        return registry
 
 
 @dataclass(frozen=True)
@@ -316,17 +349,9 @@ class SideEffectResult:
         if self.status not in {"read", "dry-run", "executed", "replayed"}:
             raise ValueError(f"unsupported side-effect result status: {self.status!r}")
         object.__setattr__(self, "result_ref", _optional_text(self.result_ref, "result_ref"))
-        object.__setattr__(
-            self,
-            "intent_fingerprint",
-            _required_text(self.intent_fingerprint, "intent_fingerprint"),
-        )
+        object.__setattr__(self, "intent_fingerprint", _required_text(self.intent_fingerprint, "intent_fingerprint"))
         if not isinstance(self.policy_disposition, PolicyDisposition):
-            object.__setattr__(
-                self,
-                "policy_disposition",
-                PolicyDisposition(self.policy_disposition),
-            )
+            object.__setattr__(self, "policy_disposition", PolicyDisposition(self.policy_disposition))
 
 
 @dataclass(frozen=True)
@@ -364,11 +389,7 @@ class _JournalEntry:
     def from_dict(cls, payload: Mapping[str, Any]) -> "_JournalEntry":
         if not isinstance(payload, Mapping):
             raise ValueError("journal entry must be a mapping")
-        _exact_keys(
-            payload,
-            {"intent", "fingerprint", "status", "approval_id", "result_ref"},
-            "journal entry",
-        )
+        _exact_keys(payload, {"intent", "fingerprint", "status", "approval_id", "result_ref"}, "journal entry")
         intent = GitHubOperationIntent.from_dict(payload["intent"])
         return cls(
             intent=intent,
@@ -402,13 +423,20 @@ class OperationJournal:
 
     def prepare(self, intent: GitHubOperationIntent, approval_id: str | None) -> None:
         entry = self._matching_entry(intent)
+        normalized_approval = _optional_text(approval_id, "approval_id")
         if entry is not None:
+            if (
+                entry.approval_id is not None
+                and normalized_approval is not None
+                and entry.approval_id != normalized_approval
+            ):
+                raise OperationReplayConflict("prepared operation cannot be rebound to another approval")
             return
         self._entries[intent.operation_id] = _JournalEntry(
             intent=intent,
             fingerprint=intent.fingerprint,
             status=JournalStatus.PREPARED,
-            approval_id=approval_id,
+            approval_id=normalized_approval,
         )
 
     def complete(self, intent: GitHubOperationIntent, result_ref: str) -> None:
@@ -418,9 +446,7 @@ class OperationJournal:
         result_ref = _required_text(result_ref, "result_ref")
         if entry.status is JournalStatus.COMPLETED:
             if entry.result_ref != result_ref:
-                raise OperationReplayConflict(
-                    "completed operation cannot be rebound to a different provider result"
-                )
+                raise OperationReplayConflict("completed operation cannot be rebound to a different provider result")
             return
         self._entries[intent.operation_id] = _JournalEntry(
             intent=intent,
@@ -433,9 +459,7 @@ class OperationJournal:
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": 1,
-            "entries": [
-                self._entries[key].to_dict() for key in sorted(self._entries)
-            ],
+            "entries": [self._entries[key].to_dict() for key in sorted(self._entries)],
         }
 
     @classmethod
@@ -463,7 +487,7 @@ class OperationJournal:
 
 
 class GitHubSideEffectAdapter(Protocol):
-    """Trusted adapter surface. No generic request/URL method is part of the contract."""
+    """Trusted adapter surface. No generic request/URL method is exposed."""
 
     def read(self, intent: GitHubOperationIntent) -> str: ...
     def reconcile(self, intent: GitHubOperationIntent) -> str | None: ...
@@ -492,16 +516,22 @@ _WRITE_METHODS: dict[GitHubOperationKind, str] = {
 
 
 class GuardedGitHubSideEffects:
-    """Deny-by-default policy, approval gate, and replay-safe typed dispatch."""
+    """Deny-by-default policy, trusted approval gate, and replay-safe dispatch.
+
+    Construction of this object, its adapter, journal, and approval registry belongs to
+    trusted host/orchestration code. The model-facing API is `evaluate()` / `execute()`.
+    """
 
     def __init__(
         self,
         *,
         adapter: GitHubSideEffectAdapter,
         journal: OperationJournal | None = None,
+        approvals: HumanApprovalRegistry | None = None,
     ) -> None:
         self._adapter = adapter
         self.journal = journal if journal is not None else OperationJournal()
+        self._approvals = approvals if approvals is not None else HumanApprovalRegistry()
 
     @staticmethod
     def classify(target: GitHubTarget) -> GitHubDestination:
@@ -528,23 +558,12 @@ class GuardedGitHubSideEffects:
             )
 
         if kind is GitHubOperationKind.READ:
-            return PolicyDecision(
-                PolicyDisposition.ALLOW,
-                destination,
-                "read is allowed for fork and upstream",
-            )
+            return PolicyDecision(PolicyDisposition.ALLOW, destination, "read is allowed for fork and upstream")
 
         if kind in {GitHubOperationKind.CREATE_BRANCH, GitHubOperationKind.UPDATE_BRANCH}:
             if intent.target.ref is None:
-                return PolicyDecision(
-                    PolicyDisposition.DENY,
-                    destination,
-                    "branch writes require an explicit target ref",
-                )
-            if (
-                destination is GitHubDestination.FORK
-                and intent.target.ref.casefold() in _PROTECTED_FORK_REFS
-            ):
+                return PolicyDecision(PolicyDisposition.DENY, destination, "branch writes require an explicit target ref")
+            if destination is GitHubDestination.FORK and intent.target.ref.casefold() in _PROTECTED_FORK_REFS:
                 return PolicyDecision(
                     PolicyDisposition.DENY,
                     destination,
@@ -578,12 +597,20 @@ class GuardedGitHubSideEffects:
             "operation kind is not exposed by the guarded capability",
         )
 
-    @staticmethod
-    def _approval_valid(
+    def _trusted_approval(
+        self,
         intent: GitHubOperationIntent,
-        approval: HumanApprovalGrant | None,
-    ) -> bool:
-        return isinstance(approval, HumanApprovalGrant) and approval.matches(intent)
+        supplied: HumanApprovalGrant | str | None,
+        entry: _JournalEntry | None,
+    ) -> HumanApprovalGrant | None:
+        grant = self._approvals.resolve(supplied)
+        if grant is not None and grant.matches(intent):
+            return grant
+        if entry is not None:
+            prior = self._approvals.get(entry.approval_id)
+            if prior is not None and prior.matches(intent):
+                return prior
+        return None
 
     def _result(
         self,
@@ -604,29 +631,33 @@ class GuardedGitHubSideEffects:
         self,
         intent: GitHubOperationIntent,
         *,
-        approval: HumanApprovalGrant | None = None,
+        approval: HumanApprovalGrant | str | None = None,
         dry_run: bool = False,
     ) -> SideEffectResult:
         if not isinstance(intent, GitHubOperationIntent):
             raise ValueError("intent must be GitHubOperationIntent")
         policy = self.evaluate(intent)
 
-        # A dry-run is a policy inspection and must not touch provider/journal state.
         if dry_run:
             return self._result(intent, "dry-run", policy)
 
         if policy.disposition is PolicyDisposition.DENY:
             raise SideEffectDenied(policy.reason)
-        if policy.disposition is PolicyDisposition.REQUIRE_APPROVAL and not self._approval_valid(
-            intent, approval
-        ):
-            raise ApprovalRequired(policy.reason)
 
         if intent.kind is GitHubOperationKind.READ:
             result_ref = _required_text(self._adapter.read(intent), "adapter read result")
             return self._result(intent, "read", policy, result_ref)
 
         entry = self.journal.entry(intent)
+
+        if policy.disposition is PolicyDisposition.REQUIRE_APPROVAL:
+            trusted = self._trusted_approval(intent, approval, entry)
+            if trusted is None:
+                raise ApprovalRequired(policy.reason)
+            approval_id = trusted.approval_id
+        else:
+            approval_id = None
+
         if entry is not None and entry.status is JournalStatus.COMPLETED:
             return self._result(intent, "replayed", policy, entry.result_ref)
 
@@ -637,14 +668,10 @@ class GuardedGitHubSideEffects:
                 self.journal.complete(intent, reconciled)
                 return self._result(intent, "replayed", policy, reconciled)
         else:
-            self.journal.prepare(
-                intent,
-                approval_id=approval.approval_id if approval is not None else None,
-            )
+            self.journal.prepare(intent, approval_id=approval_id)
 
         method_name = _WRITE_METHODS.get(intent.kind)
         if method_name is None:
-            # Defensive fail-closed check even though evaluate() already rejects it.
             raise SideEffectDenied("operation kind has no trusted adapter dispatch")
         method = getattr(self._adapter, method_name, None)
         if not callable(method):
