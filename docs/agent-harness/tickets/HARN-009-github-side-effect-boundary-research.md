@@ -32,9 +32,9 @@ HARN-007 deliberately kept HARN-010 framework-neutral and deferred any Deep Agen
 
 ## Threat model
 
-The boundary protects against an agent/controller that is buggy, retries after interruption, supplies malformed or misleading operation metadata, chooses an alternative operation name, or attempts to route a write through a generic GitHub adapter. It also protects against stale approval grants and operation-ID reuse.
+The boundary protects against an agent/controller that is buggy, retries after interruption, supplies malformed or misleading operation metadata, chooses an alternative operation name, fabricates approval-shaped data, or attempts to route a write through a generic GitHub adapter. It also protects against stale approval grants and operation-ID reuse.
 
-The boundary does **not** attempt to make a deliberately malicious trusted transport implementation safe if that transport ignores the validated target and secretly writes elsewhere. Trusted adapter code remains part of the trusted computing base; the model never receives the raw transport.
+The boundary does **not** attempt to make a deliberately malicious trusted transport implementation safe if that transport ignores the validated target and secretly writes elsewhere. Trusted adapter code, the host-owned approval registry, and their persistence are part of the trusted computing base; the model never receives the raw transport or authority to register approvals.
 
 ## Required policy model
 
@@ -75,11 +75,22 @@ Unknown/generic operations are denied, not interpreted heuristically.
 
 ### Approval
 
-Approval must be a typed, auditable artifact bound to the exact operation fingerprint (operation ID + action + target + ref + canonical payload digest). It is not a boolean supplied by the model and not a phrase in a prompt.
+Approval has two distinct parts:
 
-A stale grant, grant for another action/target/payload, or caller-supplied `approved=true` flag must not authorize anything.
+1. a typed, auditable `HumanApprovalGrant` bound to the exact operation fingerprint (operation ID + action + target + ref + canonical payload);
+2. a **trusted host-owned approval registry** that records which exact grants were actually issued through the human orchestration boundary.
 
-Current policy permits autonomous controlled writes only in the fork. Upstream writes remain denied without an exact human grant. Merge into `agent-harness-safety` and explicit workflow triggering should also require an exact human grant because they cross an integration/publication boundary even within the fork.
+A caller-created grant is only approval-shaped data. It has no authority unless the exact grant is already present in the trusted registry. This prevents a model/controller from constructing `approved_by="human"` plus the public operation fingerprint and thereby minting its own authorization.
+
+The model-facing `GuardedGitHubSideEffects` capability can present an approval ID or grant reference to `execute()`, but it has no registration method. Host code constructs and persists the registry separately. On restart, a sensitive prepared operation may reuse its recorded approval ID only if the restored trusted registry still contains an exact matching grant.
+
+A stale grant, grant for another action/target/payload, same-ID altered grant, or caller-supplied `approved=true` payload flag must not authorize anything.
+
+Current policy permits autonomous controlled writes only in the fork. Upstream writes remain denied without an exact trusted human grant. Merge into `agent-harness-safety` and explicit workflow triggering also require an exact trusted grant because they cross an integration/publication boundary even within the fork.
+
+### Canonical payload identity
+
+Approval and replay depend on operation fingerprints, so canonicalization must preserve JSON semantics exactly. In particular, arrays and objects remain distinct even when empty: `[]` and `{}` must never hash or round-trip as the same value. The implementation therefore freezes objects as immutable mappings and arrays as tuples, then thaws them back to their original JSON container types before canonical JSON hashing/serialization.
 
 ### Replay safety
 
@@ -89,7 +100,7 @@ Current policy permits autonomous controlled writes only in the fork. Upstream w
 2. record `prepared` before invoking a write transport;
 3. on retry/resume, reject reuse of the operation ID with a different fingerprint;
 4. if an identical operation is already completed, return the recorded result without a second write;
-5. if an identical operation is only `prepared`, ask the trusted transport to reconcile whether the write already happened before issuing it again;
+5. if an identical operation is only `prepared`, validate its trusted approval if required, then ask the trusted transport to reconcile whether the write already happened before issuing it again;
 6. only then execute and record `completed`.
 
 For issue/PR creation, the concrete transport used by HARN-010 should make reconciliation possible by persisting the operation ID in provider-visible metadata/body or by another deterministic lookup convention. HARN-009 can define the reconciliation protocol without making live GitHub calls.
@@ -98,34 +109,38 @@ This is stronger than an in-memory "seen ID" set and specifically addresses a cr
 
 ### Dry run
 
-Dry-run must return the same policy/approval decision and canonical intended side effect but never invoke the transport or mark a write as completed. It is inspection, not execution.
+Dry-run must return the same policy decision and canonical intended side effect but never invoke transport, reconciliation, or journal completion. It is inspection, not execution and does not itself prove human approval.
 
 ## Adapter boundary
 
 The controller should receive a `GuardedGitHubSideEffects` capability, not a generic REST/GraphQL/CLI executor. The guard dispatches a validated closed operation kind to a trusted adapter. There is deliberately no `request(method, url, body)` escape hatch.
 
-A generic-adapter bypass attempt therefore fails at the intent parser/policy boundary before any transport method is selected.
+A generic-adapter bypass attempt therefore fails at the intent parser/policy boundary before any transport method is selected. The target is taken from the validated `GitHubTarget`, never inferred from URLs or repository names embedded in payload data.
 
 ## TDD implications
 
-Tests must cover at least:
+Tests cover at least:
 
 - fork/upstream/unknown destination classification;
 - allowed fork-local reads and controlled writes;
 - upstream reads;
 - upstream write without approval -> explicit approval-required outcome and zero transport calls;
-- exact upstream approval -> allowed by policy (without using a live upstream transport in CI);
-- approval mismatch by operation ID, target, ref, action, or payload -> denied;
+- fabricated but matching unregistered grant -> rejected;
+- registered exact upstream approval -> allowed by policy without a live upstream transport in CI;
+- approval mismatch by operation ID, target, ref, action, payload, approval identity, or registered grant contents -> denied;
+- approval registry serialization/restart;
 - sensitive fork merge/workflow actions require approval;
 - operation-ID reuse with changed payload -> denied;
+- distinct JSON container types preserve distinct fingerprints and round-trip identity;
 - completed replay -> no duplicate write;
 - prepared/unknown-outcome replay -> reconcile first, then avoid duplicate if found;
+- prepared sensitive replay requires the restored trusted approval registry;
 - prepared replay with no provider-side result -> exactly one retry;
-- dry-run -> zero writes/journal completion;
+- dry-run -> zero transport/reconciliation/journal side effects;
 - unknown/generic adapter action -> denied;
 - serialization/restart of journal preserves replay behavior;
 - static `test_repository_safety.py` remains green.
 
 ## Scope decision
 
-Implement the policy, intent/approval/journal contracts, and trusted-adapter dispatch in HARN-009. Do not yet wire live GitHub credentials or the full HARN-010 loop. That separation keeps the safety boundary testable without network access and makes HARN-010 consume a proven capability rather than reimplement permissions.
+Implement the policy, exact intent/approval/registry/journal contracts, type-preserving canonicalization, and trusted-adapter dispatch in HARN-009. Do not yet wire live GitHub credentials or the full HARN-010 loop. That separation keeps the safety boundary testable without network access and makes HARN-010 consume a proven capability rather than reimplement permissions.
