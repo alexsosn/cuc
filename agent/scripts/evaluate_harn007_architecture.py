@@ -2,9 +2,9 @@
 """Emit deterministic repository evidence for the HARN-007 architecture decision.
 
 This script deliberately does not import or execute Deep Agents. External framework
-properties are dated research inputs with source URLs; CUC properties are recovered
-from the current repository source so the decision cannot silently drift away from
-HARN-004/HARN-006 semantics.
+properties are dated research inputs pinned to an immutable upstream revision; CUC
+properties are recovered from the current repository source so the decision cannot
+silently drift away from HARN-004/HARN-006 semantics.
 """
 
 from __future__ import annotations
@@ -24,10 +24,11 @@ DEVELOPMENT_REVIEWER = AGENT_ROOT / "harness" / "development_reviewer.py"
 PYPROJECT = AGENT_ROOT / "pyproject.toml"
 
 CHECKED_ON = "2026-09-11"
+DEEPAGENTS_REVISION = "54696577caf3dfcefb662db08b4a8034ec6a35cd"
 DEEPAGENTS_SOURCES = (
-    "https://github.com/langchain-ai/deepagents",
-    "https://github.com/langchain-ai/deepagents/blob/main/README.md",
-    "https://github.com/langchain-ai/deepagents/blob/main/libs/ARCHITECTURE.md",
+    f"https://github.com/langchain-ai/deepagents/tree/{DEEPAGENTS_REVISION}",
+    f"https://github.com/langchain-ai/deepagents/blob/{DEEPAGENTS_REVISION}/README.md",
+    f"https://github.com/langchain-ai/deepagents/blob/{DEEPAGENTS_REVISION}/libs/ARCHITECTURE.md",
     "https://docs.langchain.com/oss/python/deepagents/overview",
 )
 
@@ -152,11 +153,11 @@ def _repository_evidence() -> dict[str, Any]:
 
 
 def _external_observations() -> dict[str, Any]:
-    # Dated facts from the primary sources above. Keeping them explicit makes the
-    # non-repository assumptions visible and reviewable rather than inferred from
-    # an unpinned transitive package at report time.
+    # Primary GitHub evidence is pinned above. The docs URL is retained as a dated
+    # convenience reference, not as the sole evidence for any decision invariant.
     return {
         "checked_on": CHECKED_ON,
+        "deepagents_revision": DEEPAGENTS_REVISION,
         "deepagents_runtime": "langgraph",
         "opinionated_agent_loop": True,
         "bundled_subagents": True,
@@ -203,7 +204,7 @@ def _decision(repository: dict[str, Any], external: dict[str, Any]) -> dict[str,
         else "needs-more-research"
     )
     development = (
-        "selective-deepagents-behind-cuc-boundaries"
+        "defer-deepagents-until-harn009"
         if development_fit == "conditional"
         else "undecided"
     )
