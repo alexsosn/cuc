@@ -40,15 +40,16 @@ The missing data are controller-specific rather than domain evidence:
 - maximum implementation attempts;
 - maximum review attempts;
 - counters already consumed;
-- terminal controller stop reason when a bound is exhausted.
+- the last issued-but-not-yet-observed action;
+- the exact `RunState` snapshot against which that action was issued.
 
-These do not belong in `RunState`: they are orchestration policy, not evidence about the development task.
+These do not belong in `RunState`: they are orchestration policy and scheduler state, not evidence about the development task.
 
 ## Design decision
 
 Implement HARN-010 as a **single-step deterministic controller** over `RunState` plus a serializable `ControllerCheckpoint`.
 
-The controller does not run an internal `while` loop. Each call selects exactly one next action or one stop result. The trusted host performs that action, obtains a typed event/evidence object, feeds it through `apply_event`, persists the resulting `RunState` and checkpoint, then calls the controller again.
+The controller does not run an internal `while` loop. Each call selects exactly one next action or one stop result. The trusted host persists the returned checkpoint before performing the action, performs the work, obtains a typed event/evidence object, feeds it through `apply_event`, persists the resulting `RunState`, then calls the controller again.
 
 This provides a hard scheduling boundary: a caller cannot accidentally start an invisible unbounded agent loop inside the controller.
 
@@ -72,21 +73,43 @@ Resume is explicit rather than inferred: the host must first apply `ResumeReques
 
 Three independent positive integer limits are sufficient for this ticket:
 
-1. `max_steps`: global safety cap across decisions that request work;
-2. `max_implementation_attempts`: cap on IMPLEMENT actions;
-3. `max_review_attempts`: cap on REVIEW actions.
+1. `max_steps`: global safety cap across newly issued work actions;
+2. `max_implementation_attempts`: cap on newly issued IMPLEMENT actions;
+3. `max_review_attempts`: cap on newly issued REVIEW actions.
 
-Counters increment when an action is issued, not when the following event succeeds. This prevents repeated crashes/retries from obtaining unlimited work simply because no state transition was persisted afterward.
+Counters increment when a **new** action is issued. Replaying a pending action after restart does not consume another unit of budget.
 
-When a limit is exhausted, the controller returns a terminal `LIMIT_REACHED` decision and does not mutate `RunState`. Widening limits requires an explicit new checkpoint/policy operation outside `step()`.
+When a limit is exhausted, the controller returns the corresponding terminal limit decision and does not mutate `RunState`.
+
+## Crash/restart protocol
+
+A plain counter-only checkpoint is insufficient. Consider:
+
+1. controller returns `IMPLEMENT`, consuming attempt 1;
+2. host persists the checkpoint;
+3. process dies before a new `RunState` is persisted;
+4. restart sees the same IMPLEMENT-phase state.
+
+If the checkpoint only stores counters, the controller cannot distinguish “attempt 1 was issued but completion was not observed” from “schedule attempt 2”. It may duplicate work and incorrectly consume budget.
+
+Therefore the checkpoint stores a **pending action** plus a SHA-256 fingerprint of the exact `RunState.to_dict()` snapshot against which it was issued.
+
+On `step()`:
+
+- if a pending action exists and the current state fingerprint is unchanged, return the same pending action and the same checkpoint; this is a replay, not a new attempt;
+- if the state fingerprint changed, the host has durably observed progress (or an exceptional outcome), so the pending action is cleared before normal scheduling;
+- if the new state is terminal/paused, return the matching stop with the pending action cleared;
+- if the new state is another normal phase, schedule exactly one new action and increment counters once.
+
+This does not make the work itself magically idempotent; provider-level side effects still rely on their own guarded idempotency/reconciliation boundary. It prevents the controller from allocating a new logical attempt merely because the process restarted.
 
 ## Restartability and serialization
 
-`ControllerCheckpoint` must round-trip through a strict versioned JSON-compatible representation. A restored checkpoint plus restored `RunState` produces the same next decision as before process death.
+`ControllerCheckpoint` must round-trip through a strict versioned JSON-compatible representation. A restored checkpoint plus the same restored `RunState` produces the same action/checkpoint without consuming budget again.
 
 The checkpoint contains orchestration facts and is bound to the run ID. Reusing a checkpoint for another run fails closed.
 
-Unknown schema versions, unknown fields, booleans masquerading as integers, negative counters, zero/negative limits, counters greater than limits, and inconsistent terminal data must be rejected.
+Unknown schema versions, unknown fields, booleans masquerading as integers, negative counters, zero/negative limits, counters greater than limits, malformed pending actions, and pending-state fingerprint mismatches/tampering must be rejected.
 
 ## Relationship to effect execution
 
@@ -108,7 +131,7 @@ Retries are already represented by the core reducer:
 - blocked execution → `BLOCKED` with `resume_phase`;
 - reviewer escalation → `AWAITING_HUMAN` with `resume_phase`.
 
-The controller only accounts for how many IMPLEMENT/REVIEW opportunities have been consumed. It must not manufacture events to force a retry.
+The controller accounts for how many IMPLEMENT/REVIEW opportunities have been issued and whether one remains pending. It does not manufacture events to force a retry.
 
 ## Rejected alternatives
 
@@ -119,6 +142,10 @@ Rejected because it duplicates lifecycle state and makes recovery ambiguous when
 ### A controller-owned internal loop
 
 Rejected because bounds become less observable, persistence must happen inside the loop, and interruption can replay work between hidden iterations.
+
+### Counter-only restart state
+
+Rejected because a crash after action issuance but before a new durable `RunState` cannot be distinguished from a legitimate request for the next attempt.
 
 ### Embedding retry counters in `RunState`
 
@@ -138,10 +165,12 @@ Tests should cover:
 
 - deterministic mapping for every normal phase;
 - complete stop;
-- blocked and human-pause stops with no counter consumption;
+- blocked and human-pause stops;
 - global step bound;
 - implementation retry bound after verification failure;
 - review retry bound across request-changes cycles;
+- pending-action replay with no additional counter consumption;
+- changed-state acknowledgement clearing pending work;
 - checkpoint serialization/restart equivalence;
 - run-ID mismatch rejection;
 - invalid/tampered checkpoint rejection;
