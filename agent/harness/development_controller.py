@@ -1,8 +1,9 @@
 """Bounded, framework-neutral research-plan-TDD-review development controller.
 
-HARN-002 remains the authoritative development phase state machine.  This module adds
-controller-specific RED evidence, budgets, persistence, clean-review orchestration, and
-HARN-009 GitHub side-effect dispatch without exposing raw provider transport.
+HARN-002 owns development phase semantics, HARN-006 owns clean independent review,
+and the post-HARN-023 ``github_effects.GitHubEffectGateway`` is the sole GitHub
+mutation authority. This module composes those contracts with durable controller
+state, RED evidence, budgets, pending-effect sequencing, and explicit stop reasons.
 """
 
 from __future__ import annotations
@@ -30,12 +31,15 @@ from .development_reviewer import (
     build_development_review_context,
     run_independent_development_review,
 )
-from .github_side_effects import (
-    ApprovalRequired,
-    GitHubOperationIntent,
-    GuardedGitHubSideEffects,
-    JournalStatus,
-    SideEffectDenied,
+from .github_effects import (
+    AdapterEffectNotExecuted,
+    GitHubAction,
+    GitHubEffectGateway,
+    GitHubEffectJournal,
+    GitHubEffectOutcomeUnknown,
+    GitHubEffectRequest,
+    HumanApproval,
+    HumanApprovalRequired,
 )
 from .state_machine import (
     ChangeRecorded,
@@ -83,7 +87,7 @@ def _text_tuple(values: object, field: str) -> tuple[str, ...]:
 
 
 def _text_sequence(values: object, field: str) -> tuple[str, ...]:
-    """Normalize an ordered text log where repeated events are meaningful."""
+    """Normalize an ordered log where repeated event labels are meaningful."""
     if isinstance(values, (str, bytes)):
         raise ValueError(f"{field} must be an iterable of strings")
     try:
@@ -140,7 +144,9 @@ class DevelopmentControllerPolicy:
             "max_github_writes",
         ):
             object.__setattr__(
-                self, field, _nonnegative_int(getattr(self, field), field)
+                self,
+                field,
+                _nonnegative_int(getattr(self, field), field),
             )
         if self.max_cost_units is not None:
             object.__setattr__(
@@ -171,9 +177,7 @@ class RedGateEvidence:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "intent_id", _required_text(self.intent_id, "intent_id"))
-        object.__setattr__(
-            self, "baseline_sha", _required_text(self.baseline_sha, "baseline_sha")
-        )
+        object.__setattr__(self, "baseline_sha", _required_text(self.baseline_sha, "baseline_sha"))
         try:
             outcome = self.outcome if isinstance(self.outcome, GateOutcome) else GateOutcome(self.outcome)
         except (TypeError, ValueError) as exc:
@@ -208,6 +212,8 @@ class RedGateEvidence:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "RedGateEvidence":
+        if not isinstance(payload, Mapping):
+            raise ValueError("RedGateEvidence payload must be an object")
         return cls(
             payload["intent_id"],
             payload["baseline_sha"],
@@ -224,7 +230,7 @@ class RedGateEvidence:
 class ImplementationResult:
     change: ChangeSet
     head_sha: str
-    github_operations: tuple[GitHubOperationIntent, ...] = ()
+    github_operations: tuple[GitHubEffectRequest, ...] = ()
     cost_units: float = 0.0
     evidence_refs: tuple[str, ...] = ()
 
@@ -233,14 +239,16 @@ class ImplementationResult:
             raise ValueError("change must be ChangeSet")
         object.__setattr__(self, "head_sha", _required_text(self.head_sha, "head_sha"))
         if isinstance(self.github_operations, (str, bytes, Mapping)):
-            raise ValueError("github_operations must be an iterable of GitHubOperationIntent")
+            raise ValueError("github_operations must be an iterable of GitHubEffectRequest")
         operations = tuple(self.github_operations)
-        if any(not isinstance(item, GitHubOperationIntent) for item in operations):
-            raise ValueError("github_operations must contain only GitHubOperationIntent")
+        if any(not isinstance(item, GitHubEffectRequest) for item in operations):
+            raise ValueError("github_operations must contain only GitHubEffectRequest")
+        if any(item.action is GitHubAction.READ for item in operations):
+            raise ValueError("implementation GitHub operations must be write actions")
         operation_ids = tuple(item.operation_id for item in operations)
         if operation_ids != self.change.operation_ids:
             raise ValueError(
-                "change.operation_ids must exactly match ordered GitHub operation intents"
+                "change.operation_ids must exactly match ordered GitHub effect requests"
             )
         object.__setattr__(self, "github_operations", operations)
         object.__setattr__(self, "cost_units", _nonnegative_float(self.cost_units, "cost_units"))
@@ -257,10 +265,15 @@ class ImplementationResult:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ImplementationResult":
+        if not isinstance(payload, Mapping):
+            raise ValueError("ImplementationResult payload must be an object")
         return cls(
             ChangeSet.from_dict(payload["change"]),
             payload["head_sha"],
-            tuple(GitHubOperationIntent.from_dict(item) for item in payload.get("github_operations", ())),
+            tuple(
+                GitHubEffectRequest.from_dict(item)
+                for item in payload.get("github_operations", ())
+            ),
             payload.get("cost_units", 0.0),
             tuple(payload.get("evidence_refs", ())),
         )
@@ -301,7 +314,6 @@ class DevelopmentControllerState:
     red_evidence: tuple[RedGateEvidence, ...] = ()
     pending_implementation: ImplementationResult | None = None
     pending_operation_index: int = 0
-    resume_approval_id: str | None = None
     current_head_sha: str | None = None
     evaluated_change_ids: tuple[str, ...] = ()
     revision_attempts: int = 0
@@ -310,17 +322,21 @@ class DevelopmentControllerState:
     github_writes: int = 0
     cost_units: float = 0.0
     last_implementation_cost_units: float = 0.0
+    github_journal: GitHubEffectJournal = GitHubEffectJournal()
     stop_code: ControllerStopCode | None = None
     stop_reason: str | None = None
     audit_events: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.schema_version != _STATE_SCHEMA:
+        if isinstance(self.schema_version, bool) or self.schema_version != _STATE_SCHEMA:
             raise ValueError(f"schema_version must be {_STATE_SCHEMA}")
         if not isinstance(self.core, RunState):
             raise ValueError("core must be RunState")
+        if not isinstance(self.github_journal, GitHubEffectJournal):
+            raise ValueError("github_journal must be GitHubEffectJournal")
         object.__setattr__(self, "base_sha", _required_text(self.base_sha, "base_sha"))
         object.__setattr__(self, "provenance_refs", _text_tuple(self.provenance_refs, "provenance_refs"))
+
         if isinstance(self.red_evidence, (str, bytes, Mapping)):
             raise ValueError("red_evidence must be an iterable")
         reds = tuple(self.red_evidence)
@@ -330,28 +346,17 @@ class DevelopmentControllerState:
         if len(red_ids) != len(set(red_ids)):
             raise ValueError("RED intent IDs must be unique")
         object.__setattr__(self, "red_evidence", reds)
-        if self.pending_implementation is not None and not isinstance(
-            self.pending_implementation, ImplementationResult
-        ):
+
+        pending = self.pending_implementation
+        if pending is not None and not isinstance(pending, ImplementationResult):
             raise ValueError("pending_implementation must be ImplementationResult")
         index = _nonnegative_int(self.pending_operation_index, "pending_operation_index")
-        if self.pending_implementation is None and index:
+        if pending is None and index:
             raise ValueError("pending_operation_index requires pending implementation")
-        if self.pending_implementation is not None and index > len(
-            self.pending_implementation.github_operations
-        ):
+        if pending is not None and index > len(pending.github_operations):
             raise ValueError("pending_operation_index exceeds pending operation count")
         object.__setattr__(self, "pending_operation_index", index)
-        object.__setattr__(
-            self,
-            "resume_approval_id",
-            _optional_text(self.resume_approval_id, "resume_approval_id"),
-        )
-        object.__setattr__(
-            self,
-            "current_head_sha",
-            _optional_text(self.current_head_sha, "current_head_sha"),
-        )
+        object.__setattr__(self, "current_head_sha", _optional_text(self.current_head_sha, "current_head_sha"))
         object.__setattr__(
             self,
             "evaluated_change_ids",
@@ -413,7 +418,6 @@ class DevelopmentControllerState:
             if self.pending_implementation is None
             else self.pending_implementation.to_dict(),
             "pending_operation_index": self.pending_operation_index,
-            "resume_approval_id": self.resume_approval_id,
             "current_head_sha": self.current_head_sha,
             "evaluated_change_ids": list(self.evaluated_change_ids),
             "revision_attempts": self.revision_attempts,
@@ -422,6 +426,7 @@ class DevelopmentControllerState:
             "github_writes": self.github_writes,
             "cost_units": self.cost_units,
             "last_implementation_cost_units": self.last_implementation_cost_units,
+            "github_journal": self.github_journal.to_dict(),
             "stop_code": None if self.stop_code is None else self.stop_code.value,
             "stop_reason": self.stop_reason,
             "audit_events": list(self.audit_events),
@@ -429,27 +434,37 @@ class DevelopmentControllerState:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "DevelopmentControllerState":
+        if not isinstance(payload, Mapping):
+            raise ValueError("DevelopmentControllerState payload must be an object")
         pending = payload.get("pending_implementation")
         return cls(
-            payload["schema_version"],
-            payload["base_sha"],
-            RunState.from_dict(payload["core"]),
-            tuple(payload.get("provenance_refs", ())),
-            tuple(RedGateEvidence.from_dict(item) for item in payload.get("red_evidence", ())),
-            None if pending is None else ImplementationResult.from_dict(pending),
-            payload.get("pending_operation_index", 0),
-            payload.get("resume_approval_id"),
-            payload.get("current_head_sha"),
-            tuple(payload.get("evaluated_change_ids", ())),
-            payload.get("revision_attempts", 0),
-            payload.get("verification_executions", 0),
-            payload.get("review_attempts", 0),
-            payload.get("github_writes", 0),
-            payload.get("cost_units", 0.0),
-            payload.get("last_implementation_cost_units", 0.0),
-            None if payload.get("stop_code") is None else ControllerStopCode(payload["stop_code"]),
-            payload.get("stop_reason"),
-            tuple(payload.get("audit_events", ())),
+            schema_version=payload["schema_version"],
+            base_sha=payload["base_sha"],
+            core=RunState.from_dict(payload["core"]),
+            provenance_refs=tuple(payload.get("provenance_refs", ())),
+            red_evidence=tuple(
+                RedGateEvidence.from_dict(item) for item in payload.get("red_evidence", ())
+            ),
+            pending_implementation=(
+                None if pending is None else ImplementationResult.from_dict(pending)
+            ),
+            pending_operation_index=payload.get("pending_operation_index", 0),
+            current_head_sha=payload.get("current_head_sha"),
+            evaluated_change_ids=tuple(payload.get("evaluated_change_ids", ())),
+            revision_attempts=payload.get("revision_attempts", 0),
+            verification_executions=payload.get("verification_executions", 0),
+            review_attempts=payload.get("review_attempts", 0),
+            github_writes=payload.get("github_writes", 0),
+            cost_units=payload.get("cost_units", 0.0),
+            last_implementation_cost_units=payload.get("last_implementation_cost_units", 0.0),
+            github_journal=GitHubEffectJournal.from_dict(payload.get("github_journal", {})),
+            stop_code=(
+                None
+                if payload.get("stop_code") is None
+                else ControllerStopCode(payload["stop_code"])
+            ),
+            stop_reason=payload.get("stop_reason"),
+            audit_events=tuple(payload.get("audit_events", ())),
         )
 
 
@@ -462,9 +477,8 @@ class BoundedDevelopmentController:
         policy: DevelopmentControllerPolicy,
         ports: DevelopmentControllerPorts,
         reviewer: IndependentReviewer,
-        side_effects: GuardedGitHubSideEffects,
+        github_gateway: GitHubEffectGateway,
         persist: Callable[[dict[str, object]], None],
-        approval_state_persist: Callable[[dict[str, object]], None] | None,
         policy_refs: tuple[str, ...],
         review_rubric: tuple[str, ...],
         implementer_id: str,
@@ -475,18 +489,15 @@ class BoundedDevelopmentController:
             raise ValueError("ports must be DevelopmentControllerPorts")
         if not isinstance(reviewer, IndependentReviewer):
             raise ValueError("reviewer must be IndependentReviewer")
-        if not isinstance(side_effects, GuardedGitHubSideEffects):
-            raise ValueError("side_effects must be GuardedGitHubSideEffects")
+        if not isinstance(github_gateway, GitHubEffectGateway):
+            raise ValueError("github_gateway must be the canonical GitHubEffectGateway")
         if not callable(persist):
             raise ValueError("controller persist must be callable")
-        if approval_state_persist is not None and not callable(approval_state_persist):
-            raise ValueError("approval_state_persist must be callable or None")
         self.policy = policy
         self.ports = ports
         self.reviewer = reviewer
-        self.side_effects = side_effects
+        self.github_gateway = github_gateway
         self._persist_callback = persist
-        self._approval_state_persist = approval_state_persist
         self.policy_refs = _text_tuple(policy_refs, "policy_refs")
         self.review_rubric = _text_tuple(review_rubric, "review_rubric")
         if not self.policy_refs or not self.review_rubric:
@@ -495,28 +506,9 @@ class BoundedDevelopmentController:
         if reviewer.implementer_id is not None and reviewer.implementer_id != self.implementer_id:
             raise ValueError("reviewer implementer identity does not match controller")
 
-        if policy.production_mode:
-            journal_persist = getattr(side_effects.journal, "_persist", None)
-            if not callable(journal_persist):
-                raise ValueError(
-                    "production controller requires durable GitHub operation journal persistence"
-                )
-            if not callable(approval_state_persist):
-                raise ValueError(
-                    "production controller requires durable approval-state persistence"
-                )
-
     def _persist(self, state: DevelopmentControllerState) -> DevelopmentControllerState:
         self._persist_callback(state.to_dict())
         return state
-
-    def _persist_approval_registry(self) -> None:
-        if self._approval_state_persist is None:
-            return
-        registry = getattr(self.side_effects, "_approvals", None)
-        if registry is None or not hasattr(registry, "to_dict"):
-            raise RuntimeError("trusted approval registry is unavailable")
-        self._approval_state_persist(registry.to_dict())
 
     @staticmethod
     def _audit(state: DevelopmentControllerState, event: str) -> tuple[str, ...]:
@@ -536,11 +528,9 @@ class BoundedDevelopmentController:
             _STATE_SCHEMA,
             _required_text(base_sha, "base_sha"),
             RunState(_required_text(run_id, "run_id"), task),
-            _text_tuple(provenance_refs, "provenance_refs"),
+            provenance_refs=_text_tuple(provenance_refs, "provenance_refs"),
             audit_events=("controller-started",),
         )
-        if self.policy.production_mode:
-            self._persist_approval_registry()
         return self._persist(state)
 
     def _pause(
@@ -628,8 +618,7 @@ class BoundedDevelopmentController:
         limit = self.policy.max_cost_units
         if limit is None:
             return False
-        reserve = state.last_implementation_cost_units
-        return state.cost_units + reserve > limit
+        return state.cost_units + state.last_implementation_cost_units > limit
 
     def _begin_implementation(self, state: DevelopmentControllerState) -> DevelopmentControllerState:
         if state.revision_attempts >= self.policy.max_revision_attempts:
@@ -651,6 +640,7 @@ class BoundedDevelopmentController:
             return self._block(state, ControllerStopCode.BLOCKED_EXECUTION, str(exc))
         if not isinstance(result, ImplementationResult):
             raise ValueError("implementation port must return ImplementationResult")
+
         limit = self.policy.max_cost_units
         new_cost = state.cost_units + result.cost_units
         if limit is not None and new_cost > limit:
@@ -677,81 +667,139 @@ class BoundedDevelopmentController:
             )
         )
 
+    @staticmethod
+    def _pending_identity_conflict(
+        state: DevelopmentControllerState,
+        pending: ImplementationResult,
+    ) -> str | None:
+        prior_change_ids = {item.change_id for item in state.core.changes}
+        if pending.change.change_id in prior_change_ids:
+            return f"change ID reuse is forbidden: {pending.change.change_id}"
+        prior_operation_ids = {
+            operation_id
+            for change in state.core.changes
+            for operation_id in change.operation_ids
+        }
+        reused = sorted(prior_operation_ids.intersection(pending.change.operation_ids))
+        if reused:
+            return "operation ID reuse is forbidden: " + ", ".join(reused)
+        return None
+
+    def _journal_checkpoint(
+        self,
+        state: DevelopmentControllerState,
+        journal: GitHubEffectJournal,
+    ) -> None:
+        if not isinstance(journal, GitHubEffectJournal):
+            raise ValueError("gateway checkpoint must provide GitHubEffectJournal")
+        checkpoint_state = replace(state, github_journal=journal)
+        self._persist_callback(checkpoint_state.to_dict())
+
     def _dispatch_pending_effect(
         self,
         state: DevelopmentControllerState,
     ) -> DevelopmentControllerState:
         pending = state.pending_implementation
         assert pending is not None
+
+        conflict = self._pending_identity_conflict(state, pending)
+        if conflict is not None:
+            return self._block(state, ControllerStopCode.POLICY_BLOCK, conflict)
+
         index = state.pending_operation_index
         if index >= len(pending.github_operations):
-            core = apply_event(state.core, ChangeRecorded(pending.change))
+            try:
+                core = apply_event(state.core, ChangeRecorded(pending.change))
+            except ValueError as exc:
+                return self._block(
+                    state,
+                    ControllerStopCode.POLICY_BLOCK,
+                    f"change recording rejected pending implementation: {exc}",
+                )
             return self._persist(
                 replace(
                     state,
                     core=core,
                     pending_implementation=None,
                     pending_operation_index=0,
-                    resume_approval_id=None,
                     audit_events=self._audit(state, f"change:{pending.change.change_id}"),
                 )
             )
 
-        intent = pending.github_operations[index]
-        journal_entry = self.side_effects.journal.entry(intent)
-        may_write = journal_entry is None or journal_entry.status is not JournalStatus.COMPLETED
-        if may_write and state.github_writes >= self.policy.max_github_writes:
+        request = pending.github_operations[index]
+        if state.github_writes >= self.policy.max_github_writes:
             return self._block(
                 state,
                 ControllerStopCode.GITHUB_WRITE_BUDGET_EXHAUSTED,
-                "GitHub write budget exhausted before provider dispatch",
+                "GitHub write budget exhausted before gateway dispatch",
             )
 
         try:
-            if self.policy.production_mode:
-                self._persist_approval_registry()
-            result = self.side_effects.execute(
-                intent,
-                approval=state.resume_approval_id,
+            journal, _receipt = self.github_gateway.execute_write(
+                request,
+                state.github_journal,
+                checkpoint=lambda updated: self._journal_checkpoint(state, updated),
             )
-        except ApprovalRequired as exc:
+        except HumanApprovalRequired as exc:
             return self._pause(
                 state,
                 RunPhase.AWAITING_HUMAN,
                 ControllerStopCode.NEEDS_HUMAN,
-                f"human approval required for operation {intent.operation_id}: {exc}",
+                f"human approval required for operation {request.operation_id}: {exc}",
             )
-        except SideEffectDenied as exc:
+        except GitHubEffectOutcomeUnknown as exc:
+            uncertain_state = replace(state, github_journal=exc.journal)
+            return self._block(
+                uncertain_state,
+                ControllerStopCode.BLOCKED_EXECUTION,
+                f"GitHub operation {request.operation_id} has uncertain external outcome; trusted reconciliation is required",
+            )
+        except PermissionError as exc:
             return self._block(
                 state,
                 ControllerStopCode.POLICY_BLOCK,
-                f"GitHub operation {intent.operation_id} denied: {exc}",
+                f"GitHub operation {request.operation_id} denied: {exc}",
+            )
+        except AdapterEffectNotExecuted as exc:
+            return self._block(
+                state,
+                ControllerStopCode.BLOCKED_EXECUTION,
+                f"GitHub operation {request.operation_id} was not executed: {exc}",
+            )
+        except ValueError as exc:
+            return self._block(
+                state,
+                ControllerStopCode.POLICY_BLOCK,
+                f"GitHub operation {request.operation_id} violated effect invariants: {exc}",
             )
         except RuntimeError as exc:
             return self._block(
                 state,
                 ControllerStopCode.BLOCKED_EXECUTION,
-                f"GitHub operation {intent.operation_id} blocked: {exc}",
+                f"GitHub operation {request.operation_id} blocked: {exc}",
             )
 
-        writes = state.github_writes + (1 if result.status == "executed" else 0)
+        # A still-pending request consumes exactly one run write slot when the
+        # controller consumes it, whether the gateway executed it now or replayed a
+        # receipt durably checkpointed before a previous controller crash.
         return self._persist(
             replace(
                 state,
+                github_journal=journal,
                 pending_operation_index=index + 1,
-                resume_approval_id=None,
-                github_writes=writes,
-                audit_events=self._audit(
-                    state,
-                    f"github:{intent.operation_id}:{result.status}",
-                ),
+                github_writes=state.github_writes + 1,
+                audit_events=self._audit(state, f"github:{request.operation_id}:completed"),
             )
         )
 
     def _verify(self, state: DevelopmentControllerState) -> DevelopmentControllerState:
         core = state.core
         if not core.changes or state.current_head_sha is None:
-            raise ValueError("VERIFY requires current change and head SHA")
+            return self._block(
+                state,
+                ControllerStopCode.POLICY_BLOCK,
+                "VERIFY requires a current recorded change and exact head SHA",
+            )
         change = core.changes[-1]
         current = {
             result.intent_id: result
@@ -774,19 +822,39 @@ class BoundedDevelopmentController:
             except RuntimeError as exc:
                 return self._block(state, ControllerStopCode.BLOCKED_EXECUTION, str(exc))
             if not isinstance(result, TestResult):
-                raise ValueError("test port must return TestResult")
+                return self._block(
+                    state,
+                    ControllerStopCode.POLICY_BLOCK,
+                    "test port did not return TestResult",
+                )
             if result.intent_id != missing.intent_id or result.change_id != change.change_id:
-                raise ValueError("test result is bound to the wrong intent/change")
+                return self._block(
+                    state,
+                    ControllerStopCode.POLICY_BLOCK,
+                    "test result is bound to the wrong intent/change",
+                )
             if result.head_sha != state.current_head_sha or result.executed_sha != state.current_head_sha:
-                raise ValueError("test result head/executed revision does not match proposed head")
-            next_core = apply_event(core, TestRecorded(result))
+                return self._block(
+                    state,
+                    ControllerStopCode.POLICY_BLOCK,
+                    "test result head/executed revision does not match current proposed SHA",
+                )
+            try:
+                next_core = apply_event(core, TestRecorded(result))
+            except ValueError as exc:
+                return self._block(
+                    state,
+                    ControllerStopCode.POLICY_BLOCK,
+                    f"test evidence rejected by development state machine: {exc}",
+                )
             return self._persist(
                 replace(
                     state,
                     core=next_core,
                     verification_executions=state.verification_executions + 1,
                     audit_events=self._audit(
-                        state, f"verify:{missing.intent_id}:{result.outcome.value}"
+                        state,
+                        f"verify:{missing.intent_id}:{result.outcome.value}",
                     ),
                 )
             )
@@ -805,12 +873,31 @@ class BoundedDevelopmentController:
             next_core = core
             for result in evals:
                 if not isinstance(result, EvalResult):
-                    raise ValueError("eval port must return EvalResult values")
+                    return self._block(
+                        state,
+                        ControllerStopCode.POLICY_BLOCK,
+                        "eval port returned a non-EvalResult value",
+                    )
                 if result.change_id != change.change_id:
-                    raise ValueError("evaluation result is bound to the wrong change")
+                    return self._block(
+                        state,
+                        ControllerStopCode.POLICY_BLOCK,
+                        "evaluation result is bound to the wrong change",
+                    )
                 if result.head_sha != state.current_head_sha or result.executed_sha != state.current_head_sha:
-                    raise ValueError("evaluation head/executed revision does not match proposed head")
-                next_core = apply_event(next_core, EvalRecorded(result))
+                    return self._block(
+                        state,
+                        ControllerStopCode.POLICY_BLOCK,
+                        "evaluation head/executed revision does not match current proposed SHA",
+                    )
+                try:
+                    next_core = apply_event(next_core, EvalRecorded(result))
+                except ValueError as exc:
+                    return self._block(
+                        state,
+                        ControllerStopCode.POLICY_BLOCK,
+                        f"evaluation evidence rejected by development state machine: {exc}",
+                    )
                 if next_core.phase is not RunPhase.VERIFY:
                     break
             return self._persist(
@@ -823,7 +910,14 @@ class BoundedDevelopmentController:
                 )
             )
 
-        next_core = apply_event(core, VerificationPassed())
+        try:
+            next_core = apply_event(core, VerificationPassed())
+        except ValueError as exc:
+            return self._block(
+                state,
+                ControllerStopCode.POLICY_BLOCK,
+                f"verification evidence rejected: {exc}",
+            )
         return self._persist(
             replace(
                 state,
@@ -840,7 +934,11 @@ class BoundedDevelopmentController:
                 "independent review budget exhausted before reviewer call",
             )
         if state.current_head_sha is None:
-            raise ValueError("REVIEW requires current head SHA")
+            return self._block(
+                state,
+                ControllerStopCode.POLICY_BLOCK,
+                "REVIEW requires current head SHA",
+            )
         try:
             final_diff = self.ports.final_diff(state.base_sha, state.current_head_sha)
             context = build_development_review_context(
@@ -852,15 +950,23 @@ class BoundedDevelopmentController:
                 rubric=self.review_rubric,
             )
             report = run_independent_development_review(context, self.reviewer)
+            next_core = apply_event(state.core, ReviewRecorded(report.review))
         except RuntimeError as exc:
             return self._block(state, ControllerStopCode.BLOCKED_EXECUTION, str(exc))
-        next_core = apply_event(state.core, ReviewRecorded(report.review))
+        except ValueError as exc:
+            return self._block(
+                state,
+                ControllerStopCode.POLICY_BLOCK,
+                f"independent review evidence rejected: {exc}",
+            )
+
         updated = replace(
             state,
             core=next_core,
             review_attempts=state.review_attempts + 1,
             audit_events=self._audit(
-                state, f"review:{report.disposition.value}:{state.current_head_sha}"
+                state,
+                f"review:{report.disposition.value}:{state.current_head_sha}",
             ),
         )
         if next_core.phase is RunPhase.COMPLETE:
@@ -940,7 +1046,7 @@ class BoundedDevelopmentController:
         self,
         state: DevelopmentControllerState,
         *,
-        approval_id: str | None = None,
+        approval: HumanApproval | None = None,
     ) -> DevelopmentControllerState:
         if not isinstance(state, DevelopmentControllerState):
             raise ValueError("state must be DevelopmentControllerState")
@@ -948,14 +1054,29 @@ class BoundedDevelopmentController:
             raise ValueError("resume requires BLOCKED or AWAITING_HUMAN state")
         if state.core.phase is RunPhase.BLOCKED:
             raise ValueError("budget/policy/blocked-execution state is not autonomously resumable")
-        if self.policy.production_mode:
-            self._persist_approval_registry()
+
+        journal = state.github_journal
+        if approval is not None:
+            if not isinstance(approval, HumanApproval):
+                raise ValueError("approval must be HumanApproval or None")
+            operation_id = state.pending_operation_id
+            if operation_id is None:
+                raise ValueError("GitHub approval supplied without a pending GitHub operation")
+            pending = state.pending_implementation
+            assert pending is not None
+            request = pending.github_operations[state.pending_operation_index]
+            if approval.operation_id != request.operation_id:
+                raise ValueError("approval operation does not match pending GitHub request")
+            if approval.request_sha256 != request.request_sha256:
+                raise ValueError("approval digest does not match pending GitHub request")
+            journal = journal.with_approval(approval)
+
         core = apply_event(state.core, ResumeRequested())
         return self._persist(
             replace(
                 state,
                 core=core,
-                resume_approval_id=_optional_text(approval_id, "approval_id"),
+                github_journal=journal,
                 stop_code=None,
                 stop_reason=None,
                 audit_events=self._audit(state, "human-resume"),
@@ -971,8 +1092,6 @@ class BoundedDevelopmentController:
         if not isinstance(state, DevelopmentControllerState):
             raise ValueError("state must be DevelopmentControllerState")
         if max_steps is None:
-            # Finite by construction.  The ceiling intentionally over-approximates one
-            # full bounded run including RED, side effects, verification and reviews.
             max_steps = (
                 12
                 + max(1, self.policy.max_revision_attempts)
