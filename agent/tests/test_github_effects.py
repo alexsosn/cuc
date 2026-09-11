@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import importlib
 import json
+from pathlib import Path
 
 import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _runtime():
@@ -27,12 +31,34 @@ class FakeAdapter:
         return f"fake:{request.action.value}:{len(self.calls)}"
 
 
+class SimulatedProcessCrash(BaseException):
+    pass
+
+
+class CrashAfterPossibleEffectAdapter:
+    def __init__(self, trace) -> None:
+        self.calls = []
+        self.trace = trace
+
+    def execute(self, request):
+        self.calls.append(request)
+        self.trace.append("adapter")
+        raise SimulatedProcessCrash("process died after the external call began")
+
+
 def _policy(*actions, operation_ids=()):
     runtime = _runtime()
     return runtime.GitHubTaskPolicy(
         allowed_fork_write_actions=actions,
         allowed_operation_ids=operation_ids,
     )
+
+
+def _execute(gateway, request, journal, checkpoints=None):
+    if checkpoints is None:
+        checkpoints = []
+    result = gateway.execute_write(request, journal, checkpoint=checkpoints.append)
+    return result, checkpoints
 
 
 def test_repository_classification_is_exact_and_urls_do_not_bypass_it():
@@ -77,8 +103,12 @@ def test_fork_write_requires_task_policy_and_creates_attributable_receipt():
         runtime.GitHubAction.CREATE_ISSUE,
         {"title": "research finding"},
     )
-    journal, receipt = gateway.execute_write(request, runtime.GitHubEffectJournal())
+    (journal, receipt), checkpoints = _execute(
+        gateway, request, runtime.GitHubEffectJournal()
+    )
     assert len(adapter.calls) == 1
+    assert checkpoints[0].uncertain_operations == (request.operation_id,)
+    assert journal.uncertain_operations == ()
     assert receipt.operation_id == request.operation_id
     assert receipt.request_sha256 == request.request_sha256
     assert receipt.repository == "alexsosn/cuc"
@@ -92,7 +122,7 @@ def test_fork_write_requires_task_policy_and_creates_attributable_receipt():
         {"head": "x", "base": "agent-harness-safety"},
     )
     with pytest.raises(PermissionError, match="policy|allow"):
-        gateway.execute_write(denied, journal)
+        _execute(gateway, denied, journal)
     assert len(adapter.calls) == 1
 
 
@@ -110,7 +140,7 @@ def test_write_operation_must_be_declared_by_task_policy_before_any_adapter_or_a
         {"title": "not attributable"},
     )
     with pytest.raises(PermissionError, match="operation|declared|policy"):
-        gateway.execute_write(undeclared_fork, runtime.GitHubEffectJournal())
+        _execute(gateway, undeclared_fork, runtime.GitHubEffectJournal())
 
     undeclared_upstream = runtime.GitHubEffectRequest(
         "invented-upstream-op",
@@ -119,7 +149,7 @@ def test_write_operation_must_be_declared_by_task_policy_before_any_adapter_or_a
         {"title": "must not even request approval"},
     )
     with pytest.raises(PermissionError, match="operation|declared|policy"):
-        gateway.execute_write(undeclared_upstream, runtime.GitHubEffectJournal())
+        _execute(gateway, undeclared_upstream, runtime.GitHubEffectJournal())
     assert adapter.calls == []
 
 
@@ -136,10 +166,12 @@ def test_upstream_write_interrupts_before_adapter_and_exact_approval_unlocks_fak
         {"title": "release-only action"},
     )
     journal = runtime.GitHubEffectJournal()
+    checkpoints = []
     with pytest.raises(runtime.HumanApprovalRequired) as captured:
-        gateway.execute_write(request, journal)
+        gateway.execute_write(request, journal, checkpoint=checkpoints.append)
     challenge = captured.value.challenge
     assert adapter.calls == []
+    assert checkpoints == []
     assert challenge.operation_id == request.operation_id
     assert challenge.request_sha256 == request.request_sha256
     assert challenge.repository == "DT-UCPH/cuc"
@@ -152,9 +184,11 @@ def test_upstream_write_interrupts_before_adapter_and_exact_approval_unlocks_fak
         challenge.request_sha256,
     )
     approved = journal.with_approval(approval)
-    approved, receipt = gateway.execute_write(request, approved)
+    (approved, receipt), checkpoints = _execute(gateway, request, approved)
     assert len(adapter.calls) == 1
+    assert checkpoints[0].uncertain_operations == (request.operation_id,)
     assert approved.receipts == (receipt,)
+    assert approved.uncertain_operations == ()
 
 
 def test_upstream_approval_cannot_be_substituted_for_another_request():
@@ -177,7 +211,7 @@ def test_upstream_approval_cannot_be_substituted_for_another_request():
     )
     journal = runtime.GitHubEffectJournal().with_approval(wrong)
     with pytest.raises(PermissionError, match="approval|digest|request"):
-        gateway.execute_write(request, journal)
+        _execute(gateway, request, journal)
     assert adapter.calls == []
 
 
@@ -197,12 +231,13 @@ def test_successful_effect_replays_from_serialized_receipt_without_duplicate_ada
         runtime.GitHubAction.UPDATE_CONTENTS,
         {"path": "docs/example.md", "content_sha256": "a" * 64},
     )
-    journal, receipt = gateway.execute_write(request, runtime.GitHubEffectJournal())
+    (journal, receipt), _ = _execute(gateway, request, runtime.GitHubEffectJournal())
     restored = runtime.GitHubEffectJournal.from_dict(
         json.loads(json.dumps(journal.to_dict(), sort_keys=True))
     )
-    restored, replayed = gateway.execute_write(request, restored)
+    (restored, replayed), checkpoints = _execute(gateway, request, restored)
     assert replayed == receipt
+    assert checkpoints == []
     assert len(adapter.calls) == 1
 
     mutated = runtime.GitHubEffectRequest(
@@ -212,7 +247,7 @@ def test_successful_effect_replays_from_serialized_receipt_without_duplicate_ada
         {"path": "docs/other.md", "content_sha256": "b" * 64},
     )
     with pytest.raises(ValueError, match="operation|digest|reuse"):
-        gateway.execute_write(mutated, restored)
+        _execute(gateway, mutated, restored)
     assert len(adapter.calls) == 1
 
 
@@ -236,13 +271,15 @@ def test_upstream_approval_survives_resume_and_proven_no_effect_failure_can_retr
     )
     journal = runtime.GitHubEffectJournal().with_approval(approval)
     restored = runtime.GitHubEffectJournal.from_dict(journal.to_dict())
+    checkpoints = []
 
     with pytest.raises(runtime.AdapterEffectNotExecuted, match="preflight failed"):
-        gateway.execute_write(request, restored)
-    assert restored.receipts == ()
-    assert restored.uncertain_operations == ()
+        gateway.execute_write(request, restored, checkpoint=checkpoints.append)
+    assert checkpoints[0].uncertain_operations == (request.operation_id,)
+    assert checkpoints[-1].uncertain_operations == ()
+    safe_to_retry = checkpoints[-1]
 
-    resumed, receipt = gateway.execute_write(request, restored)
+    (resumed, receipt), _ = _execute(gateway, request, safe_to_retry)
     assert len(adapter.calls) == 2
     assert resumed.receipts == (receipt,)
 
@@ -263,17 +300,96 @@ def test_ambiguous_adapter_failure_blocks_automatic_retry_after_possible_externa
         runtime.GitHubAction.CREATE_ISSUE,
         {"title": "could already exist"},
     )
+    checkpoints = []
     with pytest.raises(runtime.GitHubEffectOutcomeUnknown) as captured:
-        gateway.execute_write(request, runtime.GitHubEffectJournal())
+        gateway.execute_write(
+            request,
+            runtime.GitHubEffectJournal(),
+            checkpoint=checkpoints.append,
+        )
     uncertain = captured.value.journal
+    assert checkpoints == [uncertain]
     assert uncertain.uncertain_operations == (request.operation_id,)
     assert uncertain.receipts == ()
     assert len(adapter.calls) == 1
 
     restored = runtime.GitHubEffectJournal.from_dict(uncertain.to_dict())
+    retry_checkpoints = []
     with pytest.raises(runtime.GitHubEffectOutcomeUnknown, match="reconcile|uncertain|unknown"):
-        gateway.execute_write(request, restored)
+        gateway.execute_write(request, restored, checkpoint=retry_checkpoints.append)
+    assert retry_checkpoints == []
     assert len(adapter.calls) == 1
+
+
+def test_pre_dispatch_checkpoint_is_durable_before_adapter_and_process_kill_cannot_duplicate():
+    runtime = _runtime()
+    trace = []
+    persisted = []
+    adapter = CrashAfterPossibleEffectAdapter(trace)
+    gateway = runtime.GitHubEffectGateway(
+        _policy(
+            runtime.GitHubAction.CREATE_ISSUE,
+            operation_ids=("op-crash-window",),
+        ),
+        adapter,
+    )
+    request = runtime.GitHubEffectRequest(
+        "op-crash-window",
+        "alexsosn/cuc",
+        runtime.GitHubAction.CREATE_ISSUE,
+        {"title": "external call may complete before process death"},
+    )
+
+    def checkpoint(journal):
+        trace.append("checkpoint")
+        persisted.append(runtime.GitHubEffectJournal.from_dict(journal.to_dict()))
+
+    with pytest.raises(SimulatedProcessCrash):
+        gateway.execute_write(
+            request,
+            runtime.GitHubEffectJournal(),
+            checkpoint=checkpoint,
+        )
+    assert trace == ["checkpoint", "adapter"]
+    assert persisted[-1].uncertain_operations == (request.operation_id,)
+    assert len(adapter.calls) == 1
+
+    with pytest.raises(runtime.GitHubEffectOutcomeUnknown, match="reconcile|uncertain|unknown"):
+        gateway.execute_write(request, persisted[-1], checkpoint=checkpoint)
+    assert len(adapter.calls) == 1
+    assert trace == ["checkpoint", "adapter"]
+
+
+def test_write_path_cannot_omit_checkpoint_and_checkpoint_failure_prevents_adapter_call():
+    runtime = _runtime()
+    adapter = FakeAdapter()
+    gateway = runtime.GitHubEffectGateway(
+        _policy(
+            runtime.GitHubAction.CREATE_ISSUE,
+            operation_ids=("op-needs-checkpoint",),
+        ),
+        adapter,
+    )
+    request = runtime.GitHubEffectRequest(
+        "op-needs-checkpoint",
+        "alexsosn/cuc",
+        runtime.GitHubAction.CREATE_ISSUE,
+        {"title": "checkpoint first"},
+    )
+    with pytest.raises(TypeError):
+        gateway.execute_write(request, runtime.GitHubEffectJournal())
+    assert adapter.calls == []
+
+    def broken_checkpoint(_journal):
+        raise RuntimeError("durable store unavailable")
+
+    with pytest.raises(RuntimeError, match="durable store unavailable"):
+        gateway.execute_write(
+            request,
+            runtime.GitHubEffectJournal(),
+            checkpoint=broken_checkpoint,
+        )
+    assert adapter.calls == []
 
 
 def test_generic_raw_actions_and_unknown_repository_writes_fail_closed():
@@ -298,8 +414,16 @@ def test_generic_raw_actions_and_unknown_repository_writes_fail_closed():
         {"title": "must not execute"},
     )
     with pytest.raises(PermissionError, match="unknown|repository"):
-        gateway.execute_write(unknown, runtime.GitHubEffectJournal())
+        _execute(gateway, unknown, runtime.GitHubEffectJournal())
     assert adapter.calls == []
+
+
+def test_repository_safety_static_guard_covers_development_harness_transport_bypass():
+    text = (REPO_ROOT / "agent" / "tests" / "test_repository_safety.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'REPO_ROOT / "agent" / "harness"' in text
+    assert "DIRECT_GITHUB_TRANSPORT_MARKERS" in text
 
 
 def test_journal_rejects_malformed_collections_duplicates_and_invalid_receipts():
