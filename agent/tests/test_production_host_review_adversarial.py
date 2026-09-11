@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from harness.contracts import (
@@ -13,6 +15,7 @@ from harness.contracts import (
     TestKind as ContractTestKind,
 )
 from harness.development_controller import (
+    ControllerStopCode,
     DevelopmentControllerPolicy,
     DevelopmentControllerPorts,
     DevelopmentControllerState,
@@ -140,6 +143,27 @@ def _pending_implement_state(request: GitHubEffectRequest) -> DevelopmentControl
     )
 
 
+def _awaiting_human_state(
+    request: GitHubEffectRequest,
+    *,
+    journal: GitHubEffectJournal | None = None,
+) -> DevelopmentControllerState:
+    state = _pending_implement_state(request)
+    reason = "human approval required"
+    return replace(
+        state,
+        core=replace(
+            state.core,
+            phase=RunPhase.AWAITING_HUMAN,
+            resume_phase=RunPhase.IMPLEMENT,
+            pause_reason=reason,
+        ),
+        github_journal=journal or GitHubEffectJournal(),
+        stop_code=ControllerStopCode.NEEDS_HUMAN,
+        stop_reason=reason,
+    )
+
+
 def _github_policy(request: GitHubEffectRequest) -> GitHubTaskPolicy:
     return GitHubTaskPolicy(
         allowed_fork_write_operations=(
@@ -189,6 +213,40 @@ def test_invalid_resume_does_not_persist_or_register_approval_authority(tmp_path
     assert durable.trusted_approvals == ()
     assert durable.controller_state is not None
     assert durable.controller_state.github_journal.approval_for(request.operation_id) is None
+
+
+def test_conflicting_journal_approval_is_rejected_before_new_authority_is_persisted(
+    tmp_path,
+) -> None:
+    request = _request()
+    untrusted = HumanApproval(
+        "forged-journal-approval",
+        "not-trusted",
+        request.operation_id,
+        request.request_sha256,
+    )
+    genuine = HumanApproval(
+        "genuine-human-approval",
+        "human",
+        request.operation_id,
+        request.request_sha256,
+    )
+    state = _awaiting_human_state(
+        request,
+        journal=GitHubEffectJournal().with_approval(untrusted),
+    )
+    store = AtomicHostStateStore(tmp_path / "host.json")
+    store.save(ProductionHostEnvelope(1, state, ()))
+    host = _host(store, request)
+
+    with pytest.raises(ValueError, match="approval|conflict|different"):
+        host.resume(approval=genuine)
+
+    durable = store.load()
+    assert durable is not None
+    assert durable.trusted_approvals == ()
+    assert durable.controller_state is not None
+    assert durable.controller_state.github_journal.approval_for(request.operation_id) == untrusted
 
 
 def test_production_host_requires_a_trusted_reconciler(tmp_path) -> None:
