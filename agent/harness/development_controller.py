@@ -108,12 +108,15 @@ def _digest(value: object, field: str) -> str:
 
 
 def _state_sha256(state: RunState) -> str:
+    # RunState currently permits non-finite numeric eval metrics. Python's canonical
+    # JSON spellings for those values (NaN/Infinity/-Infinity) are stable enough for
+    # this internal scheduler identity; this digest is not an interchange signature.
     encoded = json.dumps(
         state.to_dict(),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-        allow_nan=False,
+        allow_nan=True,
     ).encode("utf-8")
     return sha256(encoded).hexdigest()
 
@@ -344,6 +347,23 @@ class BoundedDevelopmentController:
             if pending.state_sha256 == state_digest:
                 return ControllerDecision(checkpoint=checkpoint, action=pending)
             if pending.source_phase is state.phase:
+                # VERIFY can durably accumulate multiple test/eval observations while
+                # remaining in VERIFY.  Treat that as progress within the same logical
+                # action: rebind the pending action to the newer snapshot without
+                # allocating another step or retry budget.  Other phases are expected
+                # to leave their phase when their issued action makes durable progress.
+                if pending.kind is ControllerActionKind.VERIFY:
+                    rebound = ControllerAction(
+                        pending.kind,
+                        pending.source_phase,
+                        pending.ordinal,
+                        state_digest,
+                    )
+                    rebound_checkpoint = replace(checkpoint, pending_action=rebound)
+                    return ControllerDecision(
+                        checkpoint=rebound_checkpoint,
+                        action=rebound,
+                    )
                 raise ValueError(
                     "RunState changed without leaving the pending action source phase; "
                     "finish the issued action before requesting another controller step"
