@@ -17,7 +17,12 @@ def _runtime():
         pytest.fail(f"HARN-007 comparison contract is not implemented yet: {exc}")
 
 
-def _record(*, disposition: str = "keep-langgraph"):
+def _record(
+    *,
+    disposition: str = "keep-langgraph",
+    observed_token_ids: tuple[str, ...] = ("t1",),
+    completed_normally: bool = True,
+):
     runtime = _runtime()
     return runtime.DeepAgentsDecisionRecord(
         schema_version=1,
@@ -25,8 +30,8 @@ def _record(*, disposition: str = "keep-langgraph"):
         deepagents_package="deepagents",
         deepagents_version="0.7.13",
         required_token_ids=("t1", "t2", "t3"),
-        observed_token_ids=("t1",),
-        completed_normally=True,
+        observed_token_ids=observed_token_ids,
+        completed_normally=completed_normally,
         equivalence_criteria=(
             "complete-column-context",
             "every-token-in-order",
@@ -56,6 +61,26 @@ def test_decision_record_round_trips_and_exposes_early_termination() -> None:
 def test_primary_adoption_is_rejected_when_probe_skips_required_tokens() -> None:
     with pytest.raises(ValueError, match="primary|token|equivalent"):
         _record(disposition="adopt-primary")
+
+
+def test_primary_adoption_requires_successful_complete_equivalence_probe() -> None:
+    with pytest.raises(ValueError, match="primary|successful|complete|equivalent"):
+        _record(
+            disposition="adopt-primary",
+            observed_token_ids=("t1", "t2", "t3"),
+            completed_normally=False,
+        )
+
+
+def test_primary_adoption_accepts_only_successful_complete_probe() -> None:
+    runtime = _runtime()
+    record = _record(
+        disposition="adopt-primary",
+        observed_token_ids=("t1", "t2", "t3"),
+        completed_normally=True,
+    )
+    assert record.disposition is runtime.DeepAgentsDisposition.ADOPT_PRIMARY
+    assert record.early_termination_observed is False
 
 
 def test_selected_component_decision_requires_named_components() -> None:
