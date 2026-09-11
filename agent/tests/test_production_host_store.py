@@ -25,12 +25,13 @@ def _task() -> TaskSpec:
     )
 
 
-def _state(base_sha: str = BASE) -> DevelopmentControllerState:
+def _state(base_sha: str = BASE, *, github_writes: int = 0) -> DevelopmentControllerState:
     return DevelopmentControllerState(
         schema_version=1,
         base_sha=base_sha,
         core=RunState("run-53", _task()),
         provenance_refs=("issue:53",),
+        github_writes=github_writes,
     )
 
 
@@ -98,6 +99,16 @@ def test_host_envelope_rejects_valid_json_missing_required_state_fields() -> Non
         ProductionHostEnvelope.from_dict(
             {"schema_version": 1, "trusted_approvals": []}
         )
+
+
+def test_host_envelope_detects_nested_controller_state_truncation() -> None:
+    payload = ProductionHostEnvelope(1, _state(github_writes=1), ()).to_dict()
+    controller = dict(payload["controller_state"])
+    assert controller.pop("github_writes") == 1
+    payload["controller_state"] = controller
+
+    with pytest.raises(ValueError, match="integrity|digest|corrupt|truncat"):
+        ProductionHostEnvelope.from_dict(payload)
 
 
 def test_atomic_store_round_trips_and_corrupt_existing_state_fails_closed(tmp_path) -> None:
