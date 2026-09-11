@@ -5,7 +5,7 @@ Research commit: `03265267a7853cc0f71ef6bc4add2bc45de1728c`
 
 ## Design
 
-Add a standard-library-only module `agent/harness/github_effects.py`.
+Add a standard-library-only module `agent/harness/github_effects.py`. It performs no network I/O; a trusted controller injects the write adapter.
 
 ### Contracts
 
@@ -15,44 +15,44 @@ Add a standard-library-only module `agent/harness/github_effects.py`.
 - `UNKNOWN`
 
 `GitHubAction`
-- explicit read action(s);
+- explicit read action;
 - explicit development write actions only;
 - no generic/raw endpoint action.
 
+`GitHubOperationPermission`
+- one HARN-002 operation ID;
+- one exact fork write action.
+
 `GitHubTaskPolicy`
-- explicit fork-write action allowlist;
-- upstream writes are never autonomous regardless of fork policy;
-- reads from fork/upstream allowed;
-- unknown-repository writes denied.
+- fork authority is bound as `operation_id -> exact action`, not a cross-product of operation IDs and actions;
+- upstream operation IDs are separately declared and never inherit fork authority;
+- legacy single-action fork policy is normalized to exact per-operation permissions; ambiguous multi-action legacy policy fails closed;
+- reads from fork/upstream are separately authorized;
+- unknown-repository writes are denied.
 
 `GitHubEffectRequest`
-- `operation_id`;
+- operation ID;
 - canonical repository;
 - action;
 - JSON-safe payload;
 - deterministic request SHA-256 over canonical repository/action/payload.
 
-`HumanApprovalChallenge`
-- operation ID;
-- request SHA-256;
-- repository/action;
-- reason.
-
-`HumanApproval`
-- approval ID;
-- approver ID;
-- exact operation ID + request SHA-256.
+`HumanApprovalChallenge` / `HumanApproval`
+- upstream approval is a structured runtime interrupt;
+- approval binds approver, operation ID and exact request digest.
 
 `GitHubEffectReceipt`
-- operation ID;
-- request SHA-256;
-- repository/action;
-- safe result reference.
+- operation ID + request digest + repository/action;
+- durable adapter result reference.
+
+`GitHubEffectUncertainRequest`
+- durable quarantine marker for an adapter dispatch whose external outcome cannot safely be replayed.
 
 `GitHubEffectJournal`
 - approvals;
 - successful receipts;
-- strict `to_dict`/`from_dict` round-trip validation.
+- uncertain requests;
+- strict round-trip validation and mutually exclusive receipt/uncertainty state for one operation.
 
 ### Runtime API
 
@@ -61,101 +61,93 @@ Add a standard-library-only module `agent/harness/github_effects.py`.
 - known fork/upstream classified exactly;
 - unknown identity remains unknown rather than falling through to fork.
 
-`authorize_read(request, policy)`
+`GitHubEffectGateway.authorize_read(request)`
 - fork/upstream reads allowed;
+- unknown reads denied;
 - write action passed to read path rejected.
 
-`GitHubEffectGateway(policy, adapter)`
-- adapter is private to gateway and receives only authorized typed requests;
-- `execute_write(request, journal)`:
-  - validates write action and task policy;
-  - returns prior persisted receipt on exact replay without adapter call;
-  - rejects operation-ID reuse with changed digest;
-  - fork write: execute if task policy explicitly allows action;
-  - upstream write with no matching approval: raise structured `HumanApprovalRequired` carrying challenge, without adapter call;
-  - upstream write with exact approval: execute;
-  - unknown repository: deny;
-  - adapter error: propagate/sanitize as execution failure but do not append receipt;
-  - success: return updated journal + receipt.
+`GitHubEffectGateway.execute_write(request, journal, checkpoint=...)`
 
-The gateway does not own HARN-002 run transitions. HARN-010 will map the structured approval interrupt into durable controller state.
+Before any adapter dispatch:
+1. validate request/action and declared operation ID;
+2. exact replay of a persisted receipt returns the receipt without adapter execution;
+3. an existing uncertainty marker blocks automatic replay;
+4. fork write requires the exact declared `(operation_id, action)` pair;
+5. upstream write requires a declared upstream operation ID plus an exact-digest `HumanApproval`; absent approval raises `HumanApprovalRequired` before adapter execution;
+6. unknown repository is denied;
+7. persist `GitHubEffectUncertainRequest` through the supplied durable checkpoint;
+8. only then invoke the injected adapter.
 
-## TDD order
+After dispatch:
+- `AdapterEffectNotExecuted` is the only adapter failure allowed to clear uncertainty automatically; the cleared journal must itself be checkpointed before retry can be considered safe;
+- any ordinary adapter exception becomes `GitHubEffectOutcomeUnknown` and keeps the durable uncertainty marker;
+- process-level interruption after the pre-dispatch checkpoint likewise resumes into the persisted uncertainty state and cannot automatically duplicate the write;
+- successful adapter return creates a receipt, clears uncertainty and checkpoints the completed journal before success is exposed;
+- if that final receipt checkpoint fails after the external write may have succeeded, raise `GitHubEffectOutcomeUnknown` carrying the earlier durable uncertainty journal.
 
-Create `agent/tests/test_github_effects.py` before implementation.
+The gateway does not own HARN-002 run transitions. HARN-010 will map approval/uncertainty outcomes into durable controller state.
 
-### A. Destination classification / reads
-- exact fork and upstream classification;
-- case/whitespace normalization is deterministic without accepting arbitrary URLs as repository identities;
-- unknown repository stays unknown;
-- upstream read allowed;
-- write action cannot enter read path.
+## TDD / review history
 
-### B. Fork writes
-- explicit task policy allows selected fork action;
-- non-allowlisted fork action denied before adapter call;
-- request carries explicit non-empty operation ID;
-- success creates attributable receipt.
+The ticket follows research → plan → TDD/RED → implementation → full-suite GREEN → logically independent adversarial review. Every blocking review finding is converted to a failing test before repair.
 
-### C. Upstream approval interrupt
-- upstream write without approval raises `HumanApprovalRequired`;
-- challenge binds repository/action/operation/digest;
-- adapter is not called before approval;
-- mismatched operation/digest approval rejected;
-- exact approval allows fake-adapter execution;
-- no real upstream API action occurs in tests.
+Coverage includes:
 
-### D. Replay / resume
-- serialize + restore journal after successful fake write;
-- replay exact request returns same receipt and adapter call count stays one;
-- same operation ID with mutated payload/action/repository is rejected;
-- adapter failure records no success receipt, so retry remains possible;
-- upstream approval survives journal serialization and retry after transient adapter failure.
+### Destination / identity
+- strict fork/upstream classification;
+- URL/repository spelling tricks rejected;
+- request digest stable and bound to repository/action/payload;
+- operation-ID reuse with mutated request rejected.
 
-### E. Generic-adapter bypass
-- action enum has no raw/generic/endpoint member;
-- gateway rejects non-enum action construction/deserialization;
-- adapter receives typed authorized request only after policy/approval checks;
-- extend `test_repository_safety.py` so future development-controller modules cannot introduce obvious direct upstream-mutating REST/CLI calls outside the boundary.
+### Fork writes
+- exact per-operation action permission required;
+- cross-product privilege expansion rejected;
+- non-allowlisted action denied before adapter call;
+- success creates attributable replay receipt.
 
-### F. Malformed persistence
-- scalar where tuple/list expected rejected;
-- duplicate approval IDs rejected;
-- duplicate receipt operation IDs rejected;
-- receipt with malformed digest rejected;
-- contradictory/mutated nested payload rejected.
+### Upstream approval
+- no matching approval raises structured `HumanApprovalRequired`;
+- challenge binds exact operation/digest/repository/action;
+- mismatched or stale approval rejected;
+- no real upstream API write occurs in tests.
+
+### Durable replay / crash safety
+- exact successful replay never repeats adapter call;
+- uncertainty is checkpointed before dispatch;
+- resume from uncertainty cannot automatically replay;
+- ordinary adapter exception remains quarantined;
+- process-level interruption remains quarantined after restore;
+- `AdapterEffectNotExecuted` supports the explicitly safe retry path;
+- final receipt-checkpoint failure is reported as outcome-unknown rather than a retryable storage failure.
+
+### Generic bypass / static safety
+- action enum exposes no raw/generic endpoint capability;
+- `agent/harness` is statically checked for recognizable direct GitHub REST/CLI transport;
+- the static check is deliberately GitHub-specific and does not prohibit local subprocess execution or non-GitHub HTTP required by later controller/evaluation work;
+- explicit upstream-mutating patterns remain covered separately by repository safety tests.
+
+### Malformed persistence
+- scalar/collection confusion rejected;
+- duplicate approvals/receipts/uncertainty IDs rejected;
+- malformed digests and contradictory durable state rejected.
 
 ## Implementation constraints
 
 - Python standard library only;
-- no GitHub SDK/network call in this module;
-- injected adapter is deterministic in tests;
-- no writes to `DT-UCPH/cuc`;
+- no GitHub SDK/network call in `github_effects.py`;
+- injected adapter is trusted infrastructure and deterministic in tests;
+- untrusted model code must never receive the raw adapter or unrestricted GitHub transport;
+- no writes to `DT-UCPH/cuc` during this ticket;
 - no changes under `auto_parsing/**` or `reviewed/**`;
 - no Deep Agents dependency;
-- preserve existing HARN-002/HARN-006/HARN-007 contracts unchanged unless a review-driven test proves a required compatibility fix.
-
-## Verification gates
-
-1. Initial focused RED: new HARN-009 tests fail only because module/contracts are absent.
-2. Minimal implementation to focused GREEN.
-3. Full `agent/tests` GREEN and existing repository-safety tests GREEN.
-4. Fresh logically independent adversarial review against issue #10 + policy files, attacking:
-   - alternate repository spelling;
-   - generic adapter/raw endpoint escape;
-   - approval substitution;
-   - operation replay and mutation;
-   - exception/partial-execution handling;
-   - serialization tampering;
-   - accidental real upstream write surface.
-5. Every blocking review finding becomes test-first RED before repair.
-6. Final exact-head full-suite GREEN + fresh review before marking PR ready/merging.
+- preserve HARN-002/HARN-006/HARN-007 contracts unless a review-driven regression proves a required compatibility change.
 
 ## Acceptance mapping
 
-- explicit operation IDs: `GitHubEffectRequest.operation_id`, tied to HARN-002 identity;
-- upstream generic bypass prevention: typed action allowlist + gateway-only adapter execution + static safety extension;
-- explicit human gate: structured `HumanApprovalRequired` challenge, exact-digest approval contract;
-- fork attribution/replay safety: task-policy allowlist + durable receipts;
+- explicit operation IDs: HARN-002 operation identity, with fork operations bound to an exact action;
+- upstream generic bypass prevention: typed action vocabulary + gateway-only adapter execution + GitHub-specific static safety guard;
+- explicit human gate: `HumanApprovalRequired` challenge and exact request-digest approval;
+- replay/crash safety: durable uncertainty-before-dispatch + durable receipt-before-success;
+- fork attribution: exact operation/action policy plus receipts;
 - existing safety suite: retained and extended;
-- adversarial bypass review: mandatory final gate.
+- adversarial review: mandatory final gate before ready/merge.
