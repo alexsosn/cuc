@@ -515,8 +515,10 @@ class BoundedDevelopmentController:
         if not self.policy_refs or not self.review_rubric:
             raise ValueError("policy_refs and review_rubric must not be empty")
         self.implementer_id = _required_text(implementer_id, "implementer_id")
-        if reviewer.implementer_id is not None and reviewer.implementer_id != self.implementer_id:
-            raise ValueError("reviewer implementer identity does not match controller")
+        if reviewer.implementer_id != self.implementer_id:
+            raise ValueError(
+                "independent reviewer must be explicitly bound to the controller implementer identity"
+            )
 
     def _persist(self, state: DevelopmentControllerState) -> DevelopmentControllerState:
         self._persist_callback(state.to_dict())
