@@ -11,7 +11,7 @@ def test_implementation_result_cannot_schedule_merge_before_verification_and_rev
     merge = GitHubEffectRequest(
         "premature-merge",
         "alexsosn/cuc",
-        GitHubAction.MERGE_PR,
+        GitHubAction.MERGE_PULL_REQUEST,
         {"pull_number": 59},
         target_ref="agent-harness-safety",
     )
@@ -22,5 +22,5 @@ def test_implementation_result_cannot_schedule_merge_before_verification_and_rev
         (merge.operation_id,),
     )
 
-    with pytest.raises(ValueError, match="MERGE_PR|merge|finaliz|review"):
+    with pytest.raises(ValueError, match="MERGE_PULL_REQUEST|merge|finaliz|review"):
         ImplementationResult(change, "b" * 40, (merge,))
