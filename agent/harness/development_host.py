@@ -8,6 +8,7 @@ authorities; it does not create another side-effect journal or executor.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import errno
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,13 @@ from .state_machine import ResumeRequested, apply_event
 
 _HOST_SCHEMA_VERSION = 1
 _HOST_FIELDS = frozenset({"schema_version", "controller_state", "trusted_approvals"})
+_DIRECTORY_FSYNC_UNSUPPORTED = frozenset(
+    {
+        errno.EINVAL,
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }
+)
 
 
 def _approval_tuple(value: object) -> tuple[HumanApproval, ...]:
@@ -143,23 +151,30 @@ class DevelopmentHostEnvelope:
 
 
 def _fsync_directory(directory: Path) -> None:
-    """Best-effort directory fsync after replace where the platform supports it.
+    """Fsync a replaced file's directory, ignoring only unsupported operations.
 
-    File fsync and atomic replacement are mandatory. Some supported platforms do
-    not permit opening/fsyncing directories; that capability gap must not cause a
-    fallback to an unsafe direct overwrite.
+    Platforms without ``O_DIRECTORY`` do not expose the POSIX directory-descriptor
+    primitive needed here. On platforms that do expose it, genuine filesystem
+    failures such as EIO propagate; only explicit not-supported errors are tolerated.
     """
 
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if directory_flag is None:
+        return
+    flags = os.O_RDONLY | directory_flag
     try:
         directory_fd = os.open(directory, flags)
-    except OSError:
-        return
+    except OSError as exc:
+        if exc.errno in _DIRECTORY_FSYNC_UNSUPPORTED:
+            return
+        raise
     try:
         try:
             os.fsync(directory_fd)
-        except OSError:
-            return
+        except OSError as exc:
+            if exc.errno in _DIRECTORY_FSYNC_UNSUPPORTED:
+                return
+            raise
     finally:
         os.close(directory_fd)
 
@@ -390,11 +405,25 @@ class TrustedDevelopmentHost:
         if state.github_journal.uncertain_for(request.operation_id) is None:
             raise ValueError("pending request is not quarantined as an uncertain GitHub effect")
 
+        # The gateway calls this only after the trusted reconciler has proven either
+        # EXECUTED or NOT_EXECUTED. Persist journal resolution and controller resume
+        # as one host-envelope transition so no restart can observe a resolved journal
+        # paired with an unresumable BLOCKED controller.
         def checkpoint(journal: GitHubEffectJournal) -> None:
             current = self.state
             if current is None:
                 raise ValueError("durable development host lost controller state")
-            self._persist_controller_state(replace(current, github_journal=journal))
+            resumed_core = apply_event(current.core, ResumeRequested())
+            resolved = replace(
+                current,
+                core=resumed_core,
+                github_journal=journal,
+                stop_code=None,
+                stop_reason=None,
+                audit_events=current.audit_events
+                + (f"github:{request.operation_id}:reconciled",),
+            )
+            self._persist_controller_state(resolved)
 
         self._gateway.reconcile_uncertain(
             request,
@@ -405,19 +434,8 @@ class TrustedDevelopmentHost:
         current = self.state
         if current is None:
             raise ValueError("durable development host lost controller state")
-        # UNKNOWN reconciliation does not checkpoint/clear the quarantine, so it
-        # must remain blocked. EXECUTED and NOT_EXECUTED both clear uncertainty.
         if current.github_journal.uncertain_for(request.operation_id) is not None:
-            return current
-
-        resumed_core = apply_event(current.core, ResumeRequested())
-        resumed = replace(
-            current,
-            core=resumed_core,
-            stop_code=None,
-            stop_reason=None,
-            audit_events=current.audit_events
-            + (f"github:{request.operation_id}:reconciled",),
-        )
-        self._persist_controller_state(resumed)
-        return resumed
+            raise RuntimeError("trusted reconciliation returned without durable resolution")
+        if current.core.phase is RunPhase.BLOCKED or current.stop_code is not None:
+            raise RuntimeError("trusted reconciliation returned without durable controller resume")
+        return current
