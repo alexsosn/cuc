@@ -286,9 +286,9 @@ class SystematicFindingCandidate:
         negative = _text_tuple(self.negative_cases, "negative_cases", single_line=True)
         boundary = _text_tuple(self.boundary_cases, "boundary_cases", single_line=True)
         normalized_roles = {
-            "positive": {item.casefold() for item in positive},
-            "negative": {item.casefold() for item in negative},
-            "boundary": {item.casefold() for item in boundary},
+            "positive": {_normalized_source_text(item) for item in positive},
+            "negative": {_normalized_source_text(item) for item in negative},
+            "boundary": {_normalized_source_text(item) for item in boundary},
         }
         overlap = (
             normalized_roles["positive"] & normalized_roles["negative"]
@@ -502,7 +502,7 @@ def plan_development_issue(
         )
 
     task = TaskSpec(
-        task_id=f"finding-{fingerprint[:16]}",
+        task_id=f"finding-{fingerprint}",
         title=candidate.title,
         objective=candidate.objective,
         acceptance_criteria=candidate.acceptance_criteria,
