@@ -12,6 +12,7 @@ from harness.contracts import (
     TaskSpec,
     TestIntent,
     TestKind,
+    TestResult,
 )
 from harness.development_controller import (
     BoundedDevelopmentController,
@@ -228,6 +229,17 @@ def test_reused_operation_id_is_blocked_before_replay_or_provider_dispatch() -> 
         ("agent/harness/prior.py",),
         (reused.operation_id,),
     )
+    prior_failure = TestResult(
+        intent.intent_id,
+        prior.change_id,
+        GateOutcome.TEST_FAILURE,
+        "e" * 40,
+        "e" * 40,
+        1,
+        0,
+        1,
+        "prior candidate failed verification",
+    )
     core = RunState(
         "run-11",
         _task(),
@@ -236,6 +248,7 @@ def test_reused_operation_id_is_blocked_before_replay_or_provider_dispatch() -> 
         plan=PlanArtifact("plan", "done", ("test", "implement")),
         test_intents=(intent,),
         changes=(prior,),
+        test_results=(prior_failure,),
     )
     pending = ImplementationResult(
         ChangeSet(
