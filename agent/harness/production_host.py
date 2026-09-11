@@ -34,6 +34,9 @@ from .state_machine import ResumeRequested, apply_event
 
 
 _HOST_SCHEMA = 1
+_HOST_FIELDS = frozenset(
+    {"schema_version", "controller_state", "trusted_approvals"}
+)
 _UNSUPPORTED_DIRECTORY_FSYNC = frozenset(
     value
     for value in (
@@ -100,10 +103,14 @@ class ProductionHostEnvelope:
     def from_dict(cls, payload: Mapping[str, Any]) -> "ProductionHostEnvelope":
         if not isinstance(payload, Mapping):
             raise ValueError("production host envelope must be an object")
-        if "schema_version" not in payload:
-            raise ValueError("production host envelope schema_version is required")
-        raw_state = payload.get("controller_state")
-        raw_approvals = payload.get("trusted_approvals", ())
+        missing = _HOST_FIELDS - set(payload)
+        if missing:
+            raise ValueError(
+                "production host envelope missing required fields: "
+                + ", ".join(sorted(missing))
+            )
+        raw_state = payload["controller_state"]
+        raw_approvals = payload["trusted_approvals"]
         if isinstance(raw_approvals, (str, bytes, Mapping)):
             raise ValueError("trusted_approvals must be an array")
         try:
@@ -251,6 +258,8 @@ class ProductionDevelopmentHost:
             raise ValueError("production host requires an explicit durable AtomicHostStateStore")
         if not isinstance(github_policy, GitHubTaskPolicy):
             raise ValueError("github_policy must be GitHubTaskPolicy")
+        if not callable(getattr(github_reconciler, "reconcile", None)):
+            raise ValueError("production host requires a trusted GitHub reconciler")
 
         self.__store = store
         loaded = store.load()
@@ -372,6 +381,13 @@ class ProductionDevelopmentHost:
     def resume(self, *, approval: HumanApproval | None = None) -> DevelopmentControllerState:
         state = self.__require_state()
         if approval is not None:
+            if (
+                state.core.phase is not RunPhase.AWAITING_HUMAN
+                or state.stop_code is not ControllerStopCode.NEEDS_HUMAN
+            ):
+                raise ValueError(
+                    "human approval may only be persisted while controller is awaiting human resume"
+                )
             self.__persist_trusted_approval(approval)
             state = self.__require_state()
         return self.__controller.resume(state, approval=approval)
