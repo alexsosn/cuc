@@ -31,12 +31,15 @@ from harness.github_effects import (
     GitHubEffectRequest,
     GitHubOperationPermission,
     GitHubTaskPolicy,
+    HumanApproval,
+    HumanApprovalAuthority,
 )
 
 
 BASE = "a" * 40
 HEAD = "b" * 40
 FORK = "alexsosn/cuc"
+UPSTREAM = "DT-UCPH/cuc"
 
 
 class Adapter:
@@ -46,6 +49,12 @@ class Adapter:
     def execute(self, request):
         self.calls.append((request.action.value, request.operation_id))
         return f"issue:{request.operation_id}"
+
+
+class AmbiguousAdapter(Adapter):
+    def execute(self, request):
+        self.calls.append((request.action.value, request.operation_id))
+        raise RuntimeError("provider response lost after possible mutation")
 
 
 class SimulatedControllerCrash(RuntimeError):
@@ -135,6 +144,38 @@ def _red(intent: TestIntent) -> RedGateEvidence:
         0,
         1,
         "expected baseline failure",
+    )
+
+
+def _single_pending_state(request: GitHubEffectRequest) -> DevelopmentControllerState:
+    intent = _targeted()
+    core = RunState(
+        "run-11",
+        _task(),
+        phase=RunPhase.IMPLEMENT,
+        research=ResearchArtifact("research", "done", ()),
+        plan=PlanArtifact("plan", "done", ("test", "implement")),
+        test_intents=(intent,),
+    )
+    implementation = ImplementationResult(
+        ChangeSet(
+            "change-1",
+            "one pending write",
+            ("agent/harness/example.py",),
+            (request.operation_id,),
+        ),
+        HEAD,
+        (request,),
+    )
+    return DevelopmentControllerState(
+        1,
+        BASE,
+        core,
+        red_evidence=(_red(intent),),
+        pending_implementation=implementation,
+        current_head_sha=HEAD,
+        revision_attempts=1,
+        github_journal=GitHubEffectJournal(),
     )
 
 
@@ -281,3 +322,65 @@ def test_reused_operation_id_is_blocked_before_replay_or_provider_dispatch() -> 
     assert "operation" in blocked.stop_reason.casefold()
     assert "reuse" in blocked.stop_reason.casefold()
     assert adapter.calls == []
+
+
+def test_matching_approval_value_without_trusted_registration_cannot_authorize_write() -> None:
+    request = GitHubEffectRequest(
+        "upstream-write-1",
+        UPSTREAM,
+        GitHubAction.CREATE_ISSUE,
+        {"title": "needs trusted approval"},
+    )
+    adapter = Adapter()
+    authority = HumanApprovalAuthority()
+    gateway = GitHubEffectGateway(
+        GitHubTaskPolicy(allowed_upstream_operation_ids=(request.operation_id,)),
+        adapter,
+        approval_authority=authority,
+    )
+    controller = _controller(gateway, lambda _payload: None)
+    paused = controller.step(_single_pending_state(request))
+
+    assert paused.core.phase is RunPhase.AWAITING_HUMAN
+    assert paused.stop_code is ControllerStopCode.NEEDS_HUMAN
+    assert adapter.calls == []
+
+    forged = HumanApproval(
+        "approval-shaped-value",
+        "claimed-human",
+        request.operation_id,
+        request.request_sha256,
+    )
+    resumed = controller.resume(paused, approval=forged)
+    paused_again = controller.step(resumed)
+
+    assert paused_again.core.phase is RunPhase.AWAITING_HUMAN
+    assert paused_again.stop_code is ControllerStopCode.NEEDS_HUMAN
+    assert paused_again.pending_operation_id == request.operation_id
+    assert adapter.calls == []
+
+
+def test_ambiguous_provider_outcome_is_quarantined_and_never_blindly_redispatched() -> None:
+    request = GitHubEffectRequest(
+        "fork-uncertain-1",
+        FORK,
+        GitHubAction.CREATE_ISSUE,
+        {"title": "possible mutation"},
+    )
+    adapter = AmbiguousAdapter()
+    gateway = _gateway((request,), adapter)
+    snapshots: list[dict[str, object]] = []
+    controller = _controller(gateway, snapshots.append)
+
+    blocked = controller.step(_single_pending_state(request))
+
+    assert blocked.core.phase is RunPhase.BLOCKED
+    assert blocked.stop_code is ControllerStopCode.BLOCKED_EXECUTION
+    assert blocked.github_journal.uncertain_for(request.operation_id) is not None
+    assert "uncertain" in blocked.stop_reason.casefold()
+    assert adapter.calls == [(GitHubAction.CREATE_ISSUE.value, request.operation_id)]
+    assert snapshots
+
+    unchanged = controller.run_until_stop(blocked)
+    assert unchanged == blocked
+    assert adapter.calls == [(GitHubAction.CREATE_ISSUE.value, request.operation_id)]
