@@ -82,6 +82,17 @@ def _text_tuple(values: object, field: str) -> tuple[str, ...]:
     return normalized
 
 
+def _text_sequence(values: object, field: str) -> tuple[str, ...]:
+    """Normalize an ordered text log where repeated events are meaningful."""
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{field} must be an iterable of strings")
+    try:
+        items = tuple(values)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(f"{field} must be an iterable of strings") from exc
+    return tuple(_required_text(item, field) for item in items)
+
+
 def _nonnegative_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field} must be a non-negative integer")
@@ -365,7 +376,7 @@ class DevelopmentControllerState:
         if self.stop_code is not None and not isinstance(self.stop_code, ControllerStopCode):
             object.__setattr__(self, "stop_code", ControllerStopCode(self.stop_code))
         object.__setattr__(self, "stop_reason", _optional_text(self.stop_reason, "stop_reason"))
-        object.__setattr__(self, "audit_events", _text_tuple(self.audit_events, "audit_events"))
+        object.__setattr__(self, "audit_events", _text_sequence(self.audit_events, "audit_events"))
 
     @property
     def red_gate_complete(self) -> bool:
