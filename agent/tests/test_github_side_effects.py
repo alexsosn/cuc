@@ -12,6 +12,7 @@ from harness.github_side_effects import (
     GitHubTarget,
     GuardedGitHubSideEffects,
     HumanApprovalGrant,
+    HumanApprovalRegistry,
     OperationJournal,
     OperationReplayConflict,
     PolicyDisposition,
@@ -96,9 +97,27 @@ def _approval(intent: GitHubOperationIntent, approval_id: str = "human-approval-
     )
 
 
-def _guard(adapter: FakeGitHubAdapter | None = None, journal: OperationJournal | None = None):
+def _registry(*grants: HumanApprovalGrant) -> HumanApprovalRegistry:
+    registry = HumanApprovalRegistry()
+    for grant in grants:
+        registry.register(grant)
+    return registry
+
+
+def _guard(
+    adapter: FakeGitHubAdapter | None = None,
+    journal: OperationJournal | None = None,
+    approvals: HumanApprovalRegistry | None = None,
+):
     adapter = adapter or FakeGitHubAdapter()
-    return GuardedGitHubSideEffects(adapter=adapter, journal=journal or OperationJournal()), adapter
+    return (
+        GuardedGitHubSideEffects(
+            adapter=adapter,
+            journal=journal or OperationJournal(),
+            approvals=approvals or HumanApprovalRegistry(),
+        ),
+        adapter,
+    )
 
 
 def test_destination_classification_is_closed_and_case_insensitive() -> None:
@@ -164,15 +183,16 @@ def test_direct_fork_updates_to_integration_refs_are_denied(
     "kind", [GitHubOperationKind.MERGE_PR, GitHubOperationKind.TRIGGER_WORKFLOW]
 )
 def test_sensitive_fork_actions_require_exact_human_approval(kind: GitHubOperationKind) -> None:
-    guard, adapter = _guard()
     intent = _intent(f"sensitive-{kind.value}", kind, ref="agent-harness-safety")
+    grant = _approval(intent)
+    guard, adapter = _guard(approvals=_registry(grant))
 
     assert guard.evaluate(intent).disposition is PolicyDisposition.REQUIRE_APPROVAL
     with pytest.raises(ApprovalRequired):
         guard.execute(intent)
     assert adapter.calls == []
 
-    result = guard.execute(intent, approval=_approval(intent))
+    result = guard.execute(intent, approval=grant)
     assert result.status == "executed"
     assert len(adapter.calls) == 1
 
@@ -192,7 +212,6 @@ def test_sensitive_fork_actions_require_exact_human_approval(kind: GitHubOperati
     ],
 )
 def test_every_upstream_write_requires_exact_approval(kind: GitHubOperationKind) -> None:
-    guard, adapter = _guard()
     ref = "release/harn-009" if kind in {
         GitHubOperationKind.CREATE_BRANCH,
         GitHubOperationKind.UPDATE_BRANCH,
@@ -200,13 +219,15 @@ def test_every_upstream_write_requires_exact_approval(kind: GitHubOperationKind)
         GitHubOperationKind.TRIGGER_WORKFLOW,
     } else None
     intent = _intent(f"upstream-{kind.value}", kind, UPSTREAM, ref=ref)
+    grant = _approval(intent)
+    guard, adapter = _guard(approvals=_registry(grant))
 
     assert guard.evaluate(intent).disposition is PolicyDisposition.REQUIRE_APPROVAL
     with pytest.raises(ApprovalRequired):
         guard.execute(intent)
     assert adapter.calls == []
 
-    result = guard.execute(intent, approval=_approval(intent))
+    result = guard.execute(intent, approval=grant)
     assert result.status == "executed"
     assert len(adapter.calls) == 1
 
@@ -226,7 +247,6 @@ def test_unknown_repository_is_denied_even_with_approval() -> None:
 
 @pytest.mark.parametrize("mutation", ["id", "action", "repo", "ref", "payload"])
 def test_approval_is_bound_to_exact_operation_fingerprint(mutation: str) -> None:
-    guard, adapter = _guard()
     original = _intent(
         "approved-upstream",
         GitHubOperationKind.CREATE_PR,
@@ -235,6 +255,7 @@ def test_approval_is_bound_to_exact_operation_fingerprint(mutation: str) -> None
         payload={"title": "release", "base": "main"},
     )
     grant = _approval(original)
+    guard, adapter = _guard(approvals=_registry(grant))
 
     if mutation == "id":
         changed = _intent("different-id", original.kind, UPSTREAM, ref="main", payload=dict(original.payload))
