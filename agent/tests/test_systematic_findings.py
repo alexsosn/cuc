@@ -27,6 +27,7 @@ def _occurrence(
     occurrence_id: str,
     tablet: str = "KTU 1.1",
     column: str = "I",
+    locus_ref: str = "1",
     token_ids: tuple[str, ...] = ("t1",),
     metric_refs: tuple[str, ...] = (),
     expert_feedback_refs: tuple[str, ...] = (),
@@ -37,6 +38,7 @@ def _occurrence(
         corpus="CUC",
         tablet=tablet,
         column=column,
+        locus_ref=locus_ref,
         token_ids=token_ids,
         summary=f"Observed {occurrence_id}",
         run_id=f"run-{occurrence_id}",
@@ -69,8 +71,8 @@ def _candidate(
         classification = mod.FindingClassification.PARSER_CONFIG_DEFECT
     if occurrences is None:
         occurrences = (
-            _occurrence(occurrence_id="a", tablet="KTU 1.1", token_ids=("t1",)),
-            _occurrence(occurrence_id="b", tablet="KTU 1.2", token_ids=("t2",)),
+            _occurrence(occurrence_id="a", tablet="KTU 1.1", locus_ref="I:1", token_ids=("t1",)),
+            _occurrence(occurrence_id="b", tablet="KTU 1.2", locus_ref="I:1", token_ids=("t2",)),
         )
     return mod.SystematicFindingCandidate(
         classification=classification,
@@ -125,8 +127,20 @@ def test_duplicate_observations_of_same_locus_do_not_fake_recurrence():
     mod = _mod()
     candidate = _candidate(
         occurrences=(
-            _occurrence(occurrence_id="a", tablet="KTU 1.1", token_ids=("t1",)),
-            _occurrence(occurrence_id="b", tablet="KTU 1.1", token_ids=("t1",)),
+            _occurrence(occurrence_id="a", tablet="KTU 1.1", locus_ref="I:4", token_ids=("t1",)),
+            _occurrence(occurrence_id="b", tablet="KTU 1.1", locus_ref="I:4", token_ids=("t1",)),
+        )
+    )
+    decision = _plan(candidate)
+    assert decision.disposition is mod.FindingDisposition.INSUFFICIENT_SYSTEMATIC_EVIDENCE
+
+
+def test_token_id_churn_at_same_source_locus_does_not_fake_recurrence():
+    mod = _mod()
+    candidate = _candidate(
+        occurrences=(
+            _occurrence(occurrence_id="old", tablet="KTU 1.1", locus_ref="I:4", token_ids=("old-17",)),
+            _occurrence(occurrence_id="new", tablet="KTU 1.1", locus_ref="I:4", token_ids=("new-912",)),
         )
     )
     decision = _plan(candidate)
@@ -195,15 +209,24 @@ def test_rule_like_findings_require_positive_negative_and_boundary_cases(classif
     assert "boundary" in decision.reason
 
 
+def test_rule_like_case_roles_must_be_disjoint():
+    with pytest.raises(ValueError, match="positive|negative|boundary|overlap"):
+        _candidate(
+            positive_cases=("case:same",),
+            negative_cases=("case:same",),
+            boundary_cases=("case:same",),
+        )
+
+
 def test_fingerprint_is_stable_across_occurrence_order_and_added_evidence():
-    first = _occurrence(occurrence_id="a", tablet="KTU 1.1", token_ids=("t1",))
-    second = _occurrence(occurrence_id="b", tablet="KTU 1.2", token_ids=("t2",))
+    first = _occurrence(occurrence_id="a", tablet="KTU 1.1", locus_ref="I:1", token_ids=("t1",))
+    second = _occurrence(occurrence_id="b", tablet="KTU 1.2", locus_ref="I:1", token_ids=("t2",))
     base = _candidate(occurrences=(first, second))
     expanded = _candidate(
         occurrences=(
             replace(second, metric_refs=("metric:new",)),
             first,
-            _occurrence(occurrence_id="c", tablet="KTU 1.3", token_ids=("t3",)),
+            _occurrence(occurrence_id="c", tablet="KTU 1.3", locus_ref="I:2", token_ids=("t3",)),
         ),
         evidence_refs=("finding:aggregate", "finding:new"),
     )
@@ -224,6 +247,17 @@ def test_fingerprint_changes_for_distinct_general_problem_identity():
     assert len(fingerprints) == 4
 
 
+def test_dedup_identity_requires_canonical_machine_ids():
+    for field, value in (
+        ("subsystem", "Pipeline Tablet Parsing"),
+        ("problem_key", "Verb stem overgeneration"),
+        ("problem_key", "verb_stem_overgeneration"),
+    ):
+        kwargs = {field: value}
+        with pytest.raises(ValueError, match=field):
+            _candidate(**kwargs)
+
+
 def test_existing_fingerprint_suppresses_duplicate_issue_creation():
     mod = _mod()
     candidate = _candidate()
@@ -239,15 +273,17 @@ def test_issue_body_contains_reproducible_run_model_skill_metric_and_expert_evid
         _occurrence(
             occurrence_id="a",
             tablet="KTU 1.1",
+            locus_ref="I:4",
             token_ids=("t1",),
             metric_refs=("metric:exact-set",),
             expert_feedback_refs=("expert:review-42",),
         ),
-        _occurrence(occurrence_id="b", tablet="KTU 1.2", token_ids=("t2",)),
+        _occurrence(occurrence_id="b", tablet="KTU 1.2", locus_ref="II:7", token_ids=("t2",)),
     )
     body = _plan(_candidate(occurrences=occurrences)).github_request.payload["body"]
     for expected in (
         "KTU 1.1",
+        "I:4",
         "t1",
         "run-a",
         "fixture-provider",
