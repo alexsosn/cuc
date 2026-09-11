@@ -1,8 +1,8 @@
 """Framework-neutral authorization boundary for development-controller GitHub effects.
 
-This module deliberately performs no network I/O.  A caller supplies a narrow adapter;
-all repository classification, task-policy checks, human approval and replay handling
-happen before that adapter is invoked.
+The module performs no network I/O. A caller supplies a narrow adapter; repository
+classification, task authorization, human approval and durable replay/uncertainty
+checks all happen before an adapter may be invoked.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class RepositoryClass(str, Enum):
 
 
 class GitHubAction(str, Enum):
-    """Closed action vocabulary exposed to development-controller helpers."""
+    """Closed action vocabulary; deliberately no raw/generic endpoint action."""
 
     READ = "read"
     CREATE_BRANCH = "create-branch"
@@ -81,8 +81,6 @@ def _canonical_repository(value: object) -> str:
         return _FORK
     if folded == _UPSTREAM.casefold():
         return _UPSTREAM
-    # GitHub repository identities are case-insensitive.  Canonicalize unknown values so
-    # case tricks cannot create multiple policy identities for the same destination.
     owner, repo = text.split("/", 1)
     return f"{owner.casefold()}/{repo.casefold()}"
 
@@ -97,8 +95,6 @@ def classify_repository(value: object) -> RepositoryClass:
 
 
 def _json_value(value: object, path: str = "payload") -> object:
-    """Validate and copy one JSON value, rejecting ambiguous/non-finite shapes."""
-
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
@@ -120,9 +116,8 @@ def _json_value(value: object, path: str = "payload") -> object:
 def _payload_json(payload: object) -> str:
     if not isinstance(payload, Mapping):
         raise ValueError("payload must be a JSON object")
-    normalized = _json_value(payload)
     return json.dumps(
-        normalized,
+        _json_value(payload),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -139,27 +134,53 @@ def _object_sequence(value: object, field: str) -> tuple[object, ...]:
         raise ValueError(f"{field} must be an array") from exc
 
 
+def _text_sequence(value: object, field: str) -> tuple[str, ...]:
+    items = _object_sequence(value, field)
+    normalized = tuple(_required_text(item, field) for item in items)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{field} must not contain duplicates")
+    return normalized
+
+
 @dataclass(frozen=True)
 class GitHubTaskPolicy:
+    """Task-local authority supplied by the development controller.
+
+    `allowed_operation_ids` is the bridge to HARN-002: HARN-010 constructs it
+    from operation IDs declared for the current development work instead of letting a
+    model invent an execution identity at call time.
+    """
+
     allowed_fork_write_actions: tuple[GitHubAction, ...] = ()
+    allowed_operation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        raw = _object_sequence(self.allowed_fork_write_actions, "allowed_fork_write_actions")
-        actions = tuple(_action(item, "allowed_fork_write_actions") for item in raw)
+        raw_actions = _object_sequence(
+            self.allowed_fork_write_actions, "allowed_fork_write_actions"
+        )
+        actions = tuple(_action(item, "allowed_fork_write_actions") for item in raw_actions)
         if GitHubAction.READ in actions:
             raise ValueError("READ is not a fork write action")
         if len(actions) != len(set(actions)):
             raise ValueError("allowed_fork_write_actions must not contain duplicates")
+        operations = _text_sequence(self.allowed_operation_ids, "allowed_operation_ids")
         object.__setattr__(self, "allowed_fork_write_actions", actions)
+        object.__setattr__(self, "allowed_operation_ids", operations)
 
     def to_dict(self) -> dict[str, object]:
-        return {"allowed_fork_write_actions": [item.value for item in self.allowed_fork_write_actions]}
+        return {
+            "allowed_fork_write_actions": [item.value for item in self.allowed_fork_write_actions],
+            "allowed_operation_ids": list(self.allowed_operation_ids),
+        }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "GitHubTaskPolicy":
         if not isinstance(payload, Mapping):
             raise ValueError("GitHubTaskPolicy payload must be an object")
-        return cls(payload.get("allowed_fork_write_actions", ()))
+        return cls(
+            payload.get("allowed_fork_write_actions", ()),
+            payload.get("allowed_operation_ids", ()),
+        )
 
 
 @dataclass(frozen=True, init=False)
@@ -199,8 +220,6 @@ class GitHubEffectRequest:
 
     @property
     def payload(self) -> dict[str, Any]:
-        # Return a fresh copy so adapter/caller mutation cannot alter the authenticated
-        # request that approvals and receipts are bound to.
         return json.loads(self._payload_json)
 
     def to_dict(self) -> dict[str, object]:
@@ -242,6 +261,15 @@ class HumanApprovalChallenge:
         object.__setattr__(self, "repository", _canonical_repository(self.repository))
         object.__setattr__(self, "action", _action(self.action))
         object.__setattr__(self, "reason", _required_text(self.reason, "reason"))
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "operation_id": self.operation_id,
+            "request_sha256": self.request_sha256,
+            "repository": self.repository,
+            "action": self.action.value,
+            "reason": self.reason,
+        }
 
 
 @dataclass(frozen=True)
@@ -317,32 +345,88 @@ class GitHubEffectReceipt:
 
 
 @dataclass(frozen=True)
+class GitHubEffectUncertainRequest:
+    """Durable quarantine marker for an adapter call with unknown external outcome."""
+
+    operation_id: str
+    request_sha256: str
+    repository: str
+    action: GitHubAction
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operation_id", _required_text(self.operation_id, "operation_id"))
+        object.__setattr__(self, "request_sha256", _digest(self.request_sha256, "request_sha256"))
+        object.__setattr__(self, "repository", _canonical_repository(self.repository))
+        object.__setattr__(self, "action", _action(self.action))
+        if self.action is GitHubAction.READ:
+            raise ValueError("uncertain request must be a write action")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "operation_id": self.operation_id,
+            "request_sha256": self.request_sha256,
+            "repository": self.repository,
+            "action": self.action.value,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "GitHubEffectUncertainRequest":
+        if not isinstance(payload, Mapping):
+            raise ValueError("uncertain request payload must be an object")
+        return cls(
+            payload["operation_id"],
+            payload["request_sha256"],
+            payload["repository"],
+            payload["action"],
+        )
+
+
+@dataclass(frozen=True)
 class GitHubEffectJournal:
     approvals: tuple[HumanApproval, ...] = ()
     receipts: tuple[GitHubEffectReceipt, ...] = ()
+    uncertain_requests: tuple[GitHubEffectUncertainRequest, ...] = ()
 
     def __post_init__(self) -> None:
         raw_approvals = _object_sequence(self.approvals, "approvals")
         raw_receipts = _object_sequence(self.receipts, "receipts")
+        raw_uncertain = _object_sequence(self.uncertain_requests, "uncertain_requests")
         if any(not isinstance(item, HumanApproval) for item in raw_approvals):
             raise ValueError("approvals must contain HumanApproval values")
         if any(not isinstance(item, GitHubEffectReceipt) for item in raw_receipts):
             raise ValueError("receipts must contain GitHubEffectReceipt values")
+        if any(not isinstance(item, GitHubEffectUncertainRequest) for item in raw_uncertain):
+            raise ValueError("uncertain_requests must contain GitHubEffectUncertainRequest values")
         approvals = tuple(raw_approvals)  # type: ignore[assignment]
         receipts = tuple(raw_receipts)  # type: ignore[assignment]
+        uncertain = tuple(raw_uncertain)  # type: ignore[assignment]
 
         approval_ids = tuple(item.approval_id for item in approvals)
         approval_operations = tuple(item.operation_id for item in approvals)
         receipt_operations = tuple(item.operation_id for item in receipts)
+        uncertain_operations = tuple(item.operation_id for item in uncertain)
         if len(approval_ids) != len(set(approval_ids)):
             raise ValueError("approval IDs must be unique")
         if len(approval_operations) != len(set(approval_operations)):
             raise ValueError("an operation may have at most one approval")
         if len(receipt_operations) != len(set(receipt_operations)):
             raise ValueError("receipt operation IDs must be unique")
+        if len(uncertain_operations) != len(set(uncertain_operations)):
+            raise ValueError("uncertain operation IDs must be unique")
+        overlap = set(receipt_operations) & set(uncertain_operations)
+        if overlap:
+            raise ValueError(
+                "an operation cannot be both successfully receipted and uncertain: "
+                + ", ".join(sorted(overlap))
+            )
 
         object.__setattr__(self, "approvals", approvals)
         object.__setattr__(self, "receipts", receipts)
+        object.__setattr__(self, "uncertain_requests", uncertain)
+
+    @property
+    def uncertain_operations(self) -> tuple[str, ...]:
+        return tuple(item.operation_id for item in self.uncertain_requests)
 
     def approval_for(self, operation_id: str) -> HumanApproval | None:
         operation_id = _required_text(operation_id, "operation_id")
@@ -351,6 +435,13 @@ class GitHubEffectJournal:
     def receipt_for(self, operation_id: str) -> GitHubEffectReceipt | None:
         operation_id = _required_text(operation_id, "operation_id")
         return next((item for item in self.receipts if item.operation_id == operation_id), None)
+
+    def uncertain_for(self, operation_id: str) -> GitHubEffectUncertainRequest | None:
+        operation_id = _required_text(operation_id, "operation_id")
+        return next(
+            (item for item in self.uncertain_requests if item.operation_id == operation_id),
+            None,
+        )
 
     def with_approval(self, approval: HumanApproval) -> "GitHubEffectJournal":
         if not isinstance(approval, HumanApproval):
@@ -362,22 +453,45 @@ class GitHubEffectJournal:
             raise ValueError("operation already has a different approval")
         if any(item.approval_id == approval.approval_id for item in self.approvals):
             raise ValueError("approval ID already exists")
-        return GitHubEffectJournal(self.approvals + (approval,), self.receipts)
+        return GitHubEffectJournal(
+            self.approvals + (approval,), self.receipts, self.uncertain_requests
+        )
 
     def with_receipt(self, receipt: GitHubEffectReceipt) -> "GitHubEffectJournal":
         if not isinstance(receipt, GitHubEffectReceipt):
             raise ValueError("receipt must be GitHubEffectReceipt")
+        if self.uncertain_for(receipt.operation_id) is not None:
+            raise ValueError("cannot record success while operation outcome is uncertain")
         existing = self.receipt_for(receipt.operation_id)
         if existing is not None:
             if existing == receipt:
                 return self
             raise ValueError("operation already has a different receipt")
-        return GitHubEffectJournal(self.approvals, self.receipts + (receipt,))
+        return GitHubEffectJournal(
+            self.approvals, self.receipts + (receipt,), self.uncertain_requests
+        )
+
+    def with_uncertain_request(
+        self, request: GitHubEffectUncertainRequest
+    ) -> "GitHubEffectJournal":
+        if not isinstance(request, GitHubEffectUncertainRequest):
+            raise ValueError("request must be GitHubEffectUncertainRequest")
+        if self.receipt_for(request.operation_id) is not None:
+            raise ValueError("successfully receipted operation cannot become uncertain")
+        existing = self.uncertain_for(request.operation_id)
+        if existing is not None:
+            if existing == request:
+                return self
+            raise ValueError("operation ID uncertainty conflicts with a different request")
+        return GitHubEffectJournal(
+            self.approvals, self.receipts, self.uncertain_requests + (request,)
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
             "approvals": [item.to_dict() for item in self.approvals],
             "receipts": [item.to_dict() for item in self.receipts],
+            "uncertain_requests": [item.to_dict() for item in self.uncertain_requests],
         }
 
     @classmethod
@@ -386,9 +500,13 @@ class GitHubEffectJournal:
             raise ValueError("GitHubEffectJournal payload must be an object")
         approvals = _object_sequence(payload.get("approvals", ()), "approvals")
         receipts = _object_sequence(payload.get("receipts", ()), "receipts")
+        uncertain = _object_sequence(
+            payload.get("uncertain_requests", ()), "uncertain_requests"
+        )
         return cls(
             tuple(HumanApproval.from_dict(item) for item in approvals),  # type: ignore[arg-type]
             tuple(GitHubEffectReceipt.from_dict(item) for item in receipts),  # type: ignore[arg-type]
+            tuple(GitHubEffectUncertainRequest.from_dict(item) for item in uncertain),  # type: ignore[arg-type]
         )
 
 
@@ -401,6 +519,31 @@ class HumanApprovalRequired(RuntimeError):
         self.challenge = challenge
         super().__init__(
             f"human approval required for {challenge.action.value} on {challenge.repository}"
+        )
+
+
+class AdapterEffectNotExecuted(RuntimeError):
+    """Adapter assertion that no external mutation occurred and a retry is safe."""
+
+
+class GitHubEffectOutcomeUnknown(RuntimeError):
+    """An adapter call may have mutated GitHub; automatic retry is quarantined."""
+
+    def __init__(
+        self,
+        journal: GitHubEffectJournal,
+        request: GitHubEffectRequest,
+        cause: Exception | None = None,
+    ) -> None:
+        if not isinstance(journal, GitHubEffectJournal):
+            raise ValueError("journal must be GitHubEffectJournal")
+        if not isinstance(request, GitHubEffectRequest):
+            raise ValueError("request must be GitHubEffectRequest")
+        self.journal = journal
+        self.request = request
+        self.cause = cause
+        super().__init__(
+            "GitHub effect outcome is uncertain; reconcile the external state before retry"
         )
 
 
@@ -431,21 +574,23 @@ class GitHubEffectGateway:
             raise PermissionError("reads from unknown repositories are outside this task boundary")
         return repository_class
 
-    def _validate_prior_receipt(
-        self,
+    @staticmethod
+    def _assert_same_request_identity(
         request: GitHubEffectRequest,
-        journal: GitHubEffectJournal,
-    ) -> GitHubEffectReceipt | None:
-        receipt = journal.receipt_for(request.operation_id)
-        if receipt is None:
-            return None
+        *,
+        request_sha256: str,
+        repository: str,
+        action: GitHubAction,
+        label: str,
+    ) -> None:
         if (
-            receipt.request_sha256 != request.request_sha256
-            or receipt.repository != request.repository
-            or receipt.action is not request.action
+            request_sha256 != request.request_sha256
+            or repository != request.repository
+            or action is not request.action
         ):
-            raise ValueError("operation ID reuse conflicts with the persisted request digest")
-        return receipt
+            raise ValueError(
+                f"operation ID reuse conflicts with the persisted {label} request digest"
+            )
 
     def execute_write(
         self,
@@ -458,10 +603,32 @@ class GitHubEffectGateway:
             raise ValueError("journal must be GitHubEffectJournal")
         if request.action not in _WRITE_ACTIONS:
             raise PermissionError("READ is not a write action")
+        if request.operation_id not in self._policy.allowed_operation_ids:
+            raise PermissionError(
+                "write operation ID was not declared by the current task policy"
+            )
 
-        prior = self._validate_prior_receipt(request, journal)
+        prior = journal.receipt_for(request.operation_id)
         if prior is not None:
+            self._assert_same_request_identity(
+                request,
+                request_sha256=prior.request_sha256,
+                repository=prior.repository,
+                action=prior.action,
+                label="receipt",
+            )
             return journal, prior
+
+        uncertain = journal.uncertain_for(request.operation_id)
+        if uncertain is not None:
+            self._assert_same_request_identity(
+                request,
+                request_sha256=uncertain.request_sha256,
+                repository=uncertain.repository,
+                action=uncertain.action,
+                label="uncertain",
+            )
+            raise GitHubEffectOutcomeUnknown(journal, request)
 
         repository_class = classify_repository(request.repository)
         if repository_class is RepositoryClass.FORK:
@@ -488,11 +655,24 @@ class GitHubEffectGateway:
         else:
             raise PermissionError("writes to an unknown repository are denied")
 
-        # The adapter sees an immutable authenticated request object.  No receipt is
-        # persisted until it returns successfully, so a transient failure is retryable.
-        result_ref = self.__adapter.execute(request)
-        if not isinstance(result_ref, str) or not result_ref.strip():
-            raise ValueError("GitHub adapter success must return a non-empty result reference")
+        try:
+            result_ref = self.__adapter.execute(request)
+            if not isinstance(result_ref, str) or not result_ref.strip():
+                raise ValueError(
+                    "GitHub adapter returned no durable result reference after a possible write"
+                )
+        except AdapterEffectNotExecuted:
+            raise
+        except Exception as exc:
+            uncertain_request = GitHubEffectUncertainRequest(
+                request.operation_id,
+                request.request_sha256,
+                request.repository,
+                request.action,
+            )
+            uncertain_journal = journal.with_uncertain_request(uncertain_request)
+            raise GitHubEffectOutcomeUnknown(uncertain_journal, request, exc) from exc
+
         receipt = GitHubEffectReceipt(
             request.operation_id,
             request.request_sha256,
