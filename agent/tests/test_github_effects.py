@@ -14,21 +14,25 @@ def _runtime():
 
 
 class FakeAdapter:
-    def __init__(self, *, fail_once: bool = False) -> None:
+    def __init__(self, *, failure=None) -> None:
         self.calls = []
-        self.fail_once = fail_once
+        self.failure = failure
 
     def execute(self, request):
         self.calls.append(request)
-        if self.fail_once:
-            self.fail_once = False
-            raise RuntimeError("transient fake adapter failure")
+        if self.failure is not None:
+            failure = self.failure
+            self.failure = None
+            raise failure
         return f"fake:{request.action.value}:{len(self.calls)}"
 
 
-def _policy(*actions):
+def _policy(*actions, operation_ids=()):
     runtime = _runtime()
-    return runtime.GitHubTaskPolicy(allowed_fork_write_actions=actions)
+    return runtime.GitHubTaskPolicy(
+        allowed_fork_write_actions=actions,
+        allowed_operation_ids=operation_ids,
+    )
 
 
 def test_repository_classification_is_exact_and_urls_do_not_bypass_it():
@@ -61,7 +65,11 @@ def test_fork_write_requires_task_policy_and_creates_attributable_receipt():
     runtime = _runtime()
     adapter = FakeAdapter()
     gateway = runtime.GitHubEffectGateway(
-        _policy(runtime.GitHubAction.CREATE_ISSUE), adapter
+        _policy(
+            runtime.GitHubAction.CREATE_ISSUE,
+            operation_ids=("op-fork-issue", "op-fork-pr"),
+        ),
+        adapter,
     )
     request = runtime.GitHubEffectRequest(
         "op-fork-issue",
@@ -88,10 +96,39 @@ def test_fork_write_requires_task_policy_and_creates_attributable_receipt():
     assert len(adapter.calls) == 1
 
 
+def test_write_operation_must_be_declared_by_task_policy_before_any_adapter_or_approval():
+    runtime = _runtime()
+    adapter = FakeAdapter()
+    gateway = runtime.GitHubEffectGateway(
+        _policy(runtime.GitHubAction.CREATE_ISSUE, operation_ids=("declared-op",)),
+        adapter,
+    )
+    undeclared_fork = runtime.GitHubEffectRequest(
+        "invented-op",
+        "alexsosn/cuc",
+        runtime.GitHubAction.CREATE_ISSUE,
+        {"title": "not attributable"},
+    )
+    with pytest.raises(PermissionError, match="operation|declared|policy"):
+        gateway.execute_write(undeclared_fork, runtime.GitHubEffectJournal())
+
+    undeclared_upstream = runtime.GitHubEffectRequest(
+        "invented-upstream-op",
+        "DT-UCPH/cuc",
+        runtime.GitHubAction.CREATE_ISSUE,
+        {"title": "must not even request approval"},
+    )
+    with pytest.raises(PermissionError, match="operation|declared|policy"):
+        gateway.execute_write(undeclared_upstream, runtime.GitHubEffectJournal())
+    assert adapter.calls == []
+
+
 def test_upstream_write_interrupts_before_adapter_and_exact_approval_unlocks_fake_execution():
     runtime = _runtime()
     adapter = FakeAdapter()
-    gateway = runtime.GitHubEffectGateway(_policy(), adapter)
+    gateway = runtime.GitHubEffectGateway(
+        _policy(operation_ids=("op-upstream-issue",)), adapter
+    )
     request = runtime.GitHubEffectRequest(
         "op-upstream-issue",
         "DT-UCPH/cuc",
@@ -123,7 +160,9 @@ def test_upstream_write_interrupts_before_adapter_and_exact_approval_unlocks_fak
 def test_upstream_approval_cannot_be_substituted_for_another_request():
     runtime = _runtime()
     adapter = FakeAdapter()
-    gateway = runtime.GitHubEffectGateway(_policy(), adapter)
+    gateway = runtime.GitHubEffectGateway(
+        _policy(operation_ids=("op-upstream-comment",)), adapter
+    )
     request = runtime.GitHubEffectRequest(
         "op-upstream-comment",
         "DT-UCPH/cuc",
@@ -146,7 +185,11 @@ def test_successful_effect_replays_from_serialized_receipt_without_duplicate_ada
     runtime = _runtime()
     adapter = FakeAdapter()
     gateway = runtime.GitHubEffectGateway(
-        _policy(runtime.GitHubAction.UPDATE_CONTENTS), adapter
+        _policy(
+            runtime.GitHubAction.UPDATE_CONTENTS,
+            operation_ids=("op-file-write",),
+        ),
+        adapter,
     )
     request = runtime.GitHubEffectRequest(
         "op-file-write",
@@ -173,10 +216,12 @@ def test_successful_effect_replays_from_serialized_receipt_without_duplicate_ada
     assert len(adapter.calls) == 1
 
 
-def test_upstream_approval_survives_resume_and_transient_failure_does_not_create_receipt():
+def test_upstream_approval_survives_resume_and_proven_no_effect_failure_can_retry():
     runtime = _runtime()
-    adapter = FakeAdapter(fail_once=True)
-    gateway = runtime.GitHubEffectGateway(_policy(), adapter)
+    adapter = FakeAdapter(failure=runtime.AdapterEffectNotExecuted("preflight failed"))
+    gateway = runtime.GitHubEffectGateway(
+        _policy(operation_ids=("op-upstream-pr",)), adapter
+    )
     request = runtime.GitHubEffectRequest(
         "op-upstream-pr",
         "DT-UCPH/cuc",
@@ -192,20 +237,54 @@ def test_upstream_approval_survives_resume_and_transient_failure_does_not_create
     journal = runtime.GitHubEffectJournal().with_approval(approval)
     restored = runtime.GitHubEffectJournal.from_dict(journal.to_dict())
 
-    with pytest.raises(RuntimeError, match="transient fake adapter failure"):
+    with pytest.raises(runtime.AdapterEffectNotExecuted, match="preflight failed"):
         gateway.execute_write(request, restored)
     assert restored.receipts == ()
+    assert restored.uncertain_operations == ()
 
     resumed, receipt = gateway.execute_write(request, restored)
     assert len(adapter.calls) == 2
     assert resumed.receipts == (receipt,)
 
 
+def test_ambiguous_adapter_failure_blocks_automatic_retry_after_possible_external_effect():
+    runtime = _runtime()
+    adapter = FakeAdapter(failure=RuntimeError("response lost after possible write"))
+    gateway = runtime.GitHubEffectGateway(
+        _policy(
+            runtime.GitHubAction.CREATE_ISSUE,
+            operation_ids=("op-ambiguous",),
+        ),
+        adapter,
+    )
+    request = runtime.GitHubEffectRequest(
+        "op-ambiguous",
+        "alexsosn/cuc",
+        runtime.GitHubAction.CREATE_ISSUE,
+        {"title": "could already exist"},
+    )
+    with pytest.raises(runtime.GitHubEffectOutcomeUnknown) as captured:
+        gateway.execute_write(request, runtime.GitHubEffectJournal())
+    uncertain = captured.value.journal
+    assert uncertain.uncertain_operations == (request.operation_id,)
+    assert uncertain.receipts == ()
+    assert len(adapter.calls) == 1
+
+    restored = runtime.GitHubEffectJournal.from_dict(uncertain.to_dict())
+    with pytest.raises(runtime.GitHubEffectOutcomeUnknown, match="reconcile|uncertain|unknown"):
+        gateway.execute_write(request, restored)
+    assert len(adapter.calls) == 1
+
+
 def test_generic_raw_actions_and_unknown_repository_writes_fail_closed():
     runtime = _runtime()
     adapter = FakeAdapter()
     gateway = runtime.GitHubEffectGateway(
-        _policy(runtime.GitHubAction.CREATE_ISSUE), adapter
+        _policy(
+            runtime.GitHubAction.CREATE_ISSUE,
+            operation_ids=("op-unknown",),
+        ),
+        adapter,
     )
     with pytest.raises(ValueError, match="action"):
         runtime.GitHubEffectRequest("op-raw", "alexsosn/cuc", "raw", {"url": "/repos/x/y"})
@@ -226,11 +305,13 @@ def test_generic_raw_actions_and_unknown_repository_writes_fail_closed():
 def test_journal_rejects_malformed_collections_duplicates_and_invalid_receipts():
     runtime = _runtime()
     with pytest.raises(ValueError, match="approvals"):
-        runtime.GitHubEffectJournal.from_dict({"approvals": "not-a-list", "receipts": []})
+        runtime.GitHubEffectJournal.from_dict(
+            {"approvals": "not-a-list", "receipts": [], "uncertain_requests": []}
+        )
 
     approval = runtime.HumanApproval("approval-1", "human", "op-1", "1" * 64)
     with pytest.raises(ValueError, match="approval"):
-        runtime.GitHubEffectJournal((approval, approval), ())
+        runtime.GitHubEffectJournal((approval, approval), (), ())
 
     receipt = runtime.GitHubEffectReceipt(
         "op-1",
@@ -240,7 +321,7 @@ def test_journal_rejects_malformed_collections_duplicates_and_invalid_receipts()
         "fake:1",
     )
     with pytest.raises(ValueError, match="receipt|operation"):
-        runtime.GitHubEffectJournal((), (receipt, receipt))
+        runtime.GitHubEffectJournal((), (receipt, receipt), ())
     with pytest.raises(ValueError, match="sha|digest"):
         runtime.GitHubEffectReceipt(
             "op-2", "not-a-digest", "alexsosn/cuc", runtime.GitHubAction.CREATE_ISSUE, "x"
