@@ -7,6 +7,7 @@ WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 UPSTREAM = "DT-UCPH/cuc"
 DIRECT_GITHUB_TRANSPORT_MARKERS = (
     "api.github.com",
+    "gh api",
     "gh pr create",
     "gh issue create",
     "gh pr comment",
@@ -55,6 +56,25 @@ def test_workflows_do_not_grant_issue_or_pull_request_write_permissions():
         assert not re.search(r"(?m)^\s*pull-requests\s*:\s*write\s*$", lowered)
 
 
+def test_development_harness_has_no_direct_github_transport():
+    """The controller harness must reach writes only through the injected gateway adapter.
+
+    This scan is intentionally independent of a literal upstream repository string: a
+    generic direct transport accepting a caller-supplied repository would otherwise be
+    an upstream-bypass surface even if `DT-UCPH/cuc` never appeared in source text.
+    """
+    root = REPO_ROOT / "agent" / "harness"
+    offenders = []
+    if root.exists():
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".py", ".sh"}:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if any(marker in text for marker in DIRECT_GITHUB_TRANSPORT_MARKERS):
+                offenders.append(str(path.relative_to(REPO_ROOT)))
+    assert not offenders, f"development harness contains direct GitHub transport: {offenders}"
+
+
 def test_automation_does_not_target_upstream_writes():
     roots = [
         REPO_ROOT / ".github",
@@ -83,10 +103,6 @@ def test_automation_does_not_target_upstream_writes():
             if UPSTREAM not in text:
                 continue
             if any(marker in text for marker in upstream_write_markers):
-                offenders.append(str(path.relative_to(REPO_ROOT)))
-            elif path.is_relative_to(REPO_ROOT / "agent" / "harness") and any(
-                marker in text for marker in DIRECT_GITHUB_TRANSPORT_MARKERS
-            ):
                 offenders.append(str(path.relative_to(REPO_ROOT)))
 
     assert not offenders, f"automation may write to upstream {UPSTREAM}: {offenders}"
