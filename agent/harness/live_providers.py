@@ -1,14 +1,13 @@
 """Bounded live-provider execution for the HARN-016 complete-column benchmark.
 
-The provider boundary is intentionally narrow. HARN-016 remains responsible for
-benchmark scheduling/comparability and HARN-004 remains responsible for scholarly
-state transitions. This module supplies model decisions, enforces live-call policy,
-and emits redacted execution artifacts.
+HARN-016 owns benchmark scheduling/comparability and HARN-004 owns scholarly
+state transitions. This module supplies provider decisions, enforces live-call
+policy, and emits redacted execution artifacts.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from hashlib import sha256
 import json
@@ -21,7 +20,6 @@ from urllib import request as urllib_request
 from .column_state import (
     ColumnRunState,
     CorpusReconciliationFinding,
-    EvidenceRecord,
     ReconciliationScope,
     RevisitRequest,
     TokenDecision,
@@ -74,7 +72,7 @@ def _mapping(value: object, field_name: str) -> Mapping[str, Any]:
 
 
 def _safe_json_value(value: object, field_name: str = "value") -> Any:
-    """Convert known checkpoint/domain values to JSON without falling back to repr()."""
+    """Convert known domain values without ever falling back to repr()."""
 
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -107,7 +105,7 @@ def _digest(value: object) -> str:
 
 
 class ProviderError(RuntimeError):
-    """Base provider-boundary error. Messages are never persisted by this module."""
+    """Base provider-boundary error; messages are never persisted here."""
 
 
 class ProviderCredentialError(ProviderError):
@@ -142,10 +140,14 @@ class ProviderUsage:
 
     def __post_init__(self) -> None:
         object.__setattr__(
-            self, "input_tokens", _nonnegative_int(self.input_tokens, "input_tokens")
+            self,
+            "input_tokens",
+            _nonnegative_int(self.input_tokens, "input_tokens"),
         )
         object.__setattr__(
-            self, "output_tokens", _nonnegative_int(self.output_tokens, "output_tokens")
+            self,
+            "output_tokens",
+            _nonnegative_int(self.output_tokens, "output_tokens"),
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -169,7 +171,9 @@ class ProviderResponse:
             raise ValueError("usage must be ProviderUsage")
         if self.request_id is not None:
             object.__setattr__(
-                self, "request_id", _required_text(self.request_id, "request_id")
+                self,
+                "request_id",
+                _required_text(self.request_id, "request_id"),
             )
 
     def to_dict(self) -> dict[str, object]:
@@ -196,14 +200,20 @@ class ProviderJSONRequest:
             raise ValueError("operation must be adjudicate or reconcile")
         object.__setattr__(self, "operation", operation)
         object.__setattr__(
-            self, "requested_model", _required_text(self.requested_model, "requested_model")
+            self,
+            "requested_model",
+            _required_text(self.requested_model, "requested_model"),
         )
         object.__setattr__(
-            self, "system_prompt", _required_text(self.system_prompt, "system_prompt")
+            self,
+            "system_prompt",
+            _required_text(self.system_prompt, "system_prompt"),
         )
         object.__setattr__(self, "payload", dict(_mapping(self.payload, "payload")))
         object.__setattr__(
-            self, "output_schema", dict(_mapping(self.output_schema, "output_schema"))
+            self,
+            "output_schema",
+            dict(_mapping(self.output_schema, "output_schema")),
         )
         object.__setattr__(
             self,
@@ -224,17 +234,26 @@ class ProviderJSONRequest:
 
 class ProviderJSONClient(Protocol):
     provider: str
+    # Production/custom clients should declare this. The built-in network clients do.
+    execution_kind: ExecutionKind
 
     def count_input_tokens(
-        self, request: ProviderJSONRequest, timeout_seconds: float
+        self,
+        request: ProviderJSONRequest,
+        timeout_seconds: float,
     ) -> int: ...
 
     def generate_json(
-        self, request: ProviderJSONRequest, timeout_seconds: float
+        self,
+        request: ProviderJSONRequest,
+        timeout_seconds: float,
     ) -> ProviderResponse: ...
 
 
-HttpJSON = Callable[[str, Mapping[str, str], Mapping[str, Any], float], Mapping[str, Any]]
+HttpJSON = Callable[
+    [str, Mapping[str, str], Mapping[str, Any], float],
+    Mapping[str, Any],
+]
 
 
 def _default_http_json(
@@ -243,7 +262,11 @@ def _default_http_json(
     body: Mapping[str, Any],
     timeout_seconds: float,
 ) -> Mapping[str, Any]:
-    data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    data = json.dumps(
+        body,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     req = urllib_request.Request(
         url,
         data=data,
@@ -254,7 +277,7 @@ def _default_http_json(
         with urllib_request.urlopen(req, timeout=timeout_seconds) as response:
             raw = response.read().decode("utf-8")
     except urllib_error.HTTPError as exc:
-        # Never retain provider error bodies: they can echo request details.
+        # Never persist provider error bodies: they can echo request details.
         if exc.code in {408, 409, 429} or exc.code >= 500:
             raise ProviderTransientError(f"provider HTTP {exc.code}") from None
         raise ProviderPermanentError(f"provider HTTP {exc.code}") from None
@@ -271,6 +294,7 @@ def _default_http_json(
 
 class _EnvironmentCredentialClient:
     provider: str
+    execution_kind = ExecutionKind.LIVE_PROVIDER
 
     def __init__(
         self,
@@ -323,7 +347,11 @@ class OpenAIResponsesClient(_EnvironmentCredentialClient):
         }
 
     @staticmethod
-    def _body(request: ProviderJSONRequest, *, include_output_limit: bool) -> dict[str, Any]:
+    def _body(
+        request: ProviderJSONRequest,
+        *,
+        include_output_limit: bool,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": request.requested_model,
             "instructions": request.system_prompt,
@@ -341,7 +369,11 @@ class OpenAIResponsesClient(_EnvironmentCredentialClient):
             body["max_output_tokens"] = request.max_output_tokens
         return body
 
-    def count_input_tokens(self, request: ProviderJSONRequest, timeout_seconds: float) -> int:
+    def count_input_tokens(
+        self,
+        request: ProviderJSONRequest,
+        timeout_seconds: float,
+    ) -> int:
         result = self._http_json(
             f"{self._base_url}/responses/input_tokens",
             self._headers(),
@@ -366,13 +398,18 @@ class OpenAIResponsesClient(_EnvironmentCredentialClient):
                 for part in content:
                     if not isinstance(part, Mapping):
                         continue
-                    if part.get("type") in {"output_text", "text"}:
-                        text = part.get("text")
-                        if isinstance(text, str) and text.strip():
-                            return text
+                    if part.get("type") not in {"output_text", "text"}:
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        return text
         raise ProviderPermanentError("OpenAI response has no output text")
 
-    def generate_json(self, request: ProviderJSONRequest, timeout_seconds: float) -> ProviderResponse:
+    def generate_json(
+        self,
+        request: ProviderJSONRequest,
+        timeout_seconds: float,
+    ) -> ProviderResponse:
         result = self._http_json(
             f"{self._base_url}/responses",
             self._headers(),
@@ -382,17 +419,28 @@ class OpenAIResponsesClient(_EnvironmentCredentialClient):
         try:
             payload = json.loads(self._output_text(result))
         except json.JSONDecodeError:
-            raise ProviderPermanentError("OpenAI structured output is invalid JSON") from None
+            raise ProviderPermanentError(
+                "OpenAI structured output is invalid JSON"
+            ) from None
         usage = _mapping(result.get("usage"), "usage")
+        request_id = result.get("id")
         return ProviderResponse(
             model=_required_text(result.get("model"), "model"),
             payload=_mapping(payload, "structured output"),
             usage=ProviderUsage(
-                _nonnegative_int(usage.get("input_tokens"), "usage.input_tokens"),
-                _nonnegative_int(usage.get("output_tokens"), "usage.output_tokens"),
+                _nonnegative_int(
+                    usage.get("input_tokens"),
+                    "usage.input_tokens",
+                ),
+                _nonnegative_int(
+                    usage.get("output_tokens"),
+                    "usage.output_tokens",
+                ),
             ),
             request_id=(
-                _required_text(result.get("id"), "id") if result.get("id") is not None else None
+                None
+                if request_id is None
+                else _required_text(request_id, "id")
             ),
         )
 
@@ -413,7 +461,10 @@ class AnthropicMessagesClient(_EnvironmentCredentialClient):
             http_json=http_json,
             base_url=base_url,
         )
-        self._anthropic_version = _required_text(anthropic_version, "anthropic_version")
+        self._anthropic_version = _required_text(
+            anthropic_version,
+            "anthropic_version",
+        )
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -423,11 +474,20 @@ class AnthropicMessagesClient(_EnvironmentCredentialClient):
         }
 
     @staticmethod
-    def _body(request: ProviderJSONRequest, *, include_output_limit: bool) -> dict[str, Any]:
+    def _body(
+        request: ProviderJSONRequest,
+        *,
+        include_output_limit: bool,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": request.requested_model,
             "system": request.system_prompt,
-            "messages": [{"role": "user", "content": _canonical_json(request.payload)}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": _canonical_json(request.payload),
+                }
+            ],
             "output_config": {
                 "format": {
                     "type": "json_schema",
@@ -439,7 +499,11 @@ class AnthropicMessagesClient(_EnvironmentCredentialClient):
             body["max_tokens"] = request.max_output_tokens
         return body
 
-    def count_input_tokens(self, request: ProviderJSONRequest, timeout_seconds: float) -> int:
+    def count_input_tokens(
+        self,
+        request: ProviderJSONRequest,
+        timeout_seconds: float,
+    ) -> int:
         result = self._http_json(
             f"{self._base_url}/messages/count_tokens",
             self._headers(),
@@ -453,14 +517,20 @@ class AnthropicMessagesClient(_EnvironmentCredentialClient):
         content = result.get("content")
         if isinstance(content, list):
             for block in content:
-                if not isinstance(block, Mapping) or block.get("type") != "text":
+                if not isinstance(block, Mapping):
+                    continue
+                if block.get("type") != "text":
                     continue
                 text = block.get("text")
                 if isinstance(text, str) and text.strip():
                     return text
         raise ProviderPermanentError("Anthropic response has no text content")
 
-    def generate_json(self, request: ProviderJSONRequest, timeout_seconds: float) -> ProviderResponse:
+    def generate_json(
+        self,
+        request: ProviderJSONRequest,
+        timeout_seconds: float,
+    ) -> ProviderResponse:
         result = self._http_json(
             f"{self._base_url}/messages",
             self._headers(),
@@ -470,25 +540,36 @@ class AnthropicMessagesClient(_EnvironmentCredentialClient):
         try:
             payload = json.loads(self._output_text(result))
         except json.JSONDecodeError:
-            raise ProviderPermanentError("Anthropic structured output is invalid JSON") from None
+            raise ProviderPermanentError(
+                "Anthropic structured output is invalid JSON"
+            ) from None
         usage = _mapping(result.get("usage"), "usage")
         input_tokens = sum(
-            _nonnegative_int(usage.get(field_name, 0), f"usage.{field_name}")
+            _nonnegative_int(
+                usage.get(field_name, 0),
+                f"usage.{field_name}",
+            )
             for field_name in (
                 "input_tokens",
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
             )
         )
+        request_id = result.get("id")
         return ProviderResponse(
             model=_required_text(result.get("model"), "model"),
             payload=_mapping(payload, "structured output"),
             usage=ProviderUsage(
                 input_tokens,
-                _nonnegative_int(usage.get("output_tokens"), "usage.output_tokens"),
+                _nonnegative_int(
+                    usage.get("output_tokens"),
+                    "usage.output_tokens",
+                ),
             ),
             request_id=(
-                _required_text(result.get("id"), "id") if result.get("id") is not None else None
+                None
+                if request_id is None
+                else _required_text(request_id, "id")
             ),
         )
 
@@ -523,7 +604,10 @@ class ProviderBudgetPolicy:
         object.__setattr__(
             self,
             "max_retries_per_request",
-            _nonnegative_int(self.max_retries_per_request, "max_retries_per_request"),
+            _nonnegative_int(
+                self.max_retries_per_request,
+                "max_retries_per_request",
+            ),
         )
         object.__setattr__(
             self,
@@ -557,21 +641,36 @@ class LiveProviderBinding:
         if not isinstance(self.spec, BenchmarkBackendSpec):
             raise ValueError("spec must be BenchmarkBackendSpec")
         requested = _required_text(self.requested_model, "requested_model")
-        exact = _required_text(self.exact_model_version, "exact_model_version")
+        exact = _required_text(
+            self.exact_model_version,
+            "exact_model_version",
+        )
         provenance = _required_text(
-            self.exact_version_provenance, "exact_version_provenance"
+            self.exact_version_provenance,
+            "exact_version_provenance",
         )
         if exact.lower() in _AMBIGUOUS_VERSION_MARKERS:
             raise ValueError("exact model version is ambiguous")
         if self.spec.model_version != exact:
-            raise ValueError("BenchmarkBackendSpec model_version must equal exact_model_version")
+            raise ValueError(
+                "BenchmarkBackendSpec model_version must equal exact_model_version"
+            )
+        # If an alias/family is requested, it must be part of HARN-016 identity.
+        # An exact requested snapshot is already bound by model_version.
+        if requested != exact and self.spec.model_id != requested:
+            raise ValueError(
+                "requested_model must equal BenchmarkBackendSpec model_id "
+                "when it differs from exact_model_version"
+            )
         provider = getattr(self.client, "provider", None)
         if provider != self.spec.model_provider:
-            raise ValueError("provider client does not match BenchmarkBackendSpec provider")
-        if not callable(getattr(self.client, "count_input_tokens", None)) or not callable(
-            getattr(self.client, "generate_json", None)
-        ):
-            raise ValueError("client must implement ProviderJSONClient")
+            raise ValueError(
+                "provider client does not match BenchmarkBackendSpec provider"
+            )
+        if not callable(getattr(self.client, "count_input_tokens", None)):
+            raise ValueError("client must implement count_input_tokens")
+        if not callable(getattr(self.client, "generate_json", None)):
+            raise ValueError("client must implement generate_json")
         try:
             kind = (
                 self.execution_kind
@@ -580,6 +679,20 @@ class LiveProviderBinding:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid execution_kind") from exc
+        client_kind_raw = getattr(self.client, "execution_kind", None)
+        if client_kind_raw is not None:
+            try:
+                client_kind = (
+                    client_kind_raw
+                    if isinstance(client_kind_raw, ExecutionKind)
+                    else ExecutionKind(client_kind_raw)
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("client declares invalid execution kind") from exc
+            if client_kind is not kind:
+                raise ValueError(
+                    "binding execution kind contradicts client execution kind"
+                )
         object.__setattr__(self, "requested_model", requested)
         object.__setattr__(self, "exact_model_version", exact)
         object.__setattr__(self, "exact_version_provenance", provenance)
@@ -619,10 +732,16 @@ class ProviderTrialArtifact:
     backend_id: str
     run_id: str
     execution_kind: str
+    provider: str
+    requested_model: str
+    exact_model_version: str
+    model_config_sha256: str
+    exact_version_provenance_sha256: str
     terminal_status: str
     request_count: int
     input_tokens: int
     output_tokens: int
+    output_tokens_reserved: int
     retries: int
     budget_exhausted: bool
     calls: tuple[ProviderCallArtifact, ...] = ()
@@ -632,10 +751,18 @@ class ProviderTrialArtifact:
             "backend_id": self.backend_id,
             "run_id": self.run_id,
             "execution_kind": self.execution_kind,
+            "provider": self.provider,
+            "requested_model": self.requested_model,
+            "exact_model_version": self.exact_model_version,
+            "model_config_sha256": self.model_config_sha256,
+            "exact_version_provenance_sha256": (
+                self.exact_version_provenance_sha256
+            ),
             "terminal_status": self.terminal_status,
             "request_count": self.request_count,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "output_tokens_reserved": self.output_tokens_reserved,
             "retries": self.retries,
             "budget_exhausted": self.budget_exhausted,
             "calls": [item.to_dict() for item in self.calls],
@@ -649,7 +776,7 @@ class LiveBenchmarkRunResult:
     complete: bool
 
     def to_dict(self) -> dict[str, object]:
-        # Deliberately omit full HARN-015 evaluations/targets from the provider artifact.
+        # Never serialize full HARN-015 evaluator targets into provider artifacts.
         return {
             "case_id": self.benchmark.case_id,
             "complete": self.complete,
@@ -664,7 +791,9 @@ class LiveBenchmarkRunResult:
                 }
                 for item in self.benchmark.results
             ],
-            "provider_trials": [item.to_dict() for item in self.provider_trials],
+            "provider_trials": [
+                item.to_dict() for item in self.provider_trials
+            ],
         }
 
     def to_json(self) -> str:
@@ -704,17 +833,26 @@ class _BudgetLedger:
         trial = self._trial(run_id)
         p = self.policy
         if trial.requests + 1 > p.max_generation_requests_per_trial:
-            raise ProviderBudgetExceeded("trial generation request budget exhausted")
+            raise ProviderBudgetExceeded(
+                "trial generation request budget exhausted"
+            )
         if self.total.requests + 1 > p.max_generation_requests_per_benchmark:
-            raise ProviderBudgetExceeded("benchmark generation request budget exhausted")
+            raise ProviderBudgetExceeded(
+                "benchmark generation request budget exhausted"
+            )
         if trial.input_tokens + input_tokens > p.max_input_tokens_per_trial:
             raise ProviderBudgetExceeded("trial input-token budget exhausted")
         if self.total.input_tokens + input_tokens > p.max_input_tokens_per_benchmark:
-            raise ProviderBudgetExceeded("benchmark input-token budget exhausted")
+            raise ProviderBudgetExceeded(
+                "benchmark input-token budget exhausted"
+            )
 
-        remaining_trial_output = p.max_output_tokens_per_trial - trial.output_tokens_reserved
+        remaining_trial_output = (
+            p.max_output_tokens_per_trial - trial.output_tokens_reserved
+        )
         remaining_total_output = (
-            p.max_output_tokens_per_benchmark - self.total.output_tokens_reserved
+            p.max_output_tokens_per_benchmark
+            - self.total.output_tokens_reserved
         )
         output_limit = min(
             p.max_output_tokens_per_request,
@@ -732,13 +870,19 @@ class _BudgetLedger:
         self.total.output_tokens_reserved += output_limit
         return _Reservation(run_id, input_tokens, output_limit)
 
-    def settle(self, reservation: _Reservation, response: ProviderResponse) -> None:
+    def settle(
+        self,
+        reservation: _Reservation,
+        response: ProviderResponse,
+    ) -> None:
         if response.usage.input_tokens != reservation.input_tokens:
             raise ProviderPermanentError(
                 "provider usage input_tokens differs from token-count preflight"
             )
         if response.usage.output_tokens > reservation.output_tokens:
-            raise ProviderPermanentError("provider exceeded reserved output-token ceiling")
+            raise ProviderPermanentError(
+                "provider exceeded reserved output-token ceiling"
+            )
         refund = reservation.output_tokens - response.usage.output_tokens
         trial = self._trial(reservation.run_id)
         trial.output_tokens_reserved -= refund
@@ -751,7 +895,11 @@ class _BudgetLedger:
 _ADJUDICATE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "analyses": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "analyses": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        },
         "evidence_ids": {
             "type": "array",
             "items": {"type": "string"},
@@ -772,7 +920,10 @@ _RECONCILE_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "scope": {"type": "string", "enum": ["column", "tablet", "corpus"]},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["column", "tablet", "corpus"],
+                    },
                     "token_ids": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -804,10 +955,11 @@ _RECONCILE_SCHEMA: dict[str, Any] = {
 }
 
 _SYSTEM_PROMPT = (
-    "You are the model decision component inside the authenticated CUC complete-column "
-    "review harness. Use only the supplied column, evidence, prior decisions, and skill "
-    "context. Return JSON matching the supplied schema. Do not invent evidence IDs, token "
-    "IDs, evaluator targets, reviewed gold data, or external facts not present in the request."
+    "You are the model decision component inside the authenticated CUC "
+    "complete-column review harness. Use only the supplied column, evidence, "
+    "prior decisions, and skill context. Return JSON matching the supplied "
+    "schema. Do not invent evidence IDs, token IDs, evaluator targets, "
+    "reviewed gold data, or external facts not present in the request."
 )
 
 
@@ -823,7 +975,10 @@ class _ProviderDecisionRuntime:
         self.model_context = dict(_mapping(model_context, "model_context"))
         self.policy = policy
         self.ledger = ledger
-        self.run_id = _required_text(self.model_context.get("run_id"), "model_context.run_id")
+        self.run_id = _required_text(
+            self.model_context.get("run_id"),
+            "model_context.run_id",
+        )
         self.calls: list[ProviderCallArtifact] = []
         self.retries = 0
         self.budget_exhausted = False
@@ -834,7 +989,8 @@ class _ProviderDecisionRuntime:
         while True:
             try:
                 value = self.binding.client.count_input_tokens(
-                    request, self.policy.budget.timeout_seconds
+                    request,
+                    self.policy.budget.timeout_seconds,
                 )
                 return _nonnegative_int(value, "counted input tokens")
             except ProviderTransientError:
@@ -847,6 +1003,37 @@ class _ProviderDecisionRuntime:
             except Exception as exc:
                 raise ProviderPermanentError(type(exc).__name__) from None
 
+    def _call_artifact(
+        self,
+        *,
+        request: ProviderJSONRequest,
+        attempt: int,
+        model: str,
+        request_id: str | None,
+        input_tokens: int,
+        output_tokens: int | None,
+        started: float,
+        request_digest: str,
+        response_payload: Mapping[str, Any] | None,
+        error_type: str | None,
+    ) -> ProviderCallArtifact:
+        return ProviderCallArtifact(
+            operation=request.operation,
+            attempt=attempt,
+            model=model,
+            request_id=request_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=(monotonic() - started) * 1000,
+            request_sha256=request_digest,
+            response_sha256=(
+                None
+                if response_payload is None
+                else _digest(response_payload)
+            ),
+            error_type=error_type,
+        )
+
     def _invoke(self, request: ProviderJSONRequest) -> Mapping[str, Any]:
         counted_input = self._count_input(request)
         attempt = 0
@@ -857,9 +1044,12 @@ class _ProviderDecisionRuntime:
                 self.budget_exhausted = True
                 raise
             effective_request = replace(
-                request, max_output_tokens=reservation.output_tokens
+                request,
+                max_output_tokens=reservation.output_tokens,
             )
-            request_digest = _digest(effective_request.safe_digest_payload())
+            request_digest = _digest(
+                effective_request.safe_digest_payload()
+            )
             started = monotonic()
             try:
                 response = self.binding.client.generate_json(
@@ -867,40 +1057,60 @@ class _ProviderDecisionRuntime:
                     self.policy.budget.timeout_seconds,
                 )
                 if not isinstance(response, ProviderResponse):
-                    raise ProviderPermanentError("provider client returned invalid response type")
-                self.ledger.settle(reservation, response)
-                if response.model != self.binding.exact_model_version:
-                    raise ProviderModelIdentityError(
-                        "provider response model does not match configured exact model version"
+                    raise ProviderPermanentError(
+                        "provider client returned invalid response type"
                     )
+                self.ledger.settle(reservation, response)
                 self.observed_output_tokens += response.usage.output_tokens
+                if response.model != self.binding.exact_model_version:
+                    self.calls.append(
+                        self._call_artifact(
+                            request=request,
+                            attempt=attempt,
+                            model=response.model,
+                            request_id=response.request_id,
+                            input_tokens=response.usage.input_tokens,
+                            output_tokens=response.usage.output_tokens,
+                            started=started,
+                            request_digest=request_digest,
+                            response_payload=response.payload,
+                            error_type=ProviderModelIdentityError.__name__,
+                        )
+                    )
+                    raise ProviderModelIdentityError(
+                        "provider response model does not match configured "
+                        "exact model version"
+                    )
                 self.calls.append(
-                    ProviderCallArtifact(
-                        operation=request.operation,
+                    self._call_artifact(
+                        request=request,
                         attempt=attempt,
                         model=response.model,
                         request_id=response.request_id,
                         input_tokens=response.usage.input_tokens,
                         output_tokens=response.usage.output_tokens,
-                        latency_ms=(monotonic() - started) * 1000,
-                        request_sha256=request_digest,
-                        response_sha256=_digest(response.payload),
+                        started=started,
+                        request_digest=request_digest,
+                        response_payload=response.payload,
                         error_type=None,
                     )
                 )
                 return response.payload
+            except ProviderModelIdentityError:
+                # Already recorded above with the provider-reported model ID.
+                raise
             except ProviderTransientError as exc:
                 self.calls.append(
-                    ProviderCallArtifact(
-                        operation=request.operation,
+                    self._call_artifact(
+                        request=request,
                         attempt=attempt,
                         model=self.binding.exact_model_version,
                         request_id=None,
                         input_tokens=counted_input,
                         output_tokens=None,
-                        latency_ms=(monotonic() - started) * 1000,
-                        request_sha256=request_digest,
-                        response_sha256=None,
+                        started=started,
+                        request_digest=request_digest,
+                        response_payload=None,
                         error_type=type(exc).__name__,
                     )
                 )
@@ -908,19 +1118,18 @@ class _ProviderDecisionRuntime:
                     raise
                 attempt += 1
                 self.retries += 1
-                continue
             except ProviderError as exc:
                 self.calls.append(
-                    ProviderCallArtifact(
-                        operation=request.operation,
+                    self._call_artifact(
+                        request=request,
                         attempt=attempt,
                         model=self.binding.exact_model_version,
                         request_id=None,
                         input_tokens=counted_input,
                         output_tokens=None,
-                        latency_ms=(monotonic() - started) * 1000,
-                        request_sha256=request_digest,
-                        response_sha256=None,
+                        started=started,
+                        request_digest=request_digest,
+                        response_payload=None,
                         error_type=type(exc).__name__,
                     )
                 )
@@ -928,16 +1137,16 @@ class _ProviderDecisionRuntime:
             except Exception as exc:
                 error = ProviderPermanentError(type(exc).__name__)
                 self.calls.append(
-                    ProviderCallArtifact(
-                        operation=request.operation,
+                    self._call_artifact(
+                        request=request,
                         attempt=attempt,
                         model=self.binding.exact_model_version,
                         request_id=None,
                         input_tokens=counted_input,
                         output_tokens=None,
-                        latency_ms=(monotonic() - started) * 1000,
-                        request_sha256=request_digest,
-                        response_sha256=None,
+                        started=started,
+                        request_digest=request_digest,
+                        response_payload=None,
                         error_type=type(error).__name__,
                     )
                 )
@@ -954,15 +1163,25 @@ class _ProviderDecisionRuntime:
     ) -> TokenDecision:
         evidence_tuple = tuple(evidence)
         payload = {
-            "model_context": _safe_json_value(self.model_context, "model_context"),
+            "model_context": _safe_json_value(
+                self.model_context,
+                "model_context",
+            ),
             "task": state.task.to_dict(),
             "snapshot": state.snapshot.to_dict(),
             "token": token.to_dict(),
             "evidence": [item.to_dict() for item in evidence_tuple],
-            "prior_decisions": [item.to_dict() for item in state.decisions],
-            "skill_context": _safe_json_value(skill_context, "skill_context"),
+            "prior_decisions": [
+                item.to_dict() for item in state.decisions
+            ],
+            "skill_context": _safe_json_value(
+                skill_context,
+                "skill_context",
+            ),
             "revisit_request": (
-                None if revisit_request is None else revisit_request.to_dict()
+                None
+                if revisit_request is None
+                else revisit_request.to_dict()
             ),
         }
         response = self._invoke(
@@ -979,14 +1198,26 @@ class _ProviderDecisionRuntime:
         evidence_raw = response.get("evidence_ids")
         summary = _required_text(response.get("summary"), "summary")
         if not isinstance(analyses_raw, list) or not analyses_raw:
-            raise ProviderPermanentError("analyses must be a non-empty list")
-        analyses = tuple(_required_text(item, "analysis") for item in analyses_raw)
+            raise ProviderPermanentError(
+                "analyses must be a non-empty list"
+            )
+        analyses = tuple(
+            _required_text(item, "analysis") for item in analyses_raw
+        )
         if not isinstance(evidence_raw, list) or not evidence_raw:
-            raise ProviderPermanentError("evidence_ids must be a non-empty list")
-        evidence_ids = tuple(_required_text(item, "evidence_id") for item in evidence_raw)
-        available_evidence = {item.evidence_id for item in evidence_tuple}
+            raise ProviderPermanentError(
+                "evidence_ids must be a non-empty list"
+            )
+        evidence_ids = tuple(
+            _required_text(item, "evidence_id") for item in evidence_raw
+        )
+        available_evidence = {
+            item.evidence_id for item in evidence_tuple
+        }
         if not set(evidence_ids).issubset(available_evidence):
-            raise ProviderPermanentError("provider referenced evidence outside supplied evidence")
+            raise ProviderPermanentError(
+                "provider referenced evidence outside supplied evidence"
+            )
         prior = state.latest_decision(token.token_id)
         decision_id = "decision-provider-" + sha256(
             f"{operation_id}:{_canonical_json(response)}".encode("utf-8")
@@ -998,10 +1229,14 @@ class _ProviderDecisionRuntime:
             evidence_ids,
             summary,
             revisit_of=(
-                None if revisit_request is None or prior is None else prior.decision_id
+                None
+                if revisit_request is None or prior is None
+                else prior.decision_id
             ),
             revisit_request_id=(
-                None if revisit_request is None else revisit_request.request_id
+                None
+                if revisit_request is None
+                else revisit_request.request_id
             ),
         )
 
@@ -1012,12 +1247,18 @@ class _ProviderDecisionRuntime:
         operation_id: str,
     ) -> ReconciliationPlan:
         payload = {
-            "model_context": _safe_json_value(self.model_context, "model_context"),
+            "model_context": _safe_json_value(
+                self.model_context,
+                "model_context",
+            ),
             "task": state.task.to_dict(),
             "snapshot": state.snapshot.to_dict(),
             "evidence": [item.to_dict() for item in state.evidence],
             "decisions": [item.to_dict() for item in state.decisions],
-            "skill_context": _safe_json_value(skill_context, "skill_context"),
+            "skill_context": _safe_json_value(
+                skill_context,
+                "skill_context",
+            ),
         }
         response = self._invoke(
             ProviderJSONRequest(
@@ -1041,27 +1282,49 @@ class _ProviderDecisionRuntime:
             raw_tokens = item.get("token_ids")
             raw_evidence = item.get("evidence_ids")
             if not isinstance(raw_tokens, list) or not raw_tokens:
-                raise ProviderPermanentError("finding token_ids must be non-empty")
+                raise ProviderPermanentError(
+                    "finding token_ids must be non-empty"
+                )
             if not isinstance(raw_evidence, list) or not raw_evidence:
-                raise ProviderPermanentError("finding evidence_ids must be non-empty")
-            finding_tokens = tuple(_required_text(value, "token_id") for value in raw_tokens)
+                raise ProviderPermanentError(
+                    "finding evidence_ids must be non-empty"
+                )
+            finding_tokens = tuple(
+                _required_text(value, "token_id")
+                for value in raw_tokens
+            )
             finding_evidence = tuple(
-                _required_text(value, "evidence_id") for value in raw_evidence
+                _required_text(value, "evidence_id")
+                for value in raw_evidence
             )
             if not set(finding_tokens).issubset(token_ids):
-                raise ProviderPermanentError("finding references token outside column")
+                raise ProviderPermanentError(
+                    "finding references token outside column"
+                )
             if not set(finding_evidence).issubset(evidence_ids):
-                raise ProviderPermanentError("finding references unknown evidence")
+                raise ProviderPermanentError(
+                    "finding references unknown evidence"
+                )
             requires_revisit = item.get("requires_revisit")
             if not isinstance(requires_revisit, bool):
-                raise ProviderPermanentError("requires_revisit must be boolean")
-            summary = _required_text(item.get("summary"), "finding summary")
+                raise ProviderPermanentError(
+                    "requires_revisit must be boolean"
+                )
+            summary = _required_text(
+                item.get("summary"),
+                "finding summary",
+            )
             try:
                 scope = ReconciliationScope(item.get("scope"))
             except (TypeError, ValueError) as exc:
-                raise ProviderPermanentError("invalid reconciliation scope") from exc
+                raise ProviderPermanentError(
+                    "invalid reconciliation scope"
+                ) from exc
             finding_id = "finding-provider-" + sha256(
-                f"{operation_id}:{index}:{_canonical_json(item)}".encode("utf-8")
+                (
+                    f"{operation_id}:{index}:"
+                    f"{_canonical_json(item)}"
+                ).encode("utf-8")
             ).hexdigest()[:24]
             finding = CorpusReconciliationFinding(
                 finding_id,
@@ -1078,24 +1341,70 @@ class _ProviderDecisionRuntime:
                         f"{finding_id}:{token_id}".encode("utf-8")
                     ).hexdigest()[:24]
                     revisits.append(
-                        RevisitRequest(request_id, token_id, summary, finding_id)
+                        RevisitRequest(
+                            request_id,
+                            token_id,
+                            summary,
+                            finding_id,
+                        )
                     )
         return ReconciliationPlan(tuple(findings), tuple(revisits))
 
-    def artifact(self, backend_id: str, terminal_status: str) -> ProviderTrialArtifact:
+    def artifact(
+        self,
+        backend_id: str,
+        terminal_status: str,
+    ) -> ProviderTrialArtifact:
         budget = self.ledger.trial(self.run_id)
-        return ProviderTrialArtifact(
+        return _artifact_from_binding(
+            self.binding,
             backend_id=backend_id,
             run_id=self.run_id,
-            execution_kind=self.binding.execution_kind.value,
             terminal_status=terminal_status,
             request_count=budget.requests,
             input_tokens=budget.input_tokens,
             output_tokens=self.observed_output_tokens,
+            output_tokens_reserved=budget.output_tokens_reserved,
             retries=self.retries,
             budget_exhausted=self.budget_exhausted,
             calls=tuple(self.calls),
         )
+
+
+def _artifact_from_binding(
+    binding: LiveProviderBinding,
+    *,
+    backend_id: str,
+    run_id: str,
+    terminal_status: str,
+    request_count: int = 0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    output_tokens_reserved: int = 0,
+    retries: int = 0,
+    budget_exhausted: bool = False,
+    calls: tuple[ProviderCallArtifact, ...] = (),
+) -> ProviderTrialArtifact:
+    return ProviderTrialArtifact(
+        backend_id=backend_id,
+        run_id=run_id,
+        execution_kind=binding.execution_kind.value,
+        provider=binding.spec.model_provider,
+        requested_model=binding.requested_model,
+        exact_model_version=binding.exact_model_version,
+        model_config_sha256=binding.spec.model_config_sha256,
+        exact_version_provenance_sha256=_digest(
+            binding.exact_version_provenance
+        ),
+        terminal_status=terminal_status,
+        request_count=request_count,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        output_tokens_reserved=output_tokens_reserved,
+        retries=retries,
+        budget_exhausted=budget_exhausted,
+        calls=calls,
+    )
 
 
 def run_live_benchmark(
@@ -1111,25 +1420,39 @@ def run_live_benchmark(
     if not isinstance(shared_adapters, SharedBenchmarkAdapters):
         raise ValueError("shared_adapters must be SharedBenchmarkAdapters")
     if not isinstance(execution_policy, ProviderExecutionPolicy):
-        raise ValueError("execution_policy must be ProviderExecutionPolicy")
+        raise ValueError(
+            "execution_policy must be ProviderExecutionPolicy"
+        )
     live_bindings = tuple(bindings)
     if not live_bindings or any(
-        not isinstance(item, LiveProviderBinding) for item in live_bindings
+        not isinstance(item, LiveProviderBinding)
+        for item in live_bindings
     ):
-        raise ValueError("bindings must contain at least one LiveProviderBinding")
+        raise ValueError(
+            "bindings must contain at least one LiveProviderBinding"
+        )
     if any(
-        item.execution_kind is ExecutionKind.LIVE_PROVIDER for item in live_bindings
+        item.execution_kind is ExecutionKind.LIVE_PROVIDER
+        for item in live_bindings
     ) and not execution_policy.allow_paid_live_execution:
         raise ValueError(
-            "live paid provider execution requires allow_paid_live_execution=True"
+            "live paid provider execution requires "
+            "allow_paid_live_execution=True"
         )
 
     ledger = _BudgetLedger(execution_policy.budget)
     runtimes: dict[str, _ProviderDecisionRuntime] = {}
     harn016_bindings: list[BenchmarkBackendBinding] = []
+    binding_by_backend = {
+        item.spec.backend_id: item for item in live_bindings
+    }
 
     for binding in live_bindings:
-        def factory(model_context: dict[str, object], binding=binding):
+
+        def factory(
+            model_context: dict[str, object],
+            binding: LiveProviderBinding = binding,
+        ) -> BackendDecisionAdapters:
             runtime = _ProviderDecisionRuntime(
                 binding,
                 model_context,
@@ -1139,9 +1462,14 @@ def run_live_benchmark(
             if runtime.run_id in runtimes:
                 raise ValueError("duplicate live-provider run id")
             runtimes[runtime.run_id] = runtime
-            return BackendDecisionAdapters(runtime.adjudicate, runtime.reconcile)
+            return BackendDecisionAdapters(
+                runtime.adjudicate,
+                runtime.reconcile,
+            )
 
-        harn016_bindings.append(BenchmarkBackendBinding(binding.spec, factory))
+        harn016_bindings.append(
+            BenchmarkBackendBinding(binding.spec, factory)
+        )
 
     benchmark = run_benchmark(
         case,
@@ -1153,28 +1481,39 @@ def run_live_benchmark(
     artifacts: list[ProviderTrialArtifact] = []
     for trial in benchmark.results:
         runtime = runtimes.get(trial.identity.run_id)
-        if runtime is None:
+        if runtime is not None:
             artifacts.append(
-                ProviderTrialArtifact(
+                runtime.artifact(
                     trial.backend_id,
-                    trial.identity.run_id,
-                    "unknown",
                     trial.terminal_status,
-                    0,
-                    0,
-                    0,
-                    0,
-                    False,
-                    (),
                 )
             )
-        else:
-            artifacts.append(runtime.artifact(trial.backend_id, trial.terminal_status))
+            continue
+        binding = binding_by_backend.get(trial.backend_id)
+        if binding is None:
+            raise ValueError(
+                "benchmark returned trial for unknown live-provider backend"
+            )
+        artifacts.append(
+            _artifact_from_binding(
+                binding,
+                backend_id=trial.backend_id,
+                run_id=trial.identity.run_id,
+                terminal_status=trial.terminal_status,
+            )
+        )
 
     expected = len(live_bindings) * trials_per_backend
     complete = (
         len(benchmark.results) == expected
         and len(artifacts) == expected
-        and all(item.terminal_status == "completed" for item in benchmark.results)
+        and all(
+            item.terminal_status == "completed"
+            for item in benchmark.results
+        )
     )
-    return LiveBenchmarkRunResult(benchmark, tuple(artifacts), complete)
+    return LiveBenchmarkRunResult(
+        benchmark,
+        tuple(artifacts),
+        complete,
+    )
