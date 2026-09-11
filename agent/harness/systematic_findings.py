@@ -20,6 +20,7 @@ from .github_effects import GitHubAction, GitHubEffectRequest
 
 FORK_REPOSITORY = "alexsosn/cuc"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MACHINE_ID_RE = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
 _RULE_LIKE_CLASSIFICATIONS = frozenset(
     {
         "parser-config-defect",
@@ -47,11 +48,13 @@ def _text_tuple(
     field: str,
     *,
     required: bool = False,
+    single_line: bool = False,
 ) -> tuple[str, ...]:
     if isinstance(value, (str, bytes)):
         raise ValueError(f"{field} must be an iterable of strings")
+    normalizer = _single_line if single_line else _required_text
     try:
-        items = tuple(_required_text(item, field) for item in value)  # type: ignore[arg-type]
+        items = tuple(normalizer(item, field) for item in value)  # type: ignore[arg-type]
     except TypeError as exc:
         raise ValueError(f"{field} must be an iterable of strings") from exc
     if required and not items:
@@ -68,9 +71,13 @@ def _digest(value: object, field: str) -> str:
     return text
 
 
-def _normalized_identity(value: object, field: str) -> str:
+def _machine_id(value: object, field: str) -> str:
     text = _single_line(value, field)
-    return " ".join(text.casefold().split())
+    if not _MACHINE_ID_RE.fullmatch(text):
+        raise ValueError(
+            f"{field} must be a canonical lower-case machine ID using letters, digits, dots and hyphens"
+        )
+    return text
 
 
 def _safe_markdown(value: str) -> str:
@@ -108,6 +115,7 @@ class FindingOccurrence:
     corpus: str
     tablet: str
     column: str
+    locus_ref: str
     token_ids: tuple[str, ...]
     summary: str
     run_id: str
@@ -126,7 +134,12 @@ class FindingOccurrence:
         object.__setattr__(self, "corpus", _single_line(self.corpus, "corpus"))
         object.__setattr__(self, "tablet", _single_line(self.tablet, "tablet"))
         object.__setattr__(self, "column", _single_line(self.column, "column"))
-        object.__setattr__(self, "token_ids", _text_tuple(self.token_ids, "token_ids", required=True))
+        object.__setattr__(self, "locus_ref", _single_line(self.locus_ref, "locus_ref"))
+        object.__setattr__(
+            self,
+            "token_ids",
+            _text_tuple(self.token_ids, "token_ids", required=True, single_line=True),
+        )
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
         object.__setattr__(self, "run_id", _single_line(self.run_id, "run_id"))
         object.__setattr__(self, "model_provider", _single_line(self.model_provider, "model_provider"))
@@ -143,21 +156,30 @@ class FindingOccurrence:
             "skill_provenance_sha256",
             _digest(self.skill_provenance_sha256, "skill_provenance_sha256"),
         )
-        object.__setattr__(self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs", required=True))
-        object.__setattr__(self, "metric_refs", _text_tuple(self.metric_refs, "metric_refs"))
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _text_tuple(self.evidence_refs, "evidence_refs", required=True, single_line=True),
+        )
+        object.__setattr__(
+            self,
+            "metric_refs",
+            _text_tuple(self.metric_refs, "metric_refs", single_line=True),
+        )
         object.__setattr__(
             self,
             "expert_feedback_refs",
-            _text_tuple(self.expert_feedback_refs, "expert_feedback_refs"),
+            _text_tuple(self.expert_feedback_refs, "expert_feedback_refs", single_line=True),
         )
 
     @property
-    def locus_key(self) -> tuple[str, str, str, tuple[str, ...]]:
+    def locus_key(self) -> tuple[str, str, str, str]:
+        """Stable textual locus identity; token IDs are evidence, not recurrence identity."""
         return (
             self.corpus.casefold(),
             self.tablet.casefold(),
             self.column.casefold(),
-            tuple(sorted(token.casefold() for token in self.token_ids)),
+            self.locus_ref.casefold(),
         )
 
 
@@ -176,7 +198,11 @@ class SystematicSignal:
             raise ValueError(f"invalid systematic signal kind: {self.kind!r}") from exc
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
-        object.__setattr__(self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs", required=True))
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _text_tuple(self.evidence_refs, "evidence_refs", required=True, single_line=True),
+        )
 
 
 @dataclass(frozen=True)
@@ -204,14 +230,19 @@ class SystematicFindingCandidate:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid finding classification: {self.classification!r}") from exc
         object.__setattr__(self, "classification", classification)
-        object.__setattr__(self, "subsystem", _single_line(self.subsystem, "subsystem"))
-        object.__setattr__(self, "problem_key", _single_line(self.problem_key, "problem_key"))
+        object.__setattr__(self, "subsystem", _machine_id(self.subsystem, "subsystem"))
+        object.__setattr__(self, "problem_key", _machine_id(self.problem_key, "problem_key"))
         object.__setattr__(self, "title", _single_line(self.title, "title"))
         object.__setattr__(self, "objective", _required_text(self.objective, "objective"))
         object.__setattr__(
             self,
             "acceptance_criteria",
-            _text_tuple(self.acceptance_criteria, "acceptance_criteria", required=True),
+            _text_tuple(
+                self.acceptance_criteria,
+                "acceptance_criteria",
+                required=True,
+                single_line=True,
+            ),
         )
         if isinstance(self.occurrences, (str, bytes)):
             raise ValueError("occurrences must be an iterable of FindingOccurrence")
@@ -232,10 +263,33 @@ class SystematicFindingCandidate:
         if len(signal_ids) != len(set(signal_ids)):
             raise ValueError("systematic signal IDs must be unique")
         object.__setattr__(self, "systematic_signals", signals)
-        object.__setattr__(self, "positive_cases", _text_tuple(self.positive_cases, "positive_cases"))
-        object.__setattr__(self, "negative_cases", _text_tuple(self.negative_cases, "negative_cases"))
-        object.__setattr__(self, "boundary_cases", _text_tuple(self.boundary_cases, "boundary_cases"))
-        object.__setattr__(self, "evidence_refs", _text_tuple(self.evidence_refs, "evidence_refs"))
+
+        positive = _text_tuple(self.positive_cases, "positive_cases", single_line=True)
+        negative = _text_tuple(self.negative_cases, "negative_cases", single_line=True)
+        boundary = _text_tuple(self.boundary_cases, "boundary_cases", single_line=True)
+        normalized_roles = {
+            "positive": {item.casefold() for item in positive},
+            "negative": {item.casefold() for item in negative},
+            "boundary": {item.casefold() for item in boundary},
+        }
+        overlap = (
+            normalized_roles["positive"] & normalized_roles["negative"]
+            | normalized_roles["positive"] & normalized_roles["boundary"]
+            | normalized_roles["negative"] & normalized_roles["boundary"]
+        )
+        if overlap:
+            raise ValueError(
+                "positive, negative and boundary case roles must be disjoint; overlap: "
+                + ", ".join(sorted(overlap))
+            )
+        object.__setattr__(self, "positive_cases", positive)
+        object.__setattr__(self, "negative_cases", negative)
+        object.__setattr__(self, "boundary_cases", boundary)
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _text_tuple(self.evidence_refs, "evidence_refs", single_line=True),
+        )
 
 
 @dataclass(frozen=True)
@@ -262,10 +316,15 @@ class FindingBridgeDecision:
 def _fingerprint(candidate: SystematicFindingCandidate) -> str:
     identity = {
         "classification": candidate.classification.value,
-        "subsystem": _normalized_identity(candidate.subsystem, "subsystem"),
-        "problem_key": _normalized_identity(candidate.problem_key, "problem_key"),
+        "subsystem": candidate.subsystem,
+        "problem_key": candidate.problem_key,
     }
-    payload = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return sha256(payload).hexdigest()
 
 
@@ -279,7 +338,11 @@ def _render_refs(refs: tuple[str, ...]) -> str:
     return ", ".join(_safe_markdown(item) for item in sorted(refs)) if refs else "none"
 
 
-def _render_issue_body(candidate: SystematicFindingCandidate, fingerprint: str, task: TaskSpec) -> str:
+def _render_issue_body(
+    candidate: SystematicFindingCandidate,
+    fingerprint: str,
+    task: TaskSpec,
+) -> str:
     lines = [
         f"<!-- harn-017:fingerprint:{fingerprint} -->",
         "## Systematic parsing/development finding",
@@ -304,11 +367,24 @@ def _render_issue_body(candidate: SystematicFindingCandidate, fingerprint: str, 
         lines.extend(
             [
                 f"### {_safe_markdown(occurrence.occurrence_id)}",
-                f"- Locus: `{_safe_markdown(occurrence.corpus)}` / `{_safe_markdown(occurrence.tablet)}` / `{_safe_markdown(occurrence.column)}` / tokens `{tokens}`",
+                (
+                    f"- Locus: `{_safe_markdown(occurrence.corpus)}` / "
+                    f"`{_safe_markdown(occurrence.tablet)}` / "
+                    f"`{_safe_markdown(occurrence.column)}` / "
+                    f"source `{_safe_markdown(occurrence.locus_ref)}` / tokens `{tokens}`"
+                ),
                 f"- Summary: {_safe_markdown(occurrence.summary)}",
                 f"- Run: `{_safe_markdown(occurrence.run_id)}`",
-                f"- Model: `{_safe_markdown(occurrence.model_provider)}` / `{_safe_markdown(occurrence.model_name)}` / `{_safe_markdown(occurrence.model_version)}`",
-                f"- Skill: `{_safe_markdown(occurrence.skill_name)}` contract `{_safe_markdown(occurrence.skill_contract_version)}` provenance `{occurrence.skill_provenance_sha256}`",
+                (
+                    f"- Model: `{_safe_markdown(occurrence.model_provider)}` / "
+                    f"`{_safe_markdown(occurrence.model_name)}` / "
+                    f"`{_safe_markdown(occurrence.model_version)}`"
+                ),
+                (
+                    f"- Skill: `{_safe_markdown(occurrence.skill_name)}` contract "
+                    f"`{_safe_markdown(occurrence.skill_contract_version)}` provenance "
+                    f"`{occurrence.skill_provenance_sha256}`"
+                ),
                 f"- Evidence refs: {_render_refs(occurrence.evidence_refs)}",
                 f"- Metric refs: {_render_refs(occurrence.metric_refs)}",
                 f"- Expert-feedback refs: {_render_refs(occurrence.expert_feedback_refs)}",
@@ -340,7 +416,12 @@ def _render_issue_body(candidate: SystematicFindingCandidate, fingerprint: str, 
             "",
             "## Development workflow",
             "",
-            "This proposal is fork-local and is intended to enter the separate research → plan → TDD/RED → implementation → verification → logically independent review development loop. The bridge only constructs a proposal; trusted GitHub authorization and dispatch remain external to this module.",
+            (
+                "This proposal is fork-local and is intended to enter the separate "
+                "research → plan → TDD/RED → implementation → verification → logically "
+                "independent review development loop. The bridge only constructs a proposal; "
+                "trusted GitHub authorization and dispatch remain external to this module."
+            ),
         ]
     )
     return "\n".join(lines)
@@ -349,7 +430,10 @@ def _render_issue_body(candidate: SystematicFindingCandidate, fingerprint: str, 
 def _insufficient_reason(candidate: SystematicFindingCandidate) -> str | None:
     distinct_loci = {item.locus_key for item in candidate.occurrences}
     if len(distinct_loci) < 2 and not candidate.systematic_signals:
-        return "insufficient systematic evidence: need at least two distinct loci or one typed systematic signal"
+        return (
+            "insufficient systematic evidence: need at least two distinct source loci "
+            "or one typed systematic signal"
+        )
 
     if candidate.classification.value in _RULE_LIKE_CLASSIFICATIONS:
         missing: list[str] = []
