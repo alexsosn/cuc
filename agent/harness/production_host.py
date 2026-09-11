@@ -353,6 +353,11 @@ class ProductionDevelopmentHost:
             raise ValueError("approval operation does not match pending GitHub request")
         if approval.request_sha256 != request.request_sha256:
             raise ValueError("approval digest does not match pending GitHub request")
+        journal_approval = state.github_journal.approval_for(request.operation_id)
+        if journal_approval is not None and journal_approval != approval:
+            raise ValueError(
+                "pending operation journal contains a different approval; refusing to create trusted authority"
+            )
 
         approvals = self.__envelope.trusted_approvals
         existing_by_id = next(
