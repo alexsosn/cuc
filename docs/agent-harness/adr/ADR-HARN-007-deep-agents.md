@@ -87,7 +87,9 @@ No observability-stack migration is justified by HARN-007. The deterministic HAR
 
 The temporary pin increased the ordinary locked environment from 68 to 85 installed packages in the observed CI run, adding the higher-level LangChain package plus provider/integration dependencies. Package count is not itself a rejection criterion, but there is no parsing capability gain that justifies retaining that surface after the semantic-equivalence test failed.
 
-The spike dependency and executable spike code must therefore be removed before this ADR is merged. The framework-neutral decision record may remain because it adds no Deep Agents dependency and makes the evidence machine-checkable.
+The spike dependency and executable spike code were removed before finalization. Trusted HARN-021 regenerated the lock on cleanup head `e5b15290a144503ad4d617f1a1b74bceb1ede82b`, producing bot commit `ad7d1e2d121210811b0d16857cf54b71003837e8`. The resulting PR lock diff contains only uv's four-line `resolution-markers` normalization; no Deep Agents/provider packages remain. A connector-authored follow-up commit triggers ordinary `uv sync --locked` CI independently of the bot writer before final review.
+
+The framework-neutral decision record remains because it adds no Deep Agents dependency and makes the evidence machine-checkable.
 
 ## Consequences
 
