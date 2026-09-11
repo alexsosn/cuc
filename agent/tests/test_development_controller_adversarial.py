@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from harness.contracts import (
     ChangeSet,
+    GateOutcome,
     PlanArtifact,
     ResearchArtifact,
     RunPhase,
@@ -30,7 +33,6 @@ from harness.github_side_effects import (
     HumanApprovalRegistry,
     OperationJournal,
 )
-from harness.contracts import GateOutcome
 
 
 BASE = "a" * 40
@@ -82,20 +84,20 @@ def _reviewer() -> IndependentReviewer:
     return IndependentReviewer("clean-reviewer", _never, implementer_id="implementer")
 
 
-def _policy() -> DevelopmentControllerPolicy:
+def _policy(*, max_github_writes: int = 1) -> DevelopmentControllerPolicy:
     return DevelopmentControllerPolicy(
-        max_revision_attempts=1,
+        max_revision_attempts=2,
         max_verification_executions=1,
         max_review_attempts=1,
-        max_github_writes=1,
+        max_github_writes=max_github_writes,
         max_cost_units=10.0,
         production_mode=True,
     )
 
 
-def _controller(guard, persist) -> BoundedDevelopmentController:
+def _controller(guard, persist, *, policy=None) -> BoundedDevelopmentController:
     return BoundedDevelopmentController(
-        policy=_policy(),
+        policy=policy or _policy(),
         ports=_ports(),
         reviewer=_reviewer(),
         side_effects=guard,
@@ -107,23 +109,42 @@ def _controller(guard, persist) -> BoundedDevelopmentController:
     )
 
 
-def _pending_state() -> DevelopmentControllerState:
-    task = TaskSpec(
+def _task() -> TaskSpec:
+    return TaskSpec(
         "issue-11",
         "controller",
         "preserve replay-safe bounded writes",
         ("duplicate retry cannot bypass GitHub write budget",),
     )
-    intent = TestIntent(
+
+
+def _targeted() -> TestIntent:
+    return TestIntent(
         "targeted",
         TestKind.TARGETED,
         ("python", "-m", "pytest", "tests/test_feature.py"),
         "agent",
         "baseline RED",
     )
+
+
+def _red(intent: TestIntent) -> RedGateEvidence:
+    return RedGateEvidence(
+        intent.intent_id,
+        BASE,
+        GateOutcome.TEST_FAILURE,
+        1,
+        0,
+        1,
+        "expected baseline failure",
+    )
+
+
+def _pending_state() -> DevelopmentControllerState:
+    intent = _targeted()
     core = RunState(
         "run-11",
-        task,
+        _task(),
         phase=RunPhase.IMPLEMENT,
         research=ResearchArtifact("research", "done", ()),
         plan=PlanArtifact("plan", "done", ("test", "implement")),
@@ -145,20 +166,11 @@ def _pending_state() -> DevelopmentControllerState:
         HEAD,
         (op1, op2),
     )
-    red = RedGateEvidence(
-        intent.intent_id,
-        BASE,
-        GateOutcome.TEST_FAILURE,
-        1,
-        0,
-        1,
-        "expected baseline failure",
-    )
     return DevelopmentControllerState(
         1,
         BASE,
         core,
-        red_evidence=(red,),
+        red_evidence=(_red(intent),),
         pending_implementation=implementation,
         current_head_sha=HEAD,
         revision_attempts=1,
@@ -203,3 +215,61 @@ def test_replayed_completed_write_consumes_budget_after_controller_snapshot_cras
     assert [call for call in adapter.calls if call[0] == "create_issue"] == [
         ("create_issue", "write-1")
     ]
+
+
+def test_reused_operation_id_is_blocked_before_replay_or_provider_dispatch() -> None:
+    adapter = Adapter()
+    journal = OperationJournal(persist=lambda _payload: None)
+    approvals = HumanApprovalRegistry()
+    guard = GuardedGitHubSideEffects(adapter=adapter, journal=journal, approvals=approvals)
+
+    intent = _targeted()
+    reused = GitHubOperationIntent(
+        "write-1", GitHubOperationKind.CREATE_ISSUE, FORK, {"title": "same"}
+    )
+    prior = ChangeSet(
+        "prior-change",
+        "prior write",
+        ("agent/harness/prior.py",),
+        (reused.operation_id,),
+    )
+    core = RunState(
+        "run-11",
+        _task(),
+        phase=RunPhase.IMPLEMENT,
+        research=ResearchArtifact("research", "done", ()),
+        plan=PlanArtifact("plan", "done", ("test", "implement")),
+        test_intents=(intent,),
+        changes=(prior,),
+    )
+    pending = ImplementationResult(
+        ChangeSet(
+            "new-change",
+            "must not reuse operation",
+            ("agent/harness/new.py",),
+            (reused.operation_id,),
+        ),
+        HEAD,
+        (reused,),
+    )
+    state = DevelopmentControllerState(
+        1,
+        BASE,
+        core,
+        red_evidence=(_red(intent),),
+        pending_implementation=pending,
+        current_head_sha=HEAD,
+        revision_attempts=2,
+    )
+
+    journal.prepare(reused, approval_id=None)
+    journal.complete(reused, "issue:write-1")
+
+    controller = _controller(guard, lambda _payload: None, policy=_policy(max_github_writes=5))
+    blocked = controller.step(state)
+
+    assert blocked.core.phase is RunPhase.BLOCKED
+    assert blocked.stop_code is ControllerStopCode.POLICY_BLOCK
+    assert "operation" in blocked.stop_reason.casefold()
+    assert "reuse" in blocked.stop_reason.casefold()
+    assert adapter.calls == []
