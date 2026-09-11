@@ -11,11 +11,11 @@ Core contracts:
 - `GitHubOperationIntent`: mandatory operation ID, operation kind, target, type-preserving canonical JSON payload, deterministic fingerprint;
 - `HumanApprovalGrant`: auditable approval ID/approver bound to the exact operation fingerprint;
 - `HumanApprovalRegistry`: trusted host-owned authority recording which exact grants were actually issued by the human gate;
-- `OperationJournal`: serializable prepared/completed records keyed by operation ID;
+- `OperationJournal`: prepared/completed records keyed by operation ID, with an optional synchronous persistence hook used before provider dispatch;
 - `PolicyDecision`: allow / approval-required / deny with deterministic reason;
 - `GuardedGitHubSideEffects`: policy evaluation, dry-run, replay/reconciliation, trusted approval lookup, and typed adapter dispatch.
 
-The module remains independent of LangGraph, Deep Agents, provider SDKs, and live GitHub credentials. The model-facing guard has no approval-registration method; registry construction/restoration belongs to trusted orchestration code.
+The module remains independent of LangGraph, Deep Agents, provider SDKs, and live GitHub credentials. The model-facing guard has no approval-registration method; registry construction/restoration and durable journal persistence belong to trusted orchestration code.
 
 ## Policy
 
@@ -23,6 +23,7 @@ The module remains independent of LangGraph, Deep Agents, provider SDKs, and liv
 - controlled fork-local development writes: allowed;
 - fork merge into `agent-harness-safety`: exact trusted human approval required;
 - explicit workflow trigger: exact trusted human approval required;
+- merge/workflow actions must carry an explicit target ref so authorization is bound to the actual integration/publication destination;
 - upstream writes: exact trusted human approval required and never silently downgraded to an autonomous fork permission;
 - writes to any other repository: denied;
 - unknown/generic operation: unrepresentable/denied.
@@ -42,8 +43,12 @@ For writes:
 5. for approval-required operations, resolve an exact grant only through the trusted registry, including a previously recorded approval ID on prepared restart;
 6. completed identical operation -> replay stored result without a second write;
 7. prepared identical operation -> call adapter reconciliation only after approval validation;
-8. if reconciliation finds an existing provider result, record/return it without a new write;
-9. otherwise keep/write `prepared`, dispatch exactly one typed operation, then record completion.
+8. if reconciliation finds an existing provider result, durably record/return it without a new write;
+9. otherwise create PREPARED and synchronously persist the complete journal snapshot;
+10. only after PREPARED persistence succeeds, dispatch exactly one typed provider operation;
+11. record COMPLETED through the same persistence hook.
+
+If PREPARED persistence fails, the journal rolls back the in-memory mutation and provider dispatch must not occur. If COMPLETED persistence fails after a successful provider write, durable state remains PREPARED, so a restart reconciles provider state before any retry. This is the crash-consistency property required for replay safety.
 
 Read operations do not require operation-journal idempotency but still pass destination/action classification.
 
@@ -98,7 +103,14 @@ The first clean-context review added tests before fixes for two blockers:
 1. a caller-fabricated grant with a perfectly matching public fingerprint must still fail unless registered by the trusted host authority;
 2. JSON `[]` and `{}` — including nested empty containers — must remain distinct through immutable normalization, round-trip serialization, and fingerprinting.
 
-The fix also tests trusted registry round-trip, same-ID altered-grant rejection, and restart of a prepared sensitive operation: journal state alone is insufficient; restored trusted approval state is required before reconciliation or retry.
+The next clean-context review added another RED gate for crash consistency and target binding:
+
+1. PREPARED must be durably persisted before the provider write;
+2. durable-store failure must make zero provider calls;
+3. a simulated process death must recover from the persisted PREPARED snapshot alone and reconcile rather than duplicate the provider write;
+4. merge/workflow intents without an explicit target ref must be denied before approval.
+
+The fixes preserve trusted registry round-trip, same-ID altered-grant rejection, and restart of a prepared sensitive operation: journal state alone is insufficient; restored trusted approval state is required before reconciliation or retry.
 
 ## Regression gates
 
