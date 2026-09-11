@@ -1,8 +1,8 @@
 """Framework-neutral authorization boundary for development-controller GitHub effects.
 
-The module performs no network I/O. A caller supplies a narrow adapter; repository
-classification, task authorization, human approval and durable replay/uncertainty
-checks all happen before an adapter may be invoked.
+This module performs no network I/O. A trusted controller supplies a narrow adapter;
+repository classification, task authorization, human approval and durable replay /
+uncertainty checks all happen before that adapter may be invoked.
 """
 
 from __future__ import annotations
@@ -143,40 +143,150 @@ def _text_sequence(value: object, field: str) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class GitHubOperationPermission:
+    """One declared operation ID bound to exactly one fork write action."""
+
+    operation_id: str
+    action: GitHubAction
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operation_id", _required_text(self.operation_id, "operation_id"))
+        action = _action(self.action)
+        if action is GitHubAction.READ:
+            raise ValueError("fork write permission cannot use READ")
+        object.__setattr__(self, "action", action)
+
+    def to_dict(self) -> dict[str, str]:
+        return {"operation_id": self.operation_id, "action": self.action.value}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "GitHubOperationPermission":
+        if not isinstance(payload, Mapping):
+            raise ValueError("GitHubOperationPermission payload must be an object")
+        return cls(payload["operation_id"], payload["action"])
+
+
+@dataclass(frozen=True)
 class GitHubTaskPolicy:
     """Task-local authority supplied by the development controller.
 
-    `allowed_operation_ids` is the bridge to HARN-002: HARN-010 constructs it
-    from operation IDs declared for the current development work instead of letting a
-    model invent an execution identity at call time.
+    New callers should use `allowed_fork_write_operations` and
+    `allowed_upstream_operation_ids`. The two legacy fields are retained only so the
+    already-existing HARN-009 tests / serialized drafts remain readable; legacy fork
+    policy is accepted only when it has one action, which can be bound unambiguously to
+    every listed operation ID. Multiple fork actions require explicit per-operation
+    permissions and therefore cannot create a cross-product privilege expansion.
     """
 
     allowed_fork_write_actions: tuple[GitHubAction, ...] = ()
     allowed_operation_ids: tuple[str, ...] = ()
+    allowed_fork_write_operations: tuple[GitHubOperationPermission, ...] = ()
+    allowed_upstream_operation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         raw_actions = _object_sequence(
             self.allowed_fork_write_actions, "allowed_fork_write_actions"
         )
-        actions = tuple(_action(item, "allowed_fork_write_actions") for item in raw_actions)
-        if GitHubAction.READ in actions:
+        legacy_actions = tuple(_action(item, "allowed_fork_write_actions") for item in raw_actions)
+        if GitHubAction.READ in legacy_actions:
             raise ValueError("READ is not a fork write action")
-        if len(actions) != len(set(actions)):
+        if len(legacy_actions) != len(set(legacy_actions)):
             raise ValueError("allowed_fork_write_actions must not contain duplicates")
-        operations = _text_sequence(self.allowed_operation_ids, "allowed_operation_ids")
-        object.__setattr__(self, "allowed_fork_write_actions", actions)
-        object.__setattr__(self, "allowed_operation_ids", operations)
+        legacy_operations = _text_sequence(self.allowed_operation_ids, "allowed_operation_ids")
+
+        raw_permissions = _object_sequence(
+            self.allowed_fork_write_operations, "allowed_fork_write_operations"
+        )
+        permissions: tuple[GitHubOperationPermission, ...] = tuple(
+            item
+            if isinstance(item, GitHubOperationPermission)
+            else GitHubOperationPermission.from_dict(item)  # type: ignore[arg-type]
+            for item in raw_permissions
+        )
+        upstream_operations = _text_sequence(
+            self.allowed_upstream_operation_ids, "allowed_upstream_operation_ids"
+        )
+
+        explicit_mode = bool(permissions or upstream_operations)
+        if explicit_mode and (legacy_actions or legacy_operations):
+            raise ValueError("legacy and explicit GitHub task policy fields cannot be mixed")
+
+        if not explicit_mode:
+            if legacy_actions:
+                if len(legacy_actions) != 1:
+                    raise ValueError(
+                        "multiple fork write actions require explicit per-operation permissions"
+                    )
+                permissions = tuple(
+                    GitHubOperationPermission(operation_id, legacy_actions[0])
+                    for operation_id in legacy_operations
+                )
+                upstream_operations = ()
+            else:
+                permissions = ()
+                upstream_operations = legacy_operations
+
+        permission_ids = tuple(item.operation_id for item in permissions)
+        if len(permission_ids) != len(set(permission_ids)):
+            raise ValueError("fork operation IDs must be unique")
+        overlap = set(permission_ids) & set(upstream_operations)
+        if overlap:
+            raise ValueError(
+                "operation IDs cannot be authorized for both fork and upstream: "
+                + ", ".join(sorted(overlap))
+            )
+
+        normalized_actions = tuple(dict.fromkeys(item.action for item in permissions))
+        normalized_operation_ids = permission_ids + upstream_operations
+        object.__setattr__(self, "allowed_fork_write_actions", normalized_actions)
+        object.__setattr__(self, "allowed_operation_ids", normalized_operation_ids)
+        object.__setattr__(self, "allowed_fork_write_operations", permissions)
+        object.__setattr__(self, "allowed_upstream_operation_ids", upstream_operations)
+
+    @property
+    def declared_operation_ids(self) -> tuple[str, ...]:
+        return self.allowed_operation_ids
+
+    def fork_permission_for(self, operation_id: str) -> GitHubOperationPermission | None:
+        operation_id = _required_text(operation_id, "operation_id")
+        return next(
+            (
+                item
+                for item in self.allowed_fork_write_operations
+                if item.operation_id == operation_id
+            ),
+            None,
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "allowed_fork_write_actions": [item.value for item in self.allowed_fork_write_actions],
-            "allowed_operation_ids": list(self.allowed_operation_ids),
+            "allowed_fork_write_operations": [
+                item.to_dict() for item in self.allowed_fork_write_operations
+            ],
+            "allowed_upstream_operation_ids": list(self.allowed_upstream_operation_ids),
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "GitHubTaskPolicy":
         if not isinstance(payload, Mapping):
             raise ValueError("GitHubTaskPolicy payload must be an object")
+        if (
+            "allowed_fork_write_operations" in payload
+            or "allowed_upstream_operation_ids" in payload
+        ):
+            raw_permissions = _object_sequence(
+                payload.get("allowed_fork_write_operations", ()),
+                "allowed_fork_write_operations",
+            )
+            return cls(
+                allowed_fork_write_operations=tuple(
+                    GitHubOperationPermission.from_dict(item)  # type: ignore[arg-type]
+                    for item in raw_permissions
+                ),
+                allowed_upstream_operation_ids=payload.get(
+                    "allowed_upstream_operation_ids", ()
+                ),
+            )
         return cls(
             payload.get("allowed_fork_write_actions", ()),
             payload.get("allowed_operation_ids", ()),
@@ -535,7 +645,7 @@ class HumanApprovalRequired(RuntimeError):
 
 
 class AdapterEffectNotExecuted(RuntimeError):
-    """Adapter assertion that no external mutation occurred and a retry is safe."""
+    """Trusted adapter assertion that no external mutation occurred and retry is safe."""
 
 
 class GitHubEffectOutcomeUnknown(RuntimeError):
@@ -545,7 +655,7 @@ class GitHubEffectOutcomeUnknown(RuntimeError):
         self,
         journal: GitHubEffectJournal,
         request: GitHubEffectRequest,
-        cause: Exception | None = None,
+        cause: BaseException | None = None,
     ) -> None:
         if not isinstance(journal, GitHubEffectJournal):
             raise ValueError("journal must be GitHubEffectJournal")
@@ -619,7 +729,7 @@ class GitHubEffectGateway:
             raise TypeError("checkpoint must be callable")
         if request.action not in _WRITE_ACTIONS:
             raise PermissionError("READ is not a write action")
-        if request.operation_id not in self._policy.allowed_operation_ids:
+        if request.operation_id not in self._policy.declared_operation_ids:
             raise PermissionError(
                 "write operation ID was not declared by the current task policy"
             )
@@ -648,11 +758,16 @@ class GitHubEffectGateway:
 
         repository_class = classify_repository(request.repository)
         if repository_class is RepositoryClass.FORK:
-            if request.action not in self._policy.allowed_fork_write_actions:
+            permission = self._policy.fork_permission_for(request.operation_id)
+            if permission is None or permission.action is not request.action:
                 raise PermissionError(
-                    f"fork write action {request.action.value!r} is not allowed by task policy"
+                    "fork operation/action pair is not allowed by task policy"
                 )
         elif repository_class is RepositoryClass.UPSTREAM:
+            if request.operation_id not in self._policy.allowed_upstream_operation_ids:
+                raise PermissionError(
+                    "upstream write operation ID was not declared by task policy"
+                )
             approval = journal.approval_for(request.operation_id)
             if approval is None:
                 raise HumanApprovalRequired(
@@ -679,9 +794,7 @@ class GitHubEffectGateway:
         )
         uncertain_journal = journal.with_uncertain_request(uncertain_request)
 
-        # This must durably succeed before a write-capable adapter is called. If the
-        # process dies at any point after this checkpoint, resume sees the quarantine
-        # marker and cannot automatically duplicate a possibly completed external write.
+        # Durable quarantine must succeed before a write-capable adapter is called.
         checkpoint(uncertain_journal)
 
         try:
@@ -692,13 +805,9 @@ class GitHubEffectGateway:
                 )
         except AdapterEffectNotExecuted:
             safe_journal = uncertain_journal.without_uncertain_request(request.operation_id)
-            # The adapter explicitly proved that no external effect occurred. Persisting
-            # the cleared marker is what makes a later retry safe.
             checkpoint(safe_journal)
             raise
         except Exception as exc:
-            # The pre-dispatch uncertainty marker is already durable. Do not clear it:
-            # the external operation may have succeeded before the response was lost.
             raise GitHubEffectOutcomeUnknown(uncertain_journal, request, exc) from exc
 
         receipt = GitHubEffectReceipt(
@@ -709,12 +818,12 @@ class GitHubEffectGateway:
             result_ref.strip(),
         )
         completed_journal = (
-            uncertain_journal
-            .without_uncertain_request(request.operation_id)
-            .with_receipt(receipt)
+            uncertain_journal.without_uncertain_request(request.operation_id).with_receipt(receipt)
         )
-        # Persist the replay receipt before exposing success to the caller. If this
-        # checkpoint fails, the previously durable uncertainty marker remains the safe
-        # recovery state and automatic replay stays blocked.
-        checkpoint(completed_journal)
+        try:
+            checkpoint(completed_journal)
+        except Exception as exc:
+            # The write has already returned success, but the durable receipt did not.
+            # The earlier uncertainty checkpoint remains the only safe replay state.
+            raise GitHubEffectOutcomeUnknown(uncertain_journal, request, exc) from exc
         return completed_journal, receipt
