@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -68,29 +67,11 @@ class RecordingReconciler:
     def reconcile(self, request: GitHubEffectRequest) -> GitHubReconciliationResult:
         self.calls.append(request)
         if self.disposition is GitHubReconciliationDisposition.EXECUTED:
-            return GitHubReconciliationResult(self.disposition, f"reconciled:{request.operation_id}")
+            return GitHubReconciliationResult(
+                self.disposition,
+                f"reconciled:{request.operation_id}",
+            )
         return GitHubReconciliationResult(self.disposition)
-
-
-class RecordingStore:
-    def __init__(self, path: Path) -> None:
-        runtime = _runtime()
-        self._inner = runtime.AtomicJsonDevelopmentHostStore(path)
-        self.events: list[str] = []
-        self.fail_save = False
-
-    def load(self):
-        return self._inner.load()
-
-    def save(self, envelope) -> None:
-        self.events.append("save")
-        if self.fail_save:
-            raise OSError("simulated durable persistence failure")
-        self._inner.save(envelope)
-
-
-class DurableStoreSubclass:
-    """Factory wrapper replaced with a real subclass at runtime to satisfy type checks."""
 
 
 def _task() -> TaskSpec:
@@ -102,9 +83,14 @@ def _task() -> TaskSpec:
     )
 
 
-def _core(phase: RunPhase, *, pause_reason: str | None = None) -> RunState:
+def _core(phase: RunPhase) -> RunState:
     research = ResearchArtifact("research-53", "durable host research", ("issue:53",))
-    plan = PlanArtifact("plan-53", "durable host plan", ("test", "implement"), ("issue:53",))
+    plan = PlanArtifact(
+        "plan-53",
+        "durable host plan",
+        ("test", "implement"),
+        ("issue:53",),
+    )
     test = TestIntent(
         "targeted",
         TestKind.TARGETED,
@@ -121,13 +107,13 @@ def _core(phase: RunPhase, *, pause_reason: str | None = None) -> RunState:
             plan=plan,
             test_intents=(test,),
             resume_phase=RunPhase.IMPLEMENT,
-            pause_reason=pause_reason or "trusted recovery required",
+            pause_reason="trusted recovery required",
         )
     assert phase is RunPhase.IMPLEMENT
     return RunState(
         "host-run",
         _task(),
-        phase=RunPhase.IMPLEMENT,
+        phase=phase,
         research=research,
         plan=plan,
         test_intents=(test,),
@@ -155,6 +141,12 @@ def _request(
     )
 
 
+def _sensitive_request() -> GitHubEffectRequest:
+    # DISPATCH_WORKFLOW is intentionally sensitive at the HARN-023 boundary but,
+    # unlike MERGE_PULL_REQUEST, is a valid pre-review ImplementationResult effect.
+    return _request(action=GitHubAction.DISPATCH_WORKFLOW)
+
+
 def _approval(request: GitHubEffectRequest) -> HumanApproval:
     return HumanApproval(
         "approval-1",
@@ -177,18 +169,23 @@ def _pending_state(
         ("agent/harness/development_host.py",),
         (request.operation_id,),
     )
-    pending = ImplementationResult(change, HEAD, (request,), 0.0, ("fixture:pending",))
-    reason = None if phase is RunPhase.IMPLEMENT else "trusted recovery required"
+    pending = ImplementationResult(
+        change,
+        HEAD,
+        (request,),
+        0.0,
+        ("fixture:pending",),
+    )
     return DevelopmentControllerState(
         schema_version=1,
         base_sha=BASE,
-        core=_core(phase, pause_reason=reason),
+        core=_core(phase),
         pending_implementation=pending,
         pending_operation_index=0,
         current_head_sha=HEAD,
         github_journal=journal or GitHubEffectJournal(),
         stop_code=stop_code,
-        stop_reason=reason if stop_code is not None else None,
+        stop_reason="trusted recovery required" if stop_code is not None else None,
         audit_events=("fixture",),
     )
 
@@ -232,7 +229,11 @@ def _reviewer() -> IndependentReviewer:
     def unused_review(_context):
         raise RuntimeError("unused review port")
 
-    return IndependentReviewer("independent-reviewer", unused_review, "implementer")
+    return IndependentReviewer(
+        "independent-reviewer",
+        unused_review,
+        "implementer",
+    )
 
 
 def _host(
@@ -248,9 +249,7 @@ def _host(
     runtime = _runtime()
     durable_store = store or runtime.AtomicJsonDevelopmentHostStore(tmp_path / "host.json")
     if state is not None or trusted_approvals:
-        durable_store.save(
-            runtime.DevelopmentHostEnvelope(1, state, trusted_approvals)
-        )
+        durable_store.save(runtime.DevelopmentHostEnvelope(1, state, trusted_approvals))
     return runtime.TrustedDevelopmentHost(
         durable_store,
         controller_policy=_controller_policy(),
@@ -266,12 +265,9 @@ def _host(
 
 
 def test_restart_restores_trusted_approval_authority_for_sensitive_effect(tmp_path: Path) -> None:
-    request = _request(action=GitHubAction.MERGE_PULL_REQUEST)
+    request = _sensitive_request()
     approval = _approval(request)
-    state = _pending_state(
-        request,
-        journal=GitHubEffectJournal(approvals=(approval,)),
-    )
+    state = _pending_state(request, journal=GitHubEffectJournal(approvals=(approval,)))
     adapter = RecordingAdapter()
     host = _host(
         tmp_path,
@@ -290,12 +286,9 @@ def test_restart_restores_trusted_approval_authority_for_sensitive_effect(tmp_pa
 
 
 def test_journal_approval_without_persisted_trusted_authority_cannot_authorize(tmp_path: Path) -> None:
-    request = _request(action=GitHubAction.MERGE_PULL_REQUEST)
+    request = _sensitive_request()
     approval = _approval(request)
-    state = _pending_state(
-        request,
-        journal=GitHubEffectJournal(approvals=(approval,)),
-    )
+    state = _pending_state(request, journal=GitHubEffectJournal(approvals=(approval,)))
     adapter = RecordingAdapter()
     host = _host(tmp_path, request, state=state, adapter=adapter)
 
@@ -311,7 +304,7 @@ def test_resume_with_approval_persists_before_live_authority_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _runtime()
-    request = _request(action=GitHubAction.MERGE_PULL_REQUEST)
+    request = _sensitive_request()
     approval = _approval(request)
     state = _pending_state(
         request,
@@ -356,7 +349,7 @@ def test_failed_approval_persistence_never_reaches_live_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _runtime()
-    request = _request(action=GitHubAction.MERGE_PULL_REQUEST)
+    request = _sensitive_request()
     approval = _approval(request)
     state = _pending_state(
         request,
@@ -403,13 +396,14 @@ def test_controller_persistence_callback_revalidates_serialized_state(
     def reject(_cls, _payload):
         raise ValueError("canonical controller revalidation sentinel")
 
-    monkeypatch.setattr(
-        runtime.DevelopmentControllerState,
-        "from_dict",
-        classmethod(reject),
-    )
+    monkeypatch.setattr(runtime.DevelopmentControllerState, "from_dict", classmethod(reject))
     with pytest.raises(ValueError, match="revalidation sentinel"):
-        host.start(run_id="new-run", task=_task(), base_sha=BASE, provenance_refs=("issue:53",))
+        host.start(
+            run_id="new-run",
+            task=_task(),
+            base_sha=BASE,
+            provenance_refs=("issue:53",),
+        )
 
     assert host.state is None
 
@@ -470,10 +464,7 @@ def test_restart_replays_durable_receipt_without_duplicate_provider_write(tmp_pa
         request.action,
         "provider:already-executed",
     )
-    state = _pending_state(
-        request,
-        journal=GitHubEffectJournal(receipts=(receipt,)),
-    )
+    state = _pending_state(request, journal=GitHubEffectJournal(receipts=(receipt,)))
     adapter = RecordingAdapter()
     host = _host(tmp_path, request, state=state, adapter=adapter)
 
@@ -539,7 +530,7 @@ def test_host_public_surface_does_not_expose_privileged_dependencies(tmp_path: P
     assert host.envelope.controller_state is None
 
 
-def test_trusted_host_requires_explicit_durable_store(tmp_path: Path) -> None:
+def test_trusted_host_requires_explicit_durable_store() -> None:
     runtime = _runtime()
     request = _request()
     with pytest.raises((TypeError, ValueError), match="store|durable"):
