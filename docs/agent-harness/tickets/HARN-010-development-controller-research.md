@@ -10,152 +10,107 @@ Build the development controller for issue-driven research -> plan -> tests/RED 
 
 ### HARN-002 owns durable development phases
 
-`agent/harness/contracts.py` and `state_machine.py` already define the authoritative phase model:
+`agent/harness/contracts.py` and `state_machine.py` define the authoritative phase model:
 
 `RESEARCH -> PLAN -> TEST_DESIGN -> IMPLEMENT -> VERIFY -> REVIEW -> COMPLETE`
 
-with explicit `BLOCKED` and `AWAITING_HUMAN` exceptional states and deterministic `ResumeRequested` semantics.
+with explicit `BLOCKED` and `AWAITING_HUMAN` exceptional states. HARN-010 should orchestrate these contracts, not introduce a parallel phase state machine.
 
-The state machine already enforces:
-
-- research before plan;
-- plan before test declaration;
-- declared tests before implementation;
-- unique change IDs and operation IDs;
-- fresh verification evidence bound to one proposed head and one executed revision;
-- failed tests/regressions route back to implementation;
-- reviewer `REQUEST_CHANGES` routes back to implementation;
-- reviewer escalation routes to `AWAITING_HUMAN`;
-- stale review revisions are rejected.
-
-HARN-010 should orchestrate these contracts, not introduce a parallel phase state machine.
+The state machine already enforces research/plan/test ordering, unique change and operation IDs, fresh verification evidence bound to one head/executed revision, reviewer routing, and stale-review rejection.
 
 ### Strict TDD/RED needs one controller-level gate
 
-HARN-002 transitions from `TEST_DESIGN` to `IMPLEMENT` immediately when tests are declared. That phase means implementation is *permitted*, not that code has already changed. Therefore HARN-010 can preserve HARN-002 unchanged and insert a controller-level pre-change RED gate before calling the implementation port.
+HARN-002 moves to `IMPLEMENT` as soon as tests are declared. HARN-010 therefore adds a pre-change RED gate before invoking the implementation port. RED evidence records targeted intent, exact baseline SHA, real exit/failure counts, and evidence refs. Model text cannot substitute for executed RED evidence.
 
-The RED artifact should record the declared targeted test(s), baseline revision, exit/failure evidence, and evidence refs. The controller must refuse the first implementation attempt until:
-
-- every required targeted RED probe has executed against the pre-change revision; and
-- at least one targeted test demonstrates the missing/broken behavior with a real non-zero test result.
-
-A model assertion such as “this should fail” is not RED evidence.
-
-Subsequent review-driven revisions do not require re-proving the original baseline RED; they require fresh verification and fresh review on the new head.
+The original baseline RED is not repeated automatically for every revision; every candidate revision still requires fresh verification and fresh independent review.
 
 ### HARN-006 owns independent development review
 
-`development_reviewer.py` already provides:
+`development_reviewer.py` provides allowlisted clean-context packets, exact base/head/executed revision binding, final-diff digest binding, fresh successful test/eval evidence, independent reviewer identity constraints, and HARN-002 routing. HARN-010 calls this boundary rather than exposing arbitrary controller scratch/history to the reviewer.
 
-- allowlisted `DevelopmentReviewContext` packets;
-- exact base/head/executed revision binding;
-- diff digest binding;
-- only successful fresh test/eval evidence in the review packet;
-- structured review findings and disposition;
-- independent reviewer identity constraints;
-- routing back through HARN-002 `ReviewRecorded`.
+## GitHub write authority after HARN-023
 
-HARN-010 should call this boundary rather than passing arbitrary controller/model history to the reviewer.
+### Research delta: HARN-023 superseded the initial HARN-009 integration choice
 
-### HARN-009 owns GitHub write authority
+While HARN-010 was in progress, HARN-023 (#54) reconciled two independently merged HARN-009 implementations. The integration branch now has exactly one canonical development-controller GitHub mutation authority:
 
-The authoritative production write capability is `github_side_effects.GuardedGitHubSideEffects`:
+`agent/harness/github_effects.py`
 
-- closed typed operations;
-- fork/upstream classification;
-- exact trusted human approval registry;
-- durable PREPARED/COMPLETED journal protocol;
-- reconciliation before retry after uncertain outcomes;
-- operation fingerprints and replay conflict detection;
-- explicit refs for sensitive integration/publication actions.
+`github_side_effects.py` was deliberately removed rather than retained as a compatibility write surface. HARN-010 must follow the new integration contract; restoring or continuing to import the retired module would recreate the duplicate-authority defect HARN-023 fixed.
 
-Issue #51 records the production wiring constraint: HARN-010 must provide atomic durable journal persistence, deterministic provider reconciliation, and host-owned approval-registry persistence; model-controlled code must not receive approval registration or raw provider transport.
+The canonical boundary retains the strongest reviewed invariants from both earlier implementations:
 
-### Legacy `github_effects.py`
+- a closed `GitHubAction` vocabulary with no raw/generic transport;
+- exact fork/upstream repository classification;
+- task-local fork operation -> action permissions and separately declared upstream operation IDs;
+- first-class `target_ref` bound into request identity;
+- protected fork integration refs;
+- explicit refs for branch/ref and integration/publication actions;
+- trusted host-owned `HumanApprovalAuthority` for every upstream write and sensitive fork integration/publication action;
+- durable pre-dispatch uncertainty checkpointing;
+- immutable `GitHubEffectJournal` with receipts and uncertain-operation quarantine;
+- deterministic trusted reconciliation without blind redispatch;
+- post-write receipt-persistence failure quarantine;
+- replay from a durable receipt without another provider write.
 
-The repository also contains an older `GitHubEffectGateway`. Its tests show useful historical invariants: explicit task policy, operation IDs, pre-dispatch checkpoint, ambiguous-outcome blocking, and no raw generic GitHub action. It is not obviously unsafe by itself.
+HARN-010 therefore accepts only `GitHubEffectGateway` as its mutation gateway and stores the current `GitHubEffectJournal` in the durable controller envelope. It never receives the underlying write adapter, reconciler, or approval-authority registration capability.
 
-However, it is a *second effect authority* with older approval/journal semantics. HARN-010 must not expose both gateways. Production controller writes should flow only through `GuardedGitHubSideEffects`. The legacy module may remain for compatibility/tests, but it is not a controller port and must not be imported by the new controller implementation.
+### Persistence consequence
+
+The canonical gateway receives a synchronous `checkpoint(GitHubEffectJournal)` callback for every write. HARN-010 must implement that checkpoint by durably persisting a controller snapshot containing the updated journal before the gateway is allowed to dispatch the provider write.
+
+After a successful write, the gateway checkpoints the completed receipt before returning. There is still a smaller crash window between that durable receipt checkpoint and the controller snapshot that advances its pending-operation index/write counter. Therefore a pending operation replayed from an already-durable receipt must still consume exactly one run-scoped GitHub-write budget slot when the controller consumes that pending operation after restart.
+
+This is the independent-review blocker captured by `test_development_controller_adversarial.py`.
+
+### Operation-ID reuse must be rejected before dispatch
+
+HARN-002 rejects duplicate operation IDs when a `ChangeSet` is recorded, but GitHub effects are dispatched before `ChangeRecorded`. A later revision that reuses a prior operation ID could therefore replay/dispatch before HARN-002 rejects the new change. HARN-010 must preflight pending `change_id` and `operation_ids` against already recorded changes before any gateway call and terminate with an explicit policy reason.
+
+### Production-host follow-up
+
+Issue #53 remains the host-wiring follow-up. Its terminology predates HARN-023, but the invariant survives: production must durably restore the controller envelope/journal, the trusted human approval authority, and deterministic reconciliation capability without exposing authority registration or raw provider transport to model-controlled code. HARN-010 defines the controller/checkpoint boundary; a concrete production storage/provider host belongs to #53.
 
 ## Controller-owned durable envelope
 
-HARN-002 `RunState` captures semantic workflow state but not controller budgets, baseline RED evidence, or terminal controller reasons. HARN-010 therefore needs a small serializable envelope around `RunState`, containing at least:
+HARN-002 `RunState` captures semantic workflow state but not controller budgets, baseline RED evidence, GitHub effect journal, pending implementation, or terminal controller reasons. HARN-010 therefore needs a serializable envelope containing at least:
 
-- schema version and controller run ID;
-- exact base revision;
+- schema version and exact baseline revision;
 - HARN-002 `RunState`;
+- issue/provenance refs;
 - pre-change RED evidence;
-- revision/implementation attempt count;
-- test/eval execution count;
-- review count;
-- GitHub write count or side-effect operation references;
-- accumulated cost units when supplied by ports;
+- pending implementation and pending operation index;
+- canonical `GitHubEffectJournal`;
+- revision, verification, review, GitHub-write, and cost counters;
 - explicit terminal reason/code;
-- audit records/evidence refs sufficient to reconstruct decisions.
+- chronological audit records.
 
-The envelope must serialize deterministically and be persisted after every semantic transition/counter update. A restart loads the envelope and resumes from the HARN-002 phase plus controller gate state; it must not replay completed GitHub effects because HARN-009 separately owns effect idempotency.
+The envelope is persisted after every accepted transition/counter mutation and from the gateway checkpoint before provider dispatch.
 
 ## Bounds and termination
 
-Controller policy should make limits explicit and non-negative/positive as appropriate:
+Controller policy explicitly bounds implementation/revision attempts, verification executions, review attempts, GitHub writes, optional cost units, and the overall step loop. Limits are checked before expensive or side-effecting calls. Exhaustion becomes a persisted blocked terminal reason; there is no unbounded retry loop.
 
-- maximum implementation/revision attempts;
-- maximum test/eval executions;
-- maximum review attempts;
-- maximum GitHub writes;
-- optional maximum cost units;
-- optional no-feature fallback permission.
+Repeated test failures and reviewer rejections route back to implementation only while budgets remain. `COMPLETE`, `BLOCKED`, and `AWAITING_HUMAN` are explicit auditable stop states.
 
-The controller checks the relevant budget **before** invoking an expensive or side-effecting port. Exhaustion is terminal/blocked with an explicit reason; there is no implicit unbounded while-loop.
+## Revision identity and model-output distrust
 
-A reviewer rejection consumes a revision attempt and can return to implementation only while budget remains. Repeated test failure likewise consumes bounded attempts. Safe termination includes `COMPLETE`, `BLOCKED`, and `AWAITING_HUMAN`, each with an auditable reason.
+Every implementation identifies its `ChangeSet` and proposed head. Verification ports report both proposed head and executed revision. HARN-002 and HARN-006 retain their stale/mixed evidence checks. RED evidence is separately bound to the exact baseline SHA.
 
-## Failure classification
+The controller treats port/model output as proposed structured evidence; only executed test/eval results and the independent review contract can advance verification/review state.
 
-Normalize external port outcomes into the existing HARN-002 categories where possible:
+## Human approval and orchestration framework
 
-- successful execution;
-- test failure;
-- regression;
-- blocked execution/dependency;
-- human escalation/approval required;
-- policy/budget block.
+LangGraph interrupt/persistence documentation reinforces that side effects preceding an interrupt must be idempotent and durably checkpointed. HARN-010 correctness remains framework-neutral: approval/uncertainty/replay safety belongs below any future LangGraph or Deep Agents host, inside the canonical HARN-023 gateway plus durable controller checkpoint.
 
-Programming errors/invariant violations should fail closed rather than be converted into success-like model text.
+A future orchestration host may map `AWAITING_HUMAN` to its interrupt primitive, but HARN-010 does not require another graph/framework dependency.
 
-## Revision identity
+## No-feature fallback and HARN-017 provenance
 
-Every implementation result must identify the resulting change and proposed head. Verification ports must report both proposed head and actually executed revision. HARN-002 already rejects mixed/stale evidence at `VerificationPassed`; HARN-006 repeats the binding for review context. HARN-010 should not weaken either check.
+Fallback work is legal only when explicitly enabled and only for performance, stability, ergonomics, documentation, or edge cases. It must become a normal task and pass the same gates.
 
-The pre-change RED evidence is separately bound to the controller's exact baseline revision, so a RED run from another branch/revision cannot unlock implementation.
-
-## Human approval and interrupts
-
-Current LangGraph documentation (checked 2026-09-11) confirms that interrupts use a checkpointer/thread ID and that resuming an interrupt restarts the interrupted node from the beginning rather than continuing at the exact source line. The docs explicitly require idempotent side effects before interrupts and recommend durable checkpointers in production:
-
-- https://docs.langchain.com/oss/python/langgraph/interrupts
-- https://docs.langchain.com/oss/python/langgraph/persistence
-
-This reinforces the architecture already chosen in HARN-009: GitHub idempotency/approval lives below any orchestration framework. HARN-010 core semantics should stay framework-neutral. A future LangGraph host can map `AWAITING_HUMAN` to `interrupt()` and persist the controller envelope with a durable checkpointer, but correctness cannot depend on LangGraph replay behavior.
-
-## No-feature fallback
-
-The issue requires fallback work only when explicitly enabled by controller policy. Therefore the controller must not silently invent feature scope after an issue is complete/blocked. When enabled, a fallback selector may choose only from:
-
-- performance;
-- stability;
-- ergonomics;
-- documentation;
-- edge cases.
-
-The fallback itself should produce a normal TaskSpec/issue provenance and pass the same research-plan-RED-implementation-verification-review gates.
-
-## HARN-017 provenance compatibility
-
-HARN-010 should treat issue provenance as structured opaque refs attached to the task/run envelope. It must preserve corpus/run/expert references supplied by future HARN-017 issues rather than reinterpret them or manufacture parser scope. Parser/eval gates are attachable ports when the issue explicitly requires them.
+HARN-017 provenance is preserved as opaque structured refs. The controller does not invent parser scope; parser/eval gates are attached only when the issue requires them.
 
 ## Scope decision
 
-Implement a small synchronous/framework-neutral bounded controller around HARN-002, HARN-006, and HARN-009. Do not add Deep Agents or a second LangGraph graph. Do not wire live GitHub credentials in unit tests. The implementation should make host ports explicit and testable with deterministic fakes.
-
-The production-host contract must make durable persistence mandatory for GitHub side effects; default/in-memory HARN-009 journal mode is allowed only in explicit offline/test configuration.
+Implement a small synchronous/framework-neutral bounded controller around HARN-002, HARN-006, and the post-HARN-023 canonical `github_effects.GitHubEffectGateway`. Do not add Deep Agents, a second LangGraph graph, or a second GitHub mutation authority. Unit tests use deterministic fake adapters/checkpoints only and perform no live upstream writes or notifications.
