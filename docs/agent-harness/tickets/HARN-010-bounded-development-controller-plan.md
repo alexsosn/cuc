@@ -11,165 +11,153 @@ Add a deterministic, restartable, explicitly bounded controller layer over the e
 
 A successful implementation must provide:
 
-1. a typed next-action vocabulary derived only from the current `RunState.phase`;
-2. a strict serializable controller checkpoint containing run binding, limits, and counters;
+1. a typed next-action vocabulary derived from `RunState.phase`;
+2. a strict serializable controller checkpoint containing run binding, limits, counters, and pending-action recovery data;
 3. one-step scheduling with immutable input/output values;
 4. hard global / implementation / review bounds;
 5. explicit stops for COMPLETE, BLOCKED, and AWAITING_HUMAN;
-6. explicit resume through the existing state-machine `ResumeRequested` event, not controller inference;
-7. deterministic restart behavior after checkpoint serialization;
+6. explicit resume through the existing `ResumeRequested` event, not controller inference;
+7. deterministic restart behavior, including crash after action issuance but before state progress;
 8. no GitHub/model/reviewer/shell/filesystem side effects in controller code.
 
 ## Proposed API
 
-Create `agent/harness/development_controller.py` with:
+Create `agent/harness/development_controller.py`.
 
 ### `ControllerActionKind`
 
-Closed enum:
-
-- `RESEARCH`
-- `PLAN`
-- `DESIGN_TESTS`
-- `IMPLEMENT`
-- `VERIFY`
-- `REVIEW`
+Closed enum: `RESEARCH`, `PLAN`, `DESIGN_TESTS`, `IMPLEMENT`, `VERIFY`, `REVIEW`.
 
 ### `ControllerStopReason`
 
-Closed enum:
-
-- `COMPLETE`
-- `BLOCKED`
-- `AWAITING_HUMAN`
-- `STEP_LIMIT_REACHED`
-- `IMPLEMENTATION_LIMIT_REACHED`
-- `REVIEW_LIMIT_REACHED`
+Closed enum: `COMPLETE`, `BLOCKED`, `AWAITING_HUMAN`, `STEP_LIMIT_REACHED`, `IMPLEMENTATION_LIMIT_REACHED`, `REVIEW_LIMIT_REACHED`.
 
 ### `ControllerLimits`
 
-Frozen value object with positive integer:
+Frozen value object with positive integer `max_steps`, `max_implementation_attempts`, and `max_review_attempts`. Strict `to_dict` / `from_dict`.
 
-- `max_steps`
-- `max_implementation_attempts`
-- `max_review_attempts`
+### `ControllerAction`
 
-It supports strict `to_dict` / `from_dict` serialization.
+Frozen value object containing:
+
+- action kind;
+- source `RunPhase`;
+- ordinal global step number;
+- the SHA-256 fingerprint of the `RunState` snapshot for which the action was issued.
+
+Strict serialization is needed because an action is persisted inside the checkpoint.
 
 ### `ControllerCheckpoint`
 
 Frozen value object:
 
-- `schema_version`
-- `run_id`
-- `limits`
-- `steps_used`
-- `implementation_attempts`
-- `review_attempts`
+- `schema_version`;
+- `run_id`;
+- `limits`;
+- `steps_used`;
+- `implementation_attempts`;
+- `review_attempts`;
+- optional `pending_action`.
 
-Strict versioned `to_dict` / `from_dict`; counters must be non-negative and may not exceed corresponding limits.
+Strict versioned `to_dict` / `from_dict`; counters must be non-negative and may not exceed corresponding limits. A pending action must have `ordinal == steps_used`, and its kind/source phase must be a valid phase/action pair.
 
-No mutable “terminal” bit is needed: terminal/paused status is derived from the current `RunState` and current limits on every call. This avoids a stale controller terminal flag after a legitimate core-state resume.
+No mutable terminal bit is stored: terminal/paused status is derived from current `RunState` and limits. This avoids stale terminal state after legitimate resume.
 
-### `ControllerAction`
+### Run-state fingerprint
 
-Frozen output containing:
-
-- action kind;
-- source `RunPhase`;
-- ordinal scheduled step number.
+Use canonical JSON of `RunState.to_dict()` (`sort_keys=True`, compact separators, UTF-8) and SHA-256. The fingerprint is scheduler identity for an observed state snapshot; it is not a security signature.
 
 ### `ControllerDecision`
 
-Frozen result with exactly one of:
-
-- `action`, or
-- `stop_reason`.
-
-Also returns the next checkpoint. For stop decisions the checkpoint is value-equal to the input checkpoint.
+Frozen result with exactly one of `action` or `stop_reason`, plus the checkpoint to persist.
 
 ### `BoundedDevelopmentController.step(state, checkpoint)`
 
 Pure single-step scheduling:
 
-1. validate `RunState` and `ControllerCheckpoint` types;
-2. require checkpoint `run_id == state.run_id`;
-3. if core phase is COMPLETE/BLOCKED/AWAITING_HUMAN, return the matching stop without consuming budget;
-4. check global step budget;
-5. map the phase to one action;
-6. check phase-specific implementation/review budget;
-7. return one action and a new checkpoint with exactly the relevant counters incremented.
+1. validate types and require `checkpoint.run_id == state.run_id`;
+2. compute current state fingerprint;
+3. if `pending_action` is bound to the same fingerprint, replay that exact action with the checkpoint unchanged;
+4. otherwise acknowledge progress by clearing stale pending work logically;
+5. if core phase is COMPLETE/BLOCKED/AWAITING_HUMAN, return the matching stop without consuming budget;
+6. check global step budget;
+7. map normal phase to one action;
+8. check phase-specific implementation/review budget;
+9. return one new action and a checkpoint with counters incremented once and that action stored as pending.
 
-The function never calls `apply_event`; events remain evidence supplied by the host after actual work. This separation prevents scheduling from pretending work completed.
+The function never calls `apply_event`; events remain evidence supplied by the host after actual work.
+
+## Persistence protocol
+
+The host must persist the returned checkpoint **before** executing a newly issued action. If it crashes afterward and reloads the same `RunState`, `step()` replays the pending action without incrementing counters. Existing effect boundaries remain responsible for idempotent/reconciled provider writes.
+
+When action completion produces a different durable `RunState`, the next call recognizes the changed fingerprint and schedules from the new phase. If the changed state is paused or complete, the returned checkpoint clears pending work.
 
 ## TDD sequence
 
-### RED 1 — normal deterministic scheduling
+### RED 1 — deterministic scheduling
 
-Tests for all six normal phases, stable mapping, run binding, immutable inputs, one increment per call.
+Tests for all six normal phases, stable phase/action mapping, run binding, immutable inputs, and one increment for a newly issued action.
 
-### RED 2 — terminal / pause behavior
-
-Tests for COMPLETE, BLOCKED, AWAITING_HUMAN. No budgets consumed.
-
-### RED 3 — bounds
+### RED 2 — pending action restart semantics
 
 Tests for:
 
-- global step exhaustion;
-- implementation-attempt exhaustion;
-- review-attempt exhaustion;
-- precedence: exceptional/core terminal phases stop without being masked by an exhausted global budget.
+- same state + returned checkpoint → exact action replay;
+- replay does not increment any counter;
+- serialization/restoration preserves replay behavior;
+- changed core state acknowledges prior pending action and allows one next action.
 
-### RED 4 — restartability / validation
+### RED 3 — terminal / pause behavior
 
-Tests for:
+Tests for COMPLETE, BLOCKED, AWAITING_HUMAN and pending-action clearing after the core state changes to one of those phases.
 
-- checkpoint JSON round trip;
-- same state + restored checkpoint → same decision;
-- cross-run checkpoint reuse rejected;
-- unknown fields / schema version rejected;
-- bool-as-int rejected;
-- invalid limits/counters rejected.
+### RED 4 — bounds
 
-### RED 5 — integration with existing reducer
+Tests for exact off-by-one behavior of global, implementation, and review limits; exceptional/core terminal phases take precedence over exhausted limits once progress has changed state.
 
-Construct a small lifecycle using existing `apply_event` semantics to prove:
+### RED 5 — strict validation
 
-- failed verification routes to IMPLEMENT and consumes a second implementation attempt when scheduled;
-- explicit `ResumeRequested` is required before controller scheduling resumes from a pause;
+Tests for cross-run checkpoint reuse, unknown fields/schema versions, bool-as-int, invalid limits/counters, malformed pending action, invalid phase/action pair, and impossible ordinal.
+
+### RED 6 — existing reducer integration
+
+Construct lifecycle snippets with `apply_event` to prove:
+
+- verification failure routes to IMPLEMENT and a later new IMPLEMENT action consumes a second attempt;
+- explicit `ResumeRequested` is required before scheduling resumes from a pause;
 - review request-changes routes back to IMPLEMENT without controller-owned phase mutation.
 
 ## Implementation order
 
 1. add tests only and commit RED state;
-2. run agent test workflow and capture expected failure because controller module/API is absent;
+2. run agent test workflow and capture expected missing-module/API failure;
 3. implement `development_controller.py` only;
 4. run targeted/full agent tests;
-5. inspect exact diff against this plan;
-6. perform logically independent adversarial review focusing on serialization tampering, off-by-one bounds, auto-resume, run mismatch, and hidden side effects;
-7. turn any review blocker into a RED regression before fixing;
+5. inspect exact diff against research and plan;
+6. perform logically independent adversarial review focusing on replay, tampering, off-by-one bounds, auto-resume, run mismatch, and hidden side effects;
+7. turn every review blocker into a RED regression before fixing;
 8. require green exact-head CI before merge.
 
 ## Non-goals
 
-- no automatic `while`/forever loop;
-- no change to `RunState` or `state_machine.apply_event` unless a demonstrated contract bug blocks HARN-010;
-- no provider SDK calls;
-- no GitHub write execution;
+- no internal `while`/forever loop;
+- no change to `RunState` or `state_machine.apply_event` unless a demonstrated core contract bug blocks HARN-010;
+- no provider SDK calls or GitHub writes;
 - no human-approval interpretation;
-- no persistence backend (the checkpoint is a strict persistable value; storage remains host-owned);
+- no persistence backend;
 - no parser/domain-specific policy.
 
 ## Adversarial questions for final review
 
 - Can a boolean bypass integer limit validation?
-- Is `max_steps=N` exactly N issued work actions, not N+1?
-- Can IMPLEMENT or REVIEW exceed their phase-specific budget while global budget remains?
-- Does a paused/complete run consume or mutate counters?
+- Is `max_steps=N` exactly N newly issued work actions?
+- Does same-state restart replay rather than allocate N+1?
+- Can a forged pending action claim a different phase/kind/ordinal?
+- Can IMPLEMENT or REVIEW exceed phase-specific budgets while global budget remains?
+- Does changed state clear pending action before terminal/pause decisions?
 - Can checkpoint data from another run be replayed?
 - Can unknown serialized fields silently alter future semantics?
-- Does restart change the selected action or counters?
 - Does controller code call external effects or manufacture lifecycle events?
 - Can an exceptional phase auto-resume because an action mapping falls through?
-- Are prior immutable checkpoint values modified in place?
+- Are immutable checkpoint inputs modified in place?
