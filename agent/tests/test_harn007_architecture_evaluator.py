@@ -7,7 +7,9 @@ import sys
 
 
 AGENT_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = AGENT_ROOT.parent
 SCRIPT = AGENT_ROOT / "scripts" / "evaluate_harn007_architecture.py"
+ADR = REPO_ROOT / "docs" / "agent-harness" / "adr" / "HARN-007-deepagents-vs-langgraph.md"
 DEEPAGENTS_REVISION = "54696577caf3dfcefb662db08b4a8034ec6a35cd"
 
 
@@ -89,6 +91,15 @@ def test_external_framework_observations_are_dated_and_source_backed() -> None:
     assert github_sources
     assert all(DEEPAGENTS_REVISION in source for source in github_sources)
     assert all("/blob/main/" not in source for source in github_sources)
+
+
+def test_final_adr_records_pinned_evidence_and_decision() -> None:
+    assert ADR.is_file()
+    content = ADR.read_text(encoding="utf-8")
+    assert DEEPAGENTS_REVISION in content
+    assert "retain explicit HARN-004 LangGraph" in content
+    assert "defer Deep Agents for development-controller execution until HARN-009" in content
+    assert "do not add `deepagents`" in content
 
 
 def test_report_is_deterministic() -> None:
