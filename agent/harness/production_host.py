@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import errno
+from hashlib import sha256
+from hmac import compare_digest
 import json
 import os
 from pathlib import Path
@@ -34,9 +36,12 @@ from .state_machine import ResumeRequested, apply_event
 
 
 _HOST_SCHEMA = 1
-_HOST_FIELDS = frozenset(
-    {"schema_version", "controller_state", "trusted_approvals"}
+_HOST_PAYLOAD_FIELDS = (
+    "schema_version",
+    "controller_state",
+    "trusted_approvals",
 )
+_HOST_FIELDS = frozenset((*_HOST_PAYLOAD_FIELDS, "payload_sha256"))
 _UNSUPPORTED_DIRECTORY_FSYNC = frozenset(
     value
     for value in (
@@ -48,6 +53,23 @@ _UNSUPPORTED_DIRECTORY_FSYNC = frozenset(
     )
     if value is not None
 )
+
+
+def _host_payload_sha256(payload: Mapping[str, object]) -> str:
+    """Checksum the complete serialized host payload, excluding the checksum itself.
+
+    This detects accidental corruption/truncation of durable state. It is not an
+    authentication mechanism; the filesystem remains a trusted host boundary.
+    """
+
+    encoded = json.dumps(
+        {field: payload[field] for field in _HOST_PAYLOAD_FIELDS},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
 
 
 def _approval_sequence(value: object) -> tuple[HumanApproval, ...]:
@@ -90,7 +112,7 @@ class ProductionHostEnvelope:
             _approval_sequence(self.trusted_approvals),
         )
 
-    def to_dict(self) -> dict[str, object]:
+    def _payload_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
             "controller_state": (
@@ -99,16 +121,33 @@ class ProductionHostEnvelope:
             "trusted_approvals": [item.to_dict() for item in self.trusted_approvals],
         }
 
+    def to_dict(self) -> dict[str, object]:
+        payload = self._payload_dict()
+        return {
+            **payload,
+            "payload_sha256": _host_payload_sha256(payload),
+        }
+
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ProductionHostEnvelope":
         if not isinstance(payload, Mapping):
             raise ValueError("production host envelope must be an object")
-        missing = _HOST_FIELDS - set(payload)
+        supplied = set(payload)
+        missing = _HOST_FIELDS - supplied
         if missing:
             raise ValueError(
                 "production host envelope missing required fields: "
                 + ", ".join(sorted(missing))
             )
+        extra = supplied - _HOST_FIELDS
+        if extra:
+            raise ValueError(
+                "production host envelope contains unknown fields: "
+                + ", ".join(sorted(extra))
+            )
+        if isinstance(payload["schema_version"], bool) or payload["schema_version"] != _HOST_SCHEMA:
+            raise ValueError(f"host schema_version must be {_HOST_SCHEMA}")
+
         raw_state = payload["controller_state"]
         raw_approvals = payload["trusted_approvals"]
         if isinstance(raw_approvals, (str, bytes, Mapping)):
@@ -117,16 +156,35 @@ class ProductionHostEnvelope:
             approval_items = tuple(raw_approvals)
         except TypeError as exc:
             raise ValueError("trusted_approvals must be an array") from exc
+
+        # Parse semantic contracts before the checksum so malformed values retain
+        # precise validation errors. The checksum then catches otherwise-valid
+        # truncation where permissive nested readers would have supplied defaults.
+        state = (
+            None
+            if raw_state is None
+            else DevelopmentControllerState.from_dict(raw_state)
+        )
+        approvals = tuple(HumanApproval.from_dict(item) for item in approval_items)
+        _approval_sequence(approvals)
+
+        supplied_digest = payload["payload_sha256"]
+        if (
+            not isinstance(supplied_digest, str)
+            or len(supplied_digest) != 64
+            or any(character not in "0123456789abcdef" for character in supplied_digest)
+        ):
+            raise ValueError("production host envelope payload_sha256 must be a SHA-256 digest")
+        expected_digest = _host_payload_sha256(payload)
+        if not compare_digest(supplied_digest, expected_digest):
+            raise ValueError(
+                "production host envelope integrity digest mismatch; state may be corrupt or truncated"
+            )
+
         return cls(
             schema_version=payload["schema_version"],
-            controller_state=(
-                None
-                if raw_state is None
-                else DevelopmentControllerState.from_dict(raw_state)
-            ),
-            trusted_approvals=tuple(
-                HumanApproval.from_dict(item) for item in approval_items
-            ),
+            controller_state=state,
+            trusted_approvals=approvals,
         )
 
 
