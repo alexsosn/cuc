@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import json
+from pathlib import Path
 
 import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _runtime():
@@ -91,3 +96,18 @@ def test_decision_record_rejects_observed_tokens_outside_fixed_workload() -> Non
             rationale="fixture",
             evidence_refs=("fixture:evidence",),
         )
+
+
+def test_committed_harn_007_evidence_is_machine_valid_and_matches_decision() -> None:
+    runtime = _runtime()
+    path = REPO_ROOT / "docs/agent-harness/tickets/HARN-007-deep-agents-evidence.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    record = runtime.DeepAgentsDecisionRecord.from_dict(payload)
+
+    assert record.disposition is runtime.DeepAgentsDisposition.KEEP_LANGGRAPH
+    assert record.deepagents_version == "0.7.13"
+    assert record.required_token_ids == ("t1", "t2", "t3")
+    assert record.observed_token_ids == ("t1",)
+    assert record.early_termination_observed is True
+    assert "git:5920d3758442e7d775c7af37f3acb4f89b2606dd" in record.evidence_refs
+    assert "synthetic-merge:7b376228f3653aa8639b97619c2795ed31105da6" in record.evidence_refs
