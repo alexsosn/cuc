@@ -6,10 +6,12 @@ import pytest
 
 from harness.contracts import (
     ChangeSet,
+    FindingSeverity,
     GateOutcome,
     PlanArtifact,
     ResearchArtifact,
     ReviewDisposition,
+    ReviewFinding,
     ReviewResult,
     RunPhase,
     RunState,
@@ -336,6 +338,15 @@ def test_review_limit_is_enforced_after_request_changes_cycle():
                 HEAD,
                 ReviewDisposition.REQUEST_CHANGES,
                 "fix blocker",
+                (
+                    ReviewFinding(
+                        "blocking-1",
+                        FindingSeverity.MAJOR,
+                        "blocking defect",
+                        ("review:evidence",),
+                        True,
+                    ),
+                ),
             )
         ),
     )
