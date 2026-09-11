@@ -12,7 +12,7 @@ from enum import Enum
 from hashlib import sha256
 import json
 import re
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 
 _FORK = "alexsosn/cuc"
@@ -487,6 +487,18 @@ class GitHubEffectJournal:
             self.approvals, self.receipts, self.uncertain_requests + (request,)
         )
 
+    def without_uncertain_request(self, operation_id: str) -> "GitHubEffectJournal":
+        operation_id = _required_text(operation_id, "operation_id")
+        if self.uncertain_for(operation_id) is None:
+            return self
+        return GitHubEffectJournal(
+            self.approvals,
+            self.receipts,
+            tuple(
+                item for item in self.uncertain_requests if item.operation_id != operation_id
+            ),
+        )
+
     def to_dict(self) -> dict[str, object]:
         return {
             "approvals": [item.to_dict() for item in self.approvals],
@@ -596,11 +608,15 @@ class GitHubEffectGateway:
         self,
         request: GitHubEffectRequest,
         journal: GitHubEffectJournal,
+        *,
+        checkpoint: Callable[[GitHubEffectJournal], None],
     ) -> tuple[GitHubEffectJournal, GitHubEffectReceipt]:
         if not isinstance(request, GitHubEffectRequest):
             raise ValueError("request must be GitHubEffectRequest")
         if not isinstance(journal, GitHubEffectJournal):
             raise ValueError("journal must be GitHubEffectJournal")
+        if not callable(checkpoint):
+            raise TypeError("checkpoint must be callable")
         if request.action not in _WRITE_ACTIONS:
             raise PermissionError("READ is not a write action")
         if request.operation_id not in self._policy.allowed_operation_ids:
@@ -655,6 +671,19 @@ class GitHubEffectGateway:
         else:
             raise PermissionError("writes to an unknown repository are denied")
 
+        uncertain_request = GitHubEffectUncertainRequest(
+            request.operation_id,
+            request.request_sha256,
+            request.repository,
+            request.action,
+        )
+        uncertain_journal = journal.with_uncertain_request(uncertain_request)
+
+        # This must durably succeed before a write-capable adapter is called. If the
+        # process dies at any point after this checkpoint, resume sees the quarantine
+        # marker and cannot automatically duplicate a possibly completed external write.
+        checkpoint(uncertain_journal)
+
         try:
             result_ref = self.__adapter.execute(request)
             if not isinstance(result_ref, str) or not result_ref.strip():
@@ -662,15 +691,14 @@ class GitHubEffectGateway:
                     "GitHub adapter returned no durable result reference after a possible write"
                 )
         except AdapterEffectNotExecuted:
+            safe_journal = uncertain_journal.without_uncertain_request(request.operation_id)
+            # The adapter explicitly proved that no external effect occurred. Persisting
+            # the cleared marker is what makes a later retry safe.
+            checkpoint(safe_journal)
             raise
         except Exception as exc:
-            uncertain_request = GitHubEffectUncertainRequest(
-                request.operation_id,
-                request.request_sha256,
-                request.repository,
-                request.action,
-            )
-            uncertain_journal = journal.with_uncertain_request(uncertain_request)
+            # The pre-dispatch uncertainty marker is already durable. Do not clear it:
+            # the external operation may have succeeded before the response was lost.
             raise GitHubEffectOutcomeUnknown(uncertain_journal, request, exc) from exc
 
         receipt = GitHubEffectReceipt(
@@ -680,4 +708,13 @@ class GitHubEffectGateway:
             request.action,
             result_ref.strip(),
         )
-        return journal.with_receipt(receipt), receipt
+        completed_journal = (
+            uncertain_journal
+            .without_uncertain_request(request.operation_id)
+            .with_receipt(receipt)
+        )
+        # Persist the replay receipt before exposing success to the caller. If this
+        # checkpoint fails, the previously durable uncertainty marker remains the safe
+        # recovery state and automatic replay stays blocked.
+        checkpoint(completed_journal)
+        return completed_journal, receipt
