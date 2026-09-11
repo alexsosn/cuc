@@ -170,7 +170,7 @@ def test_two_distinct_loci_produce_harn010_task_and_fork_issue_request():
     assert request.action is GitHubAction.CREATE_ISSUE
     assert request.target_ref is None
     assert request.operation_id == f"harn-017:create-issue:{decision.fingerprint}"
-    assert decision.task.task_id == f"finding-{decision.fingerprint[:16]}"
+    assert decision.task.task_id == f"finding-{decision.fingerprint}"
     assert request.payload["title"] == decision.task.title
     assert f"harn-017:fingerprint:{decision.fingerprint}" in request.payload["body"]
     assert "DT-UCPH/cuc" not in request.payload["body"]
@@ -252,6 +252,15 @@ def test_rule_like_case_roles_must_be_disjoint():
             positive_cases=("case:same",),
             negative_cases=("case:same",),
             boundary_cases=("case:same",),
+        )
+
+
+def test_case_role_whitespace_variants_are_still_overlap():
+    with pytest.raises(ValueError, match="positive|negative|boundary|overlap"):
+        _candidate(
+            positive_cases=("case: same",),
+            negative_cases=("case:  same",),
+            boundary_cases=("case:boundary",),
         )
 
 
