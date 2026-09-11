@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 import harness.production_host as production_host
-from harness.contracts import ChangeSet, RunPhase, RunState, TaskSpec
+from harness.contracts import (
+    ChangeSet,
+    PlanArtifact,
+    ResearchArtifact,
+    RunPhase,
+    RunState,
+    TaskSpec,
+    TestIntent,
+    TestKind,
+)
 from harness.development_controller import (
     ControllerStopCode,
     DevelopmentControllerPolicy,
@@ -101,6 +108,16 @@ def _task() -> TaskSpec:
     )
 
 
+def _targeted() -> TestIntent:
+    return TestIntent(
+        "host-targeted",
+        TestKind.TARGETED,
+        ("python", "-m", "pytest", "tests/test_production_host_runtime.py"),
+        "agent",
+        "production host runtime gate",
+    )
+
+
 def _request(*, sensitive: bool = False, payload_title: str = "one") -> GitHubEffectRequest:
     if sensitive:
         return GitHubEffectRequest(
@@ -140,6 +157,9 @@ def _pending_state(
         "run-53",
         _task(),
         phase=phase,
+        research=ResearchArtifact("research-53", "host research complete", ("issue:53",)),
+        plan=PlanArtifact("plan-53", "host plan complete", ("persist", "reconcile")),
+        test_intents=(_targeted(),),
         resume_phase=resume_phase,
         pause_reason=pause_reason,
     )
