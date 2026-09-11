@@ -1,8 +1,9 @@
 """Framework-neutral authorization boundary for development-controller GitHub effects.
 
-This module performs no network I/O. A trusted controller supplies a narrow adapter;
-repository classification, task authorization, human approval and durable replay /
-uncertainty checks all happen before that adapter may be invoked.
+This module performs no network I/O. A trusted controller supplies narrow execution
+and reconciliation adapters; repository classification, task authorization, trusted
+human approval, target/ref binding, durable replay and uncertainty checks all happen
+before a write adapter may be invoked.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ _FORK = "alexsosn/cuc"
 _UPSTREAM = "DT-UCPH/cuc"
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROTECTED_FORK_REFS = frozenset({"main", "agent-harness-safety"})
 
 
 class RepositoryClass(str, Enum):
@@ -46,12 +48,32 @@ class GitHubAction(str, Enum):
 
 
 _WRITE_ACTIONS = frozenset(action for action in GitHubAction if action is not GitHubAction.READ)
+_REF_REQUIRED_ACTIONS = frozenset(
+    {
+        GitHubAction.CREATE_BRANCH,
+        GitHubAction.UPDATE_REF,
+        GitHubAction.MERGE_PULL_REQUEST,
+        GitHubAction.DISPATCH_WORKFLOW,
+    }
+)
+_SENSITIVE_FORK_ACTIONS = frozenset(
+    {
+        GitHubAction.MERGE_PULL_REQUEST,
+        GitHubAction.DISPATCH_WORKFLOW,
+    }
+)
 
 
 def _required_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
     return value.strip()
+
+
+def _optional_text(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    return _required_text(value, field)
 
 
 def _digest(value: object, field: str) -> str:
@@ -168,14 +190,11 @@ class GitHubOperationPermission:
 
 @dataclass(frozen=True)
 class GitHubTaskPolicy:
-    """Task-local authority supplied by the development controller.
+    """Task-local authority supplied by the trusted development controller.
 
-    New callers should use `allowed_fork_write_operations` and
-    `allowed_upstream_operation_ids`. The two legacy fields are retained only so the
-    already-existing HARN-009 tests / serialized drafts remain readable; legacy fork
-    policy is accepted only when it has one action, which can be bound unambiguously to
-    every listed operation ID. Multiple fork actions require explicit per-operation
-    permissions and therefore cannot create a cross-product privilege expansion.
+    New callers use exact `allowed_fork_write_operations` permissions and separately
+    declared upstream operation IDs. Legacy fields remain readable for the original
+    HARN-009 tests, but multiple fork actions require exact per-operation permissions.
     """
 
     allowed_fork_write_actions: tuple[GitHubAction, ...] = ()
@@ -236,10 +255,12 @@ class GitHubTaskPolicy:
                 + ", ".join(sorted(overlap))
             )
 
-        normalized_actions = tuple(dict.fromkeys(item.action for item in permissions))
-        normalized_operation_ids = permission_ids + upstream_operations
-        object.__setattr__(self, "allowed_fork_write_actions", normalized_actions)
-        object.__setattr__(self, "allowed_operation_ids", normalized_operation_ids)
+        object.__setattr__(
+            self,
+            "allowed_fork_write_actions",
+            tuple(dict.fromkeys(item.action for item in permissions)),
+        )
+        object.__setattr__(self, "allowed_operation_ids", permission_ids + upstream_operations)
         object.__setattr__(self, "allowed_fork_write_operations", permissions)
         object.__setattr__(self, "allowed_upstream_operation_ids", upstream_operations)
 
@@ -250,11 +271,7 @@ class GitHubTaskPolicy:
     def fork_permission_for(self, operation_id: str) -> GitHubOperationPermission | None:
         operation_id = _required_text(operation_id, "operation_id")
         return next(
-            (
-                item
-                for item in self.allowed_fork_write_operations
-                if item.operation_id == operation_id
-            ),
+            (item for item in self.allowed_fork_write_operations if item.operation_id == operation_id),
             None,
         )
 
@@ -298,6 +315,7 @@ class GitHubEffectRequest:
     operation_id: str
     repository: str
     action: GitHubAction
+    target_ref: str | None
     _payload_json: str
     request_sha256: str
 
@@ -307,15 +325,19 @@ class GitHubEffectRequest:
         repository: str,
         action: GitHubAction | str,
         payload: Mapping[str, Any],
+        *,
+        target_ref: str | None = None,
     ) -> None:
         operation = _required_text(operation_id, "operation_id")
         canonical_repository = _canonical_repository(repository)
         normalized_action = _action(action)
+        normalized_ref = _optional_text(target_ref, "target_ref")
         encoded_payload = _payload_json(payload)
         encoded_request = json.dumps(
             {
                 "repository": canonical_repository,
                 "action": normalized_action.value,
+                "target_ref": normalized_ref,
                 "payload": json.loads(encoded_payload),
             },
             ensure_ascii=False,
@@ -325,6 +347,7 @@ class GitHubEffectRequest:
         object.__setattr__(self, "operation_id", operation)
         object.__setattr__(self, "repository", canonical_repository)
         object.__setattr__(self, "action", normalized_action)
+        object.__setattr__(self, "target_ref", normalized_ref)
         object.__setattr__(self, "_payload_json", encoded_payload)
         object.__setattr__(self, "request_sha256", sha256(encoded_request).hexdigest())
 
@@ -337,6 +360,7 @@ class GitHubEffectRequest:
             "operation_id": self.operation_id,
             "repository": self.repository,
             "action": self.action.value,
+            "target_ref": self.target_ref,
             "payload": self.payload,
             "request_sha256": self.request_sha256,
         }
@@ -350,10 +374,13 @@ class GitHubEffectRequest:
             payload["repository"],
             payload["action"],
             payload.get("payload", {}),
+            target_ref=payload.get("target_ref"),
         )
         supplied = payload.get("request_sha256")
         if supplied is not None and _digest(supplied, "request_sha256") != request.request_sha256:
-            raise ValueError("request_sha256 does not match repository/action/payload")
+            raise ValueError(
+                "request_sha256 does not match repository/action/target_ref/payload"
+            )
         return request
 
 
@@ -413,6 +440,34 @@ class HumanApproval:
             payload["operation_id"],
             payload["request_sha256"],
         )
+
+
+class HumanApprovalAuthority:
+    """Trusted host-owned registry of exact human-issued approvals.
+
+    Approval-shaped values carried in model/controller state are not authority by
+    themselves. A sensitive effect is authorized only when the exact value has also
+    been registered here by trusted host code.
+    """
+
+    def __init__(self) -> None:
+        self.__approvals: dict[str, HumanApproval] = {}
+
+    def register(self, approval: HumanApproval) -> None:
+        if not isinstance(approval, HumanApproval):
+            raise ValueError("approval must be HumanApproval")
+        existing = self.__approvals.get(approval.approval_id)
+        if existing is not None and existing != approval:
+            raise ValueError("approval ID cannot be rebound to a different approval")
+        self.__approvals[approval.approval_id] = approval
+
+    def resolve(self, approval: HumanApproval | None) -> HumanApproval | None:
+        if approval is None:
+            return None
+        if not isinstance(approval, HumanApproval):
+            raise ValueError("approval must be HumanApproval or None")
+        registered = self.__approvals.get(approval.approval_id)
+        return registered if registered == approval else None
 
 
 @dataclass(frozen=True)
@@ -604,9 +659,7 @@ class GitHubEffectJournal:
         return GitHubEffectJournal(
             self.approvals,
             self.receipts,
-            tuple(
-                item for item in self.uncertain_requests if item.operation_id != operation_id
-            ),
+            tuple(item for item in self.uncertain_requests if item.operation_id != operation_id),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -633,7 +686,7 @@ class GitHubEffectJournal:
 
 
 class HumanApprovalRequired(RuntimeError):
-    """Structured interrupt raised before an upstream write adapter is invoked."""
+    """Structured interrupt raised before a sensitive write adapter is invoked."""
 
     def __init__(self, challenge: HumanApprovalChallenge) -> None:
         if not isinstance(challenge, HumanApprovalChallenge):
@@ -669,22 +722,69 @@ class GitHubEffectOutcomeUnknown(RuntimeError):
         )
 
 
+class GitHubReconciliationDisposition(str, Enum):
+    EXECUTED = "executed"
+    NOT_EXECUTED = "not-executed"
+
+
+@dataclass(frozen=True)
+class GitHubReconciliationResult:
+    disposition: GitHubReconciliationDisposition
+    result_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            disposition = (
+                self.disposition
+                if isinstance(self.disposition, GitHubReconciliationDisposition)
+                else GitHubReconciliationDisposition(self.disposition)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid reconciliation disposition: {self.disposition!r}") from exc
+        result_ref = _optional_text(self.result_ref, "result_ref")
+        if disposition is GitHubReconciliationDisposition.EXECUTED and result_ref is None:
+            raise ValueError("executed reconciliation requires result_ref")
+        if disposition is GitHubReconciliationDisposition.NOT_EXECUTED and result_ref is not None:
+            raise ValueError("not-executed reconciliation cannot contain result_ref")
+        object.__setattr__(self, "disposition", disposition)
+        object.__setattr__(self, "result_ref", result_ref)
+
+
 class _GitHubWriteAdapter(Protocol):
     def execute(self, request: GitHubEffectRequest) -> str: ...
+
+
+class _GitHubReconciler(Protocol):
+    def reconcile(self, request: GitHubEffectRequest) -> GitHubReconciliationResult: ...
 
 
 class GitHubEffectGateway:
     """Fail-closed gateway around a write-capable GitHub adapter."""
 
-    __slots__ = ("_policy", "__adapter")
+    __slots__ = ("_policy", "__adapter", "__approval_authority", "__reconciler")
 
-    def __init__(self, policy: GitHubTaskPolicy, adapter: _GitHubWriteAdapter) -> None:
+    def __init__(
+        self,
+        policy: GitHubTaskPolicy,
+        adapter: _GitHubWriteAdapter,
+        *,
+        approval_authority: HumanApprovalAuthority | None = None,
+        reconciler: _GitHubReconciler | None = None,
+    ) -> None:
         if not isinstance(policy, GitHubTaskPolicy):
             raise ValueError("policy must be GitHubTaskPolicy")
         if not callable(getattr(adapter, "execute", None)):
             raise ValueError("adapter must provide execute(request)")
+        if approval_authority is not None and not isinstance(
+            approval_authority, HumanApprovalAuthority
+        ):
+            raise ValueError("approval_authority must be HumanApprovalAuthority or None")
+        if reconciler is not None and not callable(getattr(reconciler, "reconcile", None)):
+            raise ValueError("reconciler must provide reconcile(request)")
         self._policy = policy
         self.__adapter = adapter
+        self.__approval_authority = approval_authority or HumanApprovalAuthority()
+        self.__reconciler = reconciler
 
     def authorize_read(self, request: GitHubEffectRequest) -> RepositoryClass:
         if not isinstance(request, GitHubEffectRequest):
@@ -714,6 +814,103 @@ class GitHubEffectGateway:
                 f"operation ID reuse conflicts with the persisted {label} request digest"
             )
 
+    @staticmethod
+    def _assert_ref_policy(request: GitHubEffectRequest, repository_class: RepositoryClass) -> None:
+        if request.action in _REF_REQUIRED_ACTIONS and request.target_ref is None:
+            raise PermissionError(f"{request.action.value} requires an explicit target ref")
+        if (
+            repository_class is RepositoryClass.FORK
+            and request.action in {GitHubAction.CREATE_BRANCH, GitHubAction.UPDATE_REF}
+            and request.target_ref is not None
+            and request.target_ref.casefold() in _PROTECTED_FORK_REFS
+        ):
+            raise PermissionError(
+                "generic branch/ref mutation cannot target protected fork integration ref"
+            )
+
+    def _require_human_approval(
+        self,
+        request: GitHubEffectRequest,
+        journal: GitHubEffectJournal,
+        *,
+        reason: str,
+        require_registered_approval: bool,
+    ) -> None:
+        approval = journal.approval_for(request.operation_id)
+        if approval is None:
+            raise HumanApprovalRequired(
+                HumanApprovalChallenge(
+                    request.operation_id,
+                    request.request_sha256,
+                    request.repository,
+                    request.action,
+                    reason,
+                )
+            )
+        if approval.request_sha256 != request.request_sha256:
+            raise PermissionError(
+                "human approval does not match the exact GitHub write request digest"
+            )
+        if require_registered_approval and self.__approval_authority.resolve(approval) is None:
+            raise HumanApprovalRequired(
+                HumanApprovalChallenge(
+                    request.operation_id,
+                    request.request_sha256,
+                    request.repository,
+                    request.action,
+                    "approval value is not registered by the trusted human authority",
+                )
+            )
+
+    def _authorize_write_request(
+        self,
+        request: GitHubEffectRequest,
+        journal: GitHubEffectJournal,
+        *,
+        require_registered_approval: bool = True,
+    ) -> RepositoryClass:
+        if request.action not in _WRITE_ACTIONS:
+            raise PermissionError("READ is not a write action")
+        if request.operation_id not in self._policy.declared_operation_ids:
+            raise PermissionError(
+                "write operation ID was not declared by the current task policy"
+            )
+
+        repository_class = classify_repository(request.repository)
+        self._assert_ref_policy(request, repository_class)
+        if repository_class is RepositoryClass.FORK:
+            permission = self._policy.fork_permission_for(request.operation_id)
+            if permission is None or permission.action is not request.action:
+                raise PermissionError(
+                    "fork operation/action pair is not allowed by task policy"
+                )
+            if request.action in _SENSITIVE_FORK_ACTIONS:
+                self._require_human_approval(
+                    request,
+                    journal,
+                    reason=(
+                        "fork integration/publication actions require explicit human "
+                        "authorization at execution time"
+                    ),
+                    require_registered_approval=require_registered_approval,
+                )
+            return repository_class
+
+        if repository_class is RepositoryClass.UPSTREAM:
+            if request.operation_id not in self._policy.allowed_upstream_operation_ids:
+                raise PermissionError(
+                    "upstream write operation ID was not declared by task policy"
+                )
+            self._require_human_approval(
+                request,
+                journal,
+                reason="upstream writes require explicit human authorization at execution time",
+                require_registered_approval=require_registered_approval,
+            )
+            return repository_class
+
+        raise PermissionError("writes to an unknown repository are denied")
+
     def execute_write(
         self,
         request: GitHubEffectRequest,
@@ -727,6 +924,7 @@ class GitHubEffectGateway:
             raise ValueError("journal must be GitHubEffectJournal")
         if not callable(checkpoint):
             raise TypeError("checkpoint must be callable")
+
         if request.action not in _WRITE_ACTIONS:
             raise PermissionError("READ is not a write action")
         if request.operation_id not in self._policy.declared_operation_ids:
@@ -743,6 +941,8 @@ class GitHubEffectGateway:
                 action=prior.action,
                 label="receipt",
             )
+            repository_class = classify_repository(request.repository)
+            self._assert_ref_policy(request, repository_class)
             return journal, prior
 
         uncertain = journal.uncertain_for(request.operation_id)
@@ -756,36 +956,7 @@ class GitHubEffectGateway:
             )
             raise GitHubEffectOutcomeUnknown(journal, request)
 
-        repository_class = classify_repository(request.repository)
-        if repository_class is RepositoryClass.FORK:
-            permission = self._policy.fork_permission_for(request.operation_id)
-            if permission is None or permission.action is not request.action:
-                raise PermissionError(
-                    "fork operation/action pair is not allowed by task policy"
-                )
-        elif repository_class is RepositoryClass.UPSTREAM:
-            if request.operation_id not in self._policy.allowed_upstream_operation_ids:
-                raise PermissionError(
-                    "upstream write operation ID was not declared by task policy"
-                )
-            approval = journal.approval_for(request.operation_id)
-            if approval is None:
-                raise HumanApprovalRequired(
-                    HumanApprovalChallenge(
-                        request.operation_id,
-                        request.request_sha256,
-                        request.repository,
-                        request.action,
-                        "upstream writes require explicit human authorization at execution time",
-                    )
-                )
-            if approval.request_sha256 != request.request_sha256:
-                raise PermissionError(
-                    "human approval does not match the exact upstream write request digest"
-                )
-        else:
-            raise PermissionError("writes to an unknown repository are denied")
-
+        self._authorize_write_request(request, journal)
         uncertain_request = GitHubEffectUncertainRequest(
             request.operation_id,
             request.request_sha256,
@@ -823,7 +994,66 @@ class GitHubEffectGateway:
         try:
             checkpoint(completed_journal)
         except Exception as exc:
-            # The write has already returned success, but the durable receipt did not.
+            # The write already returned success, but durable receipt persistence failed.
             # The earlier uncertainty checkpoint remains the only safe replay state.
             raise GitHubEffectOutcomeUnknown(uncertain_journal, request, exc) from exc
         return completed_journal, receipt
+
+    def reconcile_uncertain(
+        self,
+        request: GitHubEffectRequest,
+        journal: GitHubEffectJournal,
+        *,
+        checkpoint: Callable[[GitHubEffectJournal], None],
+    ) -> tuple[GitHubEffectJournal, GitHubEffectReceipt | None]:
+        """Resolve a quarantined request through a trusted non-dispatch reconciler.
+
+        Reconciliation never invokes the write adapter. A trusted reconciler must prove
+        either that the original write executed (with durable result reference) or that
+        no mutation occurred. Any failure leaves the caller's persisted uncertainty as
+        the only safe state.
+        """
+
+        if not isinstance(request, GitHubEffectRequest):
+            raise ValueError("request must be GitHubEffectRequest")
+        if not isinstance(journal, GitHubEffectJournal):
+            raise ValueError("journal must be GitHubEffectJournal")
+        if not callable(checkpoint):
+            raise TypeError("checkpoint must be callable")
+        if self.__reconciler is None:
+            raise RuntimeError("trusted GitHub reconciler is not configured")
+
+        uncertain = journal.uncertain_for(request.operation_id)
+        if uncertain is None:
+            raise ValueError("request is not currently quarantined as uncertain")
+        self._assert_same_request_identity(
+            request,
+            request_sha256=uncertain.request_sha256,
+            repository=uncertain.repository,
+            action=uncertain.action,
+            label="uncertain",
+        )
+        self._authorize_write_request(request, journal)
+
+        result = self.__reconciler.reconcile(request)
+        if not isinstance(result, GitHubReconciliationResult):
+            raise ValueError("reconciler must return GitHubReconciliationResult")
+
+        safe_journal = journal.without_uncertain_request(request.operation_id)
+        if result.disposition is GitHubReconciliationDisposition.NOT_EXECUTED:
+            checkpoint(safe_journal)
+            return safe_journal, None
+
+        receipt = GitHubEffectReceipt(
+            request.operation_id,
+            request.request_sha256,
+            request.repository,
+            request.action,
+            result.result_ref or "",
+        )
+        completed = safe_journal.with_receipt(receipt)
+        try:
+            checkpoint(completed)
+        except Exception as exc:
+            raise GitHubEffectOutcomeUnknown(journal, request, exc) from exc
+        return completed, receipt

@@ -61,6 +61,17 @@ def _execute(gateway, request, journal, checkpoints=None):
     return result, checkpoints
 
 
+def _trusted_upstream_gateway(operation_id, adapter):
+    runtime = _runtime()
+    authority = runtime.HumanApprovalAuthority()
+    gateway = runtime.GitHubEffectGateway(
+        _policy(operation_ids=(operation_id,)),
+        adapter,
+        approval_authority=authority,
+    )
+    return gateway, authority
+
+
 def test_repository_classification_is_exact_and_urls_do_not_bypass_it():
     runtime = _runtime()
     assert runtime.classify_repository(" alexsosn/CUC ") is runtime.RepositoryClass.FORK
@@ -75,13 +86,19 @@ def test_upstream_read_is_allowed_but_write_cannot_enter_read_path():
     adapter = FakeAdapter()
     gateway = runtime.GitHubEffectGateway(_policy(), adapter)
     read = runtime.GitHubEffectRequest(
-        "read-upstream-1", "DT-UCPH/cuc", runtime.GitHubAction.READ, {"resource": "README.md"}
+        "read-upstream-1",
+        "DT-UCPH/cuc",
+        runtime.GitHubAction.READ,
+        {"resource": "README.md"},
     )
     assert gateway.authorize_read(read) is runtime.RepositoryClass.UPSTREAM
     assert adapter.calls == []
 
     write = runtime.GitHubEffectRequest(
-        "write-upstream-1", "DT-UCPH/cuc", runtime.GitHubAction.CREATE_ISSUE, {"title": "x"}
+        "write-upstream-1",
+        "DT-UCPH/cuc",
+        runtime.GitHubAction.CREATE_ISSUE,
+        {"title": "x"},
     )
     with pytest.raises(PermissionError, match="read|write"):
         gateway.authorize_read(write)
@@ -153,12 +170,10 @@ def test_write_operation_must_be_declared_by_task_policy_before_any_adapter_or_a
     assert adapter.calls == []
 
 
-def test_upstream_write_interrupts_before_adapter_and_exact_approval_unlocks_fake_execution():
+def test_upstream_write_interrupts_before_adapter_and_trusted_exact_approval_unlocks_execution():
     runtime = _runtime()
     adapter = FakeAdapter()
-    gateway = runtime.GitHubEffectGateway(
-        _policy(operation_ids=("op-upstream-issue",)), adapter
-    )
+    gateway, authority = _trusted_upstream_gateway("op-upstream-issue", adapter)
     request = runtime.GitHubEffectRequest(
         "op-upstream-issue",
         "DT-UCPH/cuc",
@@ -183,6 +198,7 @@ def test_upstream_write_interrupts_before_adapter_and_exact_approval_unlocks_fak
         challenge.operation_id,
         challenge.request_sha256,
     )
+    authority.register(approval)
     approved = journal.with_approval(approval)
     (approved, receipt), checkpoints = _execute(gateway, request, approved)
     assert len(adapter.calls) == 1
@@ -194,9 +210,7 @@ def test_upstream_write_interrupts_before_adapter_and_exact_approval_unlocks_fak
 def test_upstream_approval_cannot_be_substituted_for_another_request():
     runtime = _runtime()
     adapter = FakeAdapter()
-    gateway = runtime.GitHubEffectGateway(
-        _policy(operation_ids=("op-upstream-comment",)), adapter
-    )
+    gateway, authority = _trusted_upstream_gateway("op-upstream-comment", adapter)
     request = runtime.GitHubEffectRequest(
         "op-upstream-comment",
         "DT-UCPH/cuc",
@@ -209,6 +223,7 @@ def test_upstream_approval_cannot_be_substituted_for_another_request():
         request.operation_id,
         "0" * 64,
     )
+    authority.register(wrong)
     journal = runtime.GitHubEffectJournal().with_approval(wrong)
     with pytest.raises(PermissionError, match="approval|digest|request"):
         _execute(gateway, request, journal)
@@ -251,12 +266,10 @@ def test_successful_effect_replays_from_serialized_receipt_without_duplicate_ada
     assert len(adapter.calls) == 1
 
 
-def test_upstream_approval_survives_resume_and_proven_no_effect_failure_can_retry():
+def test_upstream_approval_and_separate_trusted_authority_survive_resume_and_safe_retry():
     runtime = _runtime()
     adapter = FakeAdapter(failure=runtime.AdapterEffectNotExecuted("preflight failed"))
-    gateway = runtime.GitHubEffectGateway(
-        _policy(operation_ids=("op-upstream-pr",)), adapter
-    )
+    gateway, authority = _trusted_upstream_gateway("op-upstream-pr", adapter)
     request = runtime.GitHubEffectRequest(
         "op-upstream-pr",
         "DT-UCPH/cuc",
@@ -269,6 +282,7 @@ def test_upstream_approval_survives_resume_and_proven_no_effect_failure_can_retr
         request.operation_id,
         request.request_sha256,
     )
+    authority.register(approval)
     journal = runtime.GitHubEffectJournal().with_approval(approval)
     restored = runtime.GitHubEffectJournal.from_dict(journal.to_dict())
     checkpoints = []
@@ -403,7 +417,9 @@ def test_generic_raw_actions_and_unknown_repository_writes_fail_closed():
         adapter,
     )
     with pytest.raises(ValueError, match="action"):
-        runtime.GitHubEffectRequest("op-raw", "alexsosn/cuc", "raw", {"url": "/repos/x/y"})
+        runtime.GitHubEffectRequest(
+            "op-raw", "alexsosn/cuc", "raw", {"url": "/repos/x/y"}
+        )
     assert not hasattr(gateway, "execute_raw")
     assert not hasattr(gateway, "adapter")
 
@@ -448,5 +464,9 @@ def test_journal_rejects_malformed_collections_duplicates_and_invalid_receipts()
         runtime.GitHubEffectJournal((), (receipt, receipt), ())
     with pytest.raises(ValueError, match="sha|digest"):
         runtime.GitHubEffectReceipt(
-            "op-2", "not-a-digest", "alexsosn/cuc", runtime.GitHubAction.CREATE_ISSUE, "x"
+            "op-2",
+            "not-a-digest",
+            "alexsosn/cuc",
+            runtime.GitHubAction.CREATE_ISSUE,
+            "x",
         )
