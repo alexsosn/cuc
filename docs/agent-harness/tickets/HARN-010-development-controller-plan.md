@@ -2,155 +2,132 @@
 
 ## Architecture
 
-Implement `agent/harness/development_controller.py` as a framework-neutral deterministic orchestration layer around existing HARN contracts. It does not replace HARN-002 `RunState`/`apply_event`; it owns only controller-specific gates, budgets, persistence, and port invocation.
+Implement `agent/harness/development_controller.py` as a framework-neutral deterministic orchestration layer around HARN-002 state, HARN-006 independent review, and the canonical post-HARN-023 `github_effects.GitHubEffectGateway`.
 
-### Durable controller envelope
+HARN-010 does not replace `RunState`/`apply_event`; it owns controller-specific RED evidence, budgets, persistence, pending side-effect sequencing, and port invocation.
+
+## HARN-023 integration delta
+
+The original plan named `github_side_effects.GuardedGitHubSideEffects`. HARN-023 (#54) subsequently removed that competing authority and made `github_effects.GitHubEffectGateway` canonical. The implementation must migrate rather than reintroduce the retired module.
+
+Controller GitHub integration therefore uses:
+
+- `GitHubEffectRequest` as the structured pending operation;
+- `GitHubEffectGateway` as the only write authority;
+- `GitHubEffectJournal` embedded in durable controller state;
+- gateway `checkpoint(journal)` calls mapped to synchronous controller-state persistence;
+- trusted `HumanApproval` values carried in state only as data, with authority remaining host-owned inside the gateway;
+- gateway uncertainty/reconciliation semantics rather than a controller-side raw adapter.
+
+No controller import or runtime path may restore `github_side_effects.py` or expose `GitHubEffectGateway`'s underlying adapter/approval authority.
+
+## Durable controller envelope
 
 `DevelopmentControllerState` contains:
 
 - schema version;
 - exact baseline SHA;
 - embedded HARN-002 `RunState`;
-- pre-change `RedGateEvidence` keyed by targeted test intent;
-- implementation/revision attempt count;
-- verification execution count;
-- review attempt count;
-- GitHub side-effect count;
-- accumulated cost units;
-- audit events/evidence refs;
-- optional explicit terminal code/reason.
+- issue/provenance refs;
+- pre-change `RedGateEvidence`;
+- pending `ImplementationResult` and operation index;
+- canonical `GitHubEffectJournal`;
+- implementation/revision, verification, review, GitHub-write, and cost counters;
+- chronological audit events;
+- optional terminal code/reason.
 
-It supports strict `to_dict` / `from_dict` / canonical JSON round-trip. State is persisted after every accepted transition/counter mutation.
+It supports strict `to_dict` / `from_dict`. The host persistence callback is invoked after every accepted controller transition and by every gateway journal checkpoint.
 
-### Policy
+## Policy and ports
 
-`DevelopmentControllerPolicy` makes bounds explicit:
+`DevelopmentControllerPolicy` bounds:
 
 - `max_revision_attempts`;
 - `max_verification_executions`;
 - `max_review_attempts`;
 - `max_github_writes`;
 - optional `max_cost_units`;
-- `require_red` (default true);
-- `allow_no_feature_fallback` (default false);
-- `production_mode` (default true).
+- `require_red`;
+- `allow_no_feature_fallback`;
+- production/test configuration as needed by the host contract.
 
-No controller loop uses an unbounded `while True`; every step consumes a phase or a bounded counter.
+Inject deterministic ports for research, planning, test declaration, baseline RED execution, implementation, post-change tests, evals, final diff, HARN-006 independent reviewer, canonical GitHub gateway, and controller-state persistence.
 
-### Ports
+## Implementation result
 
-Inject deterministic/testable ports rather than framework-specific agents:
-
-- research;
-- planning;
-- test declaration;
-- pre-change RED execution;
-- implementation;
-- post-change test execution;
-- optional eval execution;
-- final diff loader;
-- HARN-006 `IndependentReviewer`;
-- HARN-009 `GuardedGitHubSideEffects` for every GitHub write;
-- controller-state persistence.
-
-Model-facing implementation/planning ports may propose structured artifacts/intents but receive neither raw GitHub transport nor approval-registry mutation authority.
-
-### Implementation result
-
-An implementation port returns a structured result containing:
+An implementation port returns:
 
 - HARN-002 `ChangeSet`;
 - exact proposed `head_sha`;
-- optional HARN-009 GitHub operation intents;
-- cost units consumed;
+- zero or more canonical `GitHubEffectRequest` write requests;
+- cost units;
 - evidence refs.
 
-Any proposed GitHub operation ID must be declared by the returned `ChangeSet`; the controller dispatches it only through `GuardedGitHubSideEffects` and checks GitHub-write budget before each operation.
+The ordered request IDs must exactly equal `ChangeSet.operation_ids`. Requests used in the side-effect sequence must be write actions; reads belong in research/implementation ports, not the mutation journal.
+
+Before any gateway call, the controller checks that the pending `change_id` and every pending operation ID are new relative to already recorded changes. Reuse terminates with an explicit policy block before replay/provider dispatch.
 
 ## TDD/RED semantics
 
-After HARN-002 `TestsDeclared` moves the core state to `IMPLEMENT`, the controller still blocks the implementation port until RED evidence exists.
+After HARN-002 reaches `IMPLEMENT`, HARN-010 still blocks the first implementation call until every required targeted RED probe has executed against the exact baseline SHA and produced a real failing execution (`TEST_FAILURE`, non-zero exit, failed_tests > 0). Model assertions are not execution evidence.
 
-For the first implementation attempt when `require_red` is true:
+Reviewer/test-driven revisions preserve the original baseline RED but require fresh post-change verification and fresh clean-context review on each new head.
 
-- every `TestKind.TARGETED` intent is executed against the exact baseline SHA;
-- each targeted command must return a real `TEST_FAILURE` with non-zero exit and at least one failed test;
-- no generated/model assertion can substitute for execution evidence;
-- regression intents are not required to fail at baseline;
-- baseline SHA mismatch is rejected.
+## Canonical GitHub checkpoint/replay semantics
 
-The RED evidence is durable and not re-run after reviewer-driven revisions unless test declarations change (which HARN-002 currently does not allow in-run).
+For one pending write request:
 
-## Step semantics
+1. Check run-scoped GitHub-write budget and operation/change uniqueness before gateway dispatch.
+2. Call `GitHubEffectGateway.execute_write(request, journal, checkpoint=...)`.
+3. The checkpoint callback persists a controller snapshot containing the supplied journal synchronously.
+4. The gateway checkpoints uncertainty before provider dispatch and receipt completion after successful provider mutation.
+5. When the controller successfully consumes the pending request, increment `github_writes` exactly once and advance the pending-operation index.
+6. If restart restores a snapshot whose journal already contains the pending request receipt but whose index/counter are stale, gateway replay performs no provider write; consuming that still-pending replay nevertheless increments the run-scoped write counter exactly once before the controller can attempt another request.
+7. A quarantined/unknown outcome is preserved in the durable journal and cannot be blindly redispatched.
 
-A `step()` call performs at most one logical controller action and persists its result. `run_until_stop()` repeatedly calls `step()` only up to a caller/policy-derived finite step ceiling.
+This closes the crash-window budget bypass found by independent review.
 
-Expected phase actions:
+## Human approval
 
-1. `RESEARCH`: call research port -> `ResearchRecorded`.
-2. `PLAN`: call planning port -> `PlanRecorded`.
-3. `TEST_DESIGN`: call test-design port -> `TestsDeclared`.
-4. `IMPLEMENT` with missing RED: execute one missing targeted RED probe and persist it; when RED gate complete, a later step may implement.
-5. `IMPLEMENT` with RED satisfied: check revision/cost budgets; call implement port; dispatch declared GitHub intents through HARN-009; record `ChangeRecorded`.
-6. `VERIFY`: run one missing current test/eval at a time. Any real failure is routed through HARN-002 back to `IMPLEMENT`. When all required current tests/evals succeed, emit `VerificationPassed`.
-7. `REVIEW`: build HARN-006 clean review context from verified evidence + exact final diff, call `run_independent_development_review`, then route its core review through HARN-002. APPROVE completes; REQUEST_CHANGES returns to bounded implementation; ESCALATE waits for human.
-8. `BLOCKED` / `AWAITING_HUMAN` / `COMPLETE`: no autonomous action unless explicit resume is supplied where legal.
+For upstream or sensitive fork writes, the canonical gateway raises `HumanApprovalRequired` before provider dispatch. Controller state becomes `AWAITING_HUMAN` while preserving the exact pending request.
 
-## Budgets and stop reasons
+Resume may attach a structured `HumanApproval` to the controller journal, but that value is not authority by itself. The trusted host must separately register the exact approval in the gateway's `HumanApprovalAuthority`; otherwise the gateway pauses again. HARN-010 never receives authority-registration capability.
 
-Before a port call, check the relevant limit. Exhaustion creates a persisted terminal/blocked controller reason such as:
+Concrete durable authority/reconciler/provider host wiring remains tracked by #53.
 
-- `revision-budget-exhausted`;
-- `verification-budget-exhausted`;
-- `review-budget-exhausted`;
-- `github-write-budget-exhausted`;
-- `cost-budget-exhausted`;
-- `blocked-execution`;
-- `policy-block`;
-- `needs-human`;
-- `complete`.
+## Verification and review
 
-Terminal reasons are data, not prose-only logs.
+`VERIFY` runs one missing test/eval action at a time and binds each result to the current proposed/executed SHA. Real failures route through HARN-002 to bounded implementation. Only after all required current evidence is successful may `VerificationPassed` advance to `REVIEW`.
 
-## HARN-009 production wiring
+`REVIEW` builds HARN-006's allowlisted context from exact verified evidence and final diff. APPROVE completes; REQUEST_CHANGES returns to bounded implementation; ESCALATE pauses for human. Every new candidate requires fresh verification and a fresh review packet.
 
-Close follow-up #51 as part of HARN-010. Production mode must reject a side-effect capability whose operation journal is not durably configured. The controller code must import/use `github_side_effects.GuardedGitHubSideEffects`, not legacy `github_effects.GitHubEffectGateway`.
+## Budgets and safe termination
 
-The host remains responsible for constructing/restoring the trusted approval registry and deterministic reconciliation-capable adapter. The controller never receives approval registration or raw provider transport.
+Before relevant calls, enforce revision, verification, review, GitHub-write, and cost limits. `run_until_stop()` has a finite step ceiling. Stop reasons are persisted codes/data, including budget exhaustion, blocked execution, policy block, needs-human, and complete.
 
-If a GitHub execution raises `ApprovalRequired`, controller state becomes explicit `AWAITING_HUMAN` before any further autonomous phase action. Resume must retry the same operation ID; HARN-009 supplies replay/reconciliation safety.
+Programming/invariant violations fail closed; externally meaningful stop conditions should be represented as explicit persisted controller states where practical.
 
-## Scenario RED tests before implementation
+## Scenario gates
 
-1. happy path enforces research -> plan -> test declaration -> real RED -> implementation -> fresh tests -> clean review -> complete;
-2. implementation port is never called before RED;
-3. fake/model-only RED evidence or baseline mismatch is rejected;
-4. repeated test failure terminates at revision budget rather than looping;
-5. reviewer rejection causes a fresh bounded implementation/verification/review cycle;
-6. blocked dependency produces explicit blocked reason;
-7. stale head/executed revision mismatch cannot advance to review;
-8. cost/revision/test/review/GitHub-write budgets stop before the over-budget port call;
-9. approval-required side effect pauses in `AWAITING_HUMAN`; resume keeps the same operation identity and does not duplicate an already completed effect;
-10. state serialization/restart continues from the exact next gate without repeating research/plan/RED/completed effects;
-11. HARN-006 reviewer receives only its allowlisted clean context, not controller scratch/audit history;
-12. production mode rejects in-memory HARN-009 journal wiring;
-13. controller source does not import/use legacy `GitHubEffectGateway`;
-14. every terminal state/reason round-trips through persisted state;
-15. no-feature fallback cannot activate unless policy explicitly enables it.
+Required scenarios include:
+
+1. happy path ordering and real RED before implementation;
+2. model-only/false/stale RED cannot unlock implementation;
+3. repeated test failure stops at revision budget;
+4. reviewer rejection causes bounded new implementation/verification/review;
+5. blocked dependency has explicit reason;
+6. stale head/executed verification evidence cannot advance;
+7. cost/revision/verification/review/GitHub-write budgets stop before excess call;
+8. human approval pause/resume preserves exact operation identity;
+9. serialization/restart does not repeat completed research/plan/RED;
+10. durable receipt replay cannot duplicate provider mutation **or** bypass GitHub-write budget;
+11. reused operation/change IDs are blocked before gateway/provider dispatch;
+12. every terminal state/reason and issue provenance round-trip;
+13. no-feature fallback is policy gated;
+14. source/runtime uses only the canonical HARN-023 GitHub authority.
 
 ## Review strategy
 
-After full-suite GREEN, perform a logically independent adversarial review from issue #11 + final diff + CI evidence only. Attack at least:
+After exact-head full-suite GREEN, conduct a logically independent review from issue #11, final diff, HARN-023 canonical contract, and CI evidence. Attack termination/budget off-by-one errors, fabricated/stale evidence, restart crash windows, duplicate/reused operation IDs, forged approval-shaped data, uncertain outcomes, alternative GitHub authority paths, provenance drift, and fallback scope expansion.
 
-- off-by-one retry/budget loops;
-- fabricated RED/test/review success;
-- stale revision evidence;
-- restart duplication;
-- GitHub write bypass through legacy gateway/raw adapter;
-- forged human approval/resume;
-- state persistence failure windows;
-- hidden unbounded execution path;
-- issue/provenance drift;
-- fallback scope expansion.
-
-Every blocker gets a new RED regression before the fix, followed by full suite and fresh re-review.
+Every confirmed blocker gets a RED regression before its fix, followed by full suite and a fresh clean-context re-review.
