@@ -8,6 +8,7 @@ import sys
 
 AGENT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = AGENT_ROOT / "scripts" / "evaluate_harn007_architecture.py"
+DEEPAGENTS_REVISION = "54696577caf3dfcefb662db08b4a8034ec6a35cd"
 
 
 def _report() -> dict[str, object]:
@@ -63,7 +64,7 @@ def test_decision_model_distinguishes_parser_and_development_controller() -> Non
     decision = report["decision"]
 
     assert decision["parser_orchestrator"] == "retain-explicit-langgraph"
-    assert decision["development_controller"] == "selective-deepagents-behind-cuc-boundaries"
+    assert decision["development_controller"] == "defer-deepagents-until-harn009"
     assert decision["core_dependency"] == "do-not-add-deepagents-now"
     assert decision["parser_primary_deepagents_fit"] == "reject"
     assert decision["development_helper_deepagents_fit"] == "conditional"
@@ -74,11 +75,20 @@ def test_external_framework_observations_are_dated_and_source_backed() -> None:
     observations = report["external_observations"]
 
     assert observations["checked_on"] == "2026-09-11"
+    assert observations["deepagents_revision"] == DEEPAGENTS_REVISION
     assert observations["deepagents_runtime"] == "langgraph"
     assert observations["compiled_langgraph_can_be_subagent"] is True
     assert observations["tool_boundary_required_for_security"] is True
     assert observations["sources"]
     assert all(source.startswith("https://") for source in observations["sources"])
+
+    github_sources = [
+        source for source in observations["sources"]
+        if source.startswith("https://github.com/langchain-ai/deepagents/")
+    ]
+    assert github_sources
+    assert all(DEEPAGENTS_REVISION in source for source in github_sources)
+    assert all("/blob/main/" not in source for source in github_sources)
 
 
 def test_report_is_deterministic() -> None:
