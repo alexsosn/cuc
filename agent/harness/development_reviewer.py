@@ -390,6 +390,36 @@ class DevelopmentReviewContext:
         object.__setattr__(self, "diff_sha256", expected_diff_digest)
         object.__setattr__(self, "test_evidence", tests)
         object.__setattr__(self, "eval_evidence", evals)
+
+        for item in tests:
+            if item.outcome != GateOutcome.SUCCESS.value:
+                raise ValueError(
+                    f"review verification test is not successful: {item.intent_id}"
+                )
+            if item.head_sha != self.head_sha:
+                raise ValueError(
+                    f"review verification test head does not match context: {item.intent_id}"
+                )
+            if item.executed_sha != self.executed_sha:
+                raise ValueError(
+                    "review verification test executed revision does not match context: "
+                    f"{item.intent_id}"
+                )
+        for item in evals:
+            if item.outcome != GateOutcome.SUCCESS.value:
+                raise ValueError(
+                    f"review verification evaluation is not successful: {item.eval_id}"
+                )
+            if item.head_sha != self.head_sha:
+                raise ValueError(
+                    f"review verification evaluation head does not match context: {item.eval_id}"
+                )
+            if item.executed_sha != self.executed_sha:
+                raise ValueError(
+                    "review verification evaluation executed revision does not match context: "
+                    f"{item.eval_id}"
+                )
+
         object.__setattr__(
             self,
             "policy_refs",
