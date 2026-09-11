@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "baseline_revision": "935864fca6510aeb4ce02e70a6cf69b2461e298e",
+  "deepagents_package": "deepagents",
+  "deepagents_version": "0.7.13",
+  "required_token_ids": ["t1", "t2", "t3"],
+  "observed_token_ids": ["t1"],
+  "completed_normally": true,
+  "equivalence_criteria": [
+    "complete-column-context",
+    "every-token-in-order",
+    "checkpoint-resume",
+    "exact-completion-gates"
+  ],
+  "observations": [
+    "Pinned deepagents 0.7.13 returned an ordinary final response after one review_token call even though the system and user messages required t1, t2, and t3 in order.",
+    "HARN-004 prevents equivalent false completion through deterministic ColumnRunState traversal and ColumnCompleted validation outside model control.",
+    "The temporary core dependency increased the ordinary locked environment from 68 installed packages to 85, including LangChain, Anthropic/Google integrations, and cryptography dependencies.",
+    "Deep Agents isolated subagents and skills progressive-disclosure patterns remain potentially useful around HARN-006/HARN-010 without transferring parsing correctness authority."
+  ],
+  "disposition": "keep-langgraph",
+  "selected_components": [
+    "isolated-subagent-launcher-pattern",
+    "skills-progressive-disclosure-pattern",
+    "development-controller-context-management-pattern"
+  ],
+  "rationale": "Keep explicit HARN-004 LangGraph orchestration as the parsing authority. Deep Agents can be customized to call deterministic CUC state transitions, but that preserves rather than replaces the existing state machine. Borrow selected development-controller ergonomics only when they remain behind HARN-006/HARN-009/HARN-010 contracts.",
+  "evidence_refs": [
+    "git:5920d3758442e7d775c7af37f3acb4f89b2606dd",
+    "synthetic-merge:7b376228f3653aa8639b97619c2795ed31105da6",
+    "github-actions:34577769467",
+    "pytest:1228-passed-1-skipped-23-subtests",
+    "harn-007:red2:5c7c556a0cf75fd82386a74dc1783c9e89c1a00a",
+    "harn-004:column-state",
+    "harn-006:clean-development-review-context"
+  ]
+}
