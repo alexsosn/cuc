@@ -360,7 +360,10 @@ class DevelopmentControllerState:
         if pending is not None and index > len(pending.github_operations):
             raise ValueError("pending_operation_index exceeds pending operation count")
         object.__setattr__(self, "pending_operation_index", index)
-        object.__setattr__(self, "current_head_sha", _optional_text(self.current_head_sha, "current_head_sha"))
+        current_head = _optional_text(self.current_head_sha, "current_head_sha")
+        if pending is not None and current_head != pending.head_sha:
+            raise ValueError("pending implementation head must match current_head_sha")
+        object.__setattr__(self, "current_head_sha", current_head)
         object.__setattr__(
             self,
             "evaluated_change_ids",
@@ -386,7 +389,10 @@ class DevelopmentControllerState:
             object.__setattr__(self, "stop_code", ControllerStopCode(self.stop_code))
         if self.stop_code is ControllerStopCode.COMPLETE and self.core.phase is not RunPhase.COMPLETE:
             raise ValueError("COMPLETE terminal code requires HARN-002 COMPLETE phase")
-        object.__setattr__(self, "stop_reason", _optional_text(self.stop_reason, "stop_reason"))
+        stop_reason = _optional_text(self.stop_reason, "stop_reason")
+        if self.stop_code is not None and stop_reason is None:
+            raise ValueError("terminal stop code requires an explicit stop reason")
+        object.__setattr__(self, "stop_reason", stop_reason)
         object.__setattr__(self, "audit_events", _text_sequence(self.audit_events, "audit_events"))
 
     @property
