@@ -38,6 +38,12 @@ No controller import or runtime path may restore `github_side_effects.py` or exp
 
 It supports strict `to_dict` / `from_dict`. The host persistence callback is invoked after every accepted controller transition and by every gateway journal checkpoint.
 
+Restart/deserialization invariants are fail-closed:
+
+- a pending implementation must be bound to the exact same `current_head_sha` as its own `head_sha`, so restart cannot verify a different revision than the one whose effects are being consumed;
+- every non-null terminal `stop_code` must carry an explicit `stop_reason`;
+- `ControllerStopCode.COMPLETE` is valid only when the embedded HARN-002 state is already `RunPhase.COMPLETE`, which itself requires fresh successful verification and an approving independent review.
+
 ## Policy and ports
 
 `DevelopmentControllerPolicy` bounds:
@@ -64,6 +70,8 @@ An implementation port returns:
 - evidence refs.
 
 The ordered request IDs must exactly equal `ChangeSet.operation_ids`. Requests used in the side-effect sequence must be write actions; reads belong in research/implementation ports, not the mutation journal.
+
+`ImplementationResult` must not contain `MERGE_PULL_REQUEST`. Implementation-stage effects happen before verification and review, while merge is a post-review finalization action. Allowing a merge request in `IMPLEMENT` would permit a trusted/human-approved merge before the candidate had passed fresh verification and independent review.
 
 Before any gateway call, the controller checks that the pending `change_id` and every pending operation ID are new relative to already recorded changes. Reuse terminates with an explicit policy block before replay/provider dispatch.
 
@@ -95,11 +103,13 @@ Resume may attach a structured `HumanApproval` to the controller journal, but th
 
 Concrete durable authority/reconciler/provider host wiring remains tracked by #53.
 
-## Verification and review
+## Verification, review, and finalization boundary
 
 `VERIFY` runs one missing test/eval action at a time and binds each result to the current proposed/executed SHA. Real failures route through HARN-002 to bounded implementation. Only after all required current evidence is successful may `VerificationPassed` advance to `REVIEW`.
 
-`REVIEW` builds HARN-006's allowlisted context from exact verified evidence and final diff. APPROVE completes; REQUEST_CHANGES returns to bounded implementation; ESCALATE pauses for human. Every new candidate requires fresh verification and a fresh review packet.
+`REVIEW` builds HARN-006's allowlisted context from exact verified evidence and final diff. APPROVE advances HARN-002 to `COMPLETE`; REQUEST_CHANGES returns to bounded implementation; ESCALATE pauses for human. Every new candidate requires fresh verification and a fresh review packet.
+
+Within HARN-010, `COMPLETE` means **review-approved and eligible for trusted host finalization**. It does not mean a pull request has already been merged. Any actual merge happens after `COMPLETE` through the canonical HARN-023 gateway/host finalization path and remains subject to the gateway's sensitive-action authorization, exact target/ref binding, and human approval rules. This preserves the required ordering `... -> verify -> independent review -> finalize/merge`.
 
 ## Budgets and safe termination
 
@@ -124,10 +134,12 @@ Required scenarios include:
 11. reused operation/change IDs are blocked before gateway/provider dispatch;
 12. every terminal state/reason and issue provenance round-trip;
 13. no-feature fallback is policy gated;
-14. source/runtime uses only the canonical HARN-023 GitHub authority.
+14. source/runtime uses only the canonical HARN-023 GitHub authority;
+15. implementation cannot schedule pull-request merge before verification/review;
+16. serialized COMPLETE cannot contradict HARN-002 phase, terminal states cannot omit their reason, and pending implementation cannot drift from its exact current head.
 
 ## Review strategy
 
-After exact-head full-suite GREEN, conduct a logically independent review from issue #11, final diff, HARN-023 canonical contract, and CI evidence. Attack termination/budget off-by-one errors, fabricated/stale evidence, restart crash windows, duplicate/reused operation IDs, forged approval-shaped data, uncertain outcomes, alternative GitHub authority paths, provenance drift, and fallback scope expansion.
+After exact-head full-suite GREEN, conduct a logically independent review from issue #11, final diff, HARN-023 canonical contract, and CI evidence. Attack termination/budget off-by-one errors, fabricated/stale evidence, restart crash windows, duplicate/reused operation IDs, forged approval-shaped data, uncertain outcomes, premature finalization, malformed persisted terminal/revision state, alternative GitHub authority paths, provenance drift, and fallback scope expansion.
 
 Every confirmed blocker gets a RED regression before its fix, followed by full suite and a fresh clean-context re-review.
