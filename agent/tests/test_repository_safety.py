@@ -5,6 +5,20 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 UPSTREAM = "DT-UCPH/cuc"
+DIRECT_GITHUB_TRANSPORT_MARKERS = (
+    "api.github.com",
+    "gh pr create",
+    "gh issue create",
+    "gh pr comment",
+    "gh issue comment",
+    "requests.post(",
+    "requests.patch(",
+    "httpx.post(",
+    "httpx.patch(",
+    "urllib.request",
+    "subprocess.run(",
+    "subprocess.Popen(",
+)
 
 
 def _workflow_texts():
@@ -42,8 +56,13 @@ def test_workflows_do_not_grant_issue_or_pull_request_write_permissions():
 
 
 def test_automation_does_not_target_upstream_writes():
-    roots = [REPO_ROOT / ".github", REPO_ROOT / "scripts", REPO_ROOT / "agent" / "scripts"]
-    write_markers = (
+    roots = [
+        REPO_ROOT / ".github",
+        REPO_ROOT / "scripts",
+        REPO_ROOT / "agent" / "scripts",
+        REPO_ROOT / "agent" / "harness",
+    ]
+    upstream_write_markers = (
         "gh pr create",
         "gh issue create",
         "gh pr comment",
@@ -63,7 +82,11 @@ def test_automation_does_not_target_upstream_writes():
             text = path.read_text(encoding="utf-8", errors="ignore")
             if UPSTREAM not in text:
                 continue
-            if any(marker in text for marker in write_markers):
+            if any(marker in text for marker in upstream_write_markers):
+                offenders.append(str(path.relative_to(REPO_ROOT)))
+            elif path.is_relative_to(REPO_ROOT / "agent" / "harness") and any(
+                marker in text for marker in DIRECT_GITHUB_TRANSPORT_MARKERS
+            ):
                 offenders.append(str(path.relative_to(REPO_ROOT)))
 
     assert not offenders, f"automation may write to upstream {UPSTREAM}: {offenders}"
