@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def _runtime():
     return importlib.import_module("harness.github_effects")
+
+
+def _safety_module():
+    path = REPO_ROOT / "agent" / "tests" / "test_repository_safety.py"
+    spec = importlib.util.spec_from_file_location("harn009_repository_safety", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class _Adapter:
@@ -106,3 +116,17 @@ def test_static_safety_guard_scans_harness_for_generic_direct_github_transport()
     )
     assert "def test_development_harness_has_no_direct_github_transport" in text
     assert "DIRECT_GITHUB_TRANSPORT_MARKERS" in text
+
+
+def test_static_transport_guard_allows_local_processes_but_detects_direct_github_io():
+    safety = _safety_module()
+    assert not safety._contains_direct_github_transport(
+        'subprocess.run(["python", "-m", "pytest", "-q"], check=True)'
+    )
+    assert not safety._contains_direct_github_transport(
+        'requests.post("https://example.invalid/evals", json=payload)'
+    )
+    assert safety._contains_direct_github_transport(
+        'requests.post("https://api.github.com/repos/owner/repo/issues", json=payload)'
+    )
+    assert safety._contains_direct_github_transport('os.system("gh issue create --title x")')
