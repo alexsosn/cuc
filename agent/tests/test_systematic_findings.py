@@ -147,6 +147,18 @@ def test_token_id_churn_at_same_source_locus_does_not_fake_recurrence():
     assert decision.disposition is mod.FindingDisposition.INSUFFICIENT_SYSTEMATIC_EVIDENCE
 
 
+def test_whitespace_variants_of_same_source_locus_do_not_fake_recurrence():
+    mod = _mod()
+    candidate = _candidate(
+        occurrences=(
+            _occurrence(occurrence_id="a", tablet="KTU 1.1", column="I", locus_ref="I:4"),
+            _occurrence(occurrence_id="b", tablet="KTU  1.1", column=" I ", locus_ref=" I:4 "),
+        )
+    )
+    decision = _plan(candidate)
+    assert decision.disposition is mod.FindingDisposition.INSUFFICIENT_SYSTEMATIC_EVIDENCE
+
+
 def test_two_distinct_loci_produce_harn010_task_and_fork_issue_request():
     mod = _mod()
     decision = _plan(_candidate())
@@ -169,6 +181,8 @@ def test_typed_systematic_signal_can_justify_single_locus():
     signal = mod.SystematicSignal(
         signal_id="eval-regression-1",
         kind=mod.SystematicSignalKind.EVAL_REGRESSION,
+        subsystem="harness.parsing-evaluation",
+        problem_key="metric-artifact-mismatch",
         summary="Complete-column exact-set accuracy regressed across the fixed workload.",
         evidence_refs=("eval:run-17",),
     )
@@ -184,6 +198,30 @@ def test_typed_systematic_signal_can_justify_single_locus():
     )
     decision = _plan(candidate)
     assert decision.disposition is mod.FindingDisposition.READY_FOR_DEVELOPMENT_ISSUE
+
+
+def test_systematic_signal_for_different_problem_cannot_justify_single_locus():
+    mod = _mod()
+    unrelated = mod.SystematicSignal(
+        signal_id="unrelated",
+        kind=mod.SystematicSignalKind.EVAL_REGRESSION,
+        subsystem="harness.parsing-evaluation",
+        problem_key="different-problem",
+        summary="Regression belongs to another general defect.",
+        evidence_refs=("eval:other",),
+    )
+    candidate = _candidate(
+        classification=mod.FindingClassification.EVAL_BENCHMARK_DEFECT,
+        occurrences=(_occurrence(occurrence_id="only"),),
+        signals=(unrelated,),
+        positive_cases=(),
+        negative_cases=(),
+        boundary_cases=(),
+        subsystem="harness.parsing-evaluation",
+        problem_key="metric-artifact-mismatch",
+    )
+    with pytest.raises(ValueError, match="signal|subsystem|problem"):
+        _plan(candidate)
 
 
 @pytest.mark.parametrize(
