@@ -34,7 +34,7 @@ HARN-007 deliberately kept HARN-010 framework-neutral and deferred any Deep Agen
 
 The boundary protects against an agent/controller that is buggy, retries after interruption, supplies malformed or misleading operation metadata, chooses an alternative operation name, fabricates approval-shaped data, or attempts to route a write through a generic GitHub adapter. It also protects against stale approval grants and operation-ID reuse.
 
-The boundary does **not** attempt to make a deliberately malicious trusted transport implementation safe if that transport ignores the validated target and secretly writes elsewhere. Trusted adapter code, the host-owned approval registry, and their persistence are part of the trusted computing base; the model never receives the raw transport or authority to register approvals.
+The boundary does **not** attempt to make a deliberately malicious trusted transport implementation safe if that transport ignores the validated target and secretly writes elsewhere. Trusted adapter code, the host-owned approval registry, the durable journal store, and their persistence are part of the trusted computing base; the model never receives the raw transport or authority to register approvals.
 
 ## Required policy model
 
@@ -71,7 +71,7 @@ Sensitive writes:
 - trigger write-capable workflows;
 - any upstream write.
 
-Unknown/generic operations are denied, not interpreted heuristically.
+Unknown/generic operations are denied, not interpreted heuristically. Merge and workflow-trigger intents must carry an explicit target ref so the approval fingerprint names the integration/publication destination rather than leaving it implicit in payload data.
 
 ### Approval
 
@@ -94,26 +94,29 @@ Approval and replay depend on operation fingerprints, so canonicalization must p
 
 ### Replay safety
 
-`operation_id` is mandatory and immutable. The boundary needs a serializable operation journal:
+`operation_id` is mandatory and immutable. The boundary uses a two-phase operation journal:
 
 1. canonicalize and fingerprint the intent;
-2. record `prepared` before invoking a write transport;
-3. on retry/resume, reject reuse of the operation ID with a different fingerprint;
-4. if an identical operation is already completed, return the recorded result without a second write;
-5. if an identical operation is only `prepared`, validate its trusted approval if required, then ask the trusted transport to reconcile whether the write already happened before issuing it again;
-6. only then execute and record `completed`.
+2. create `prepared` state and **synchronously persist that snapshot before any provider write is dispatched**;
+3. if durable persistence fails, roll back the in-memory mutation and make zero provider calls;
+4. on retry/resume, reject reuse of the operation ID with a different fingerprint;
+5. if an identical operation is already completed, return the recorded result without a second write;
+6. if an identical operation is only `prepared`, validate its trusted approval if required, then ask the trusted transport to reconcile whether the write already happened before issuing it again;
+7. only then execute and durably record `completed`.
 
-For issue/PR creation, the concrete transport used by HARN-010 should make reconciliation possible by persisting the operation ID in provider-visible metadata/body or by another deterministic lookup convention. HARN-009 can define the reconciliation protocol without making live GitHub calls.
+Serializability alone is insufficient: a process can die after a successful provider write but before an external caller saves an in-memory journal. Requiring the PREPARED snapshot to be committed synchronously before provider dispatch closes that restart window. A failure while persisting COMPLETED leaves the durable state at PREPARED; the next run reconciles provider state before deciding whether any retry is safe.
+
+For issue/PR creation, the concrete transport used by HARN-010 should make reconciliation possible by persisting the operation ID in provider-visible metadata/body or by another deterministic lookup convention. HARN-009 defines the reconciliation protocol without making live GitHub calls.
 
 This is stronger than an in-memory "seen ID" set and specifically addresses a crash between a successful provider write and local completion recording.
 
 ### Dry run
 
-Dry-run must return the same policy decision and canonical intended side effect but never invoke transport, reconciliation, or journal completion. It is inspection, not execution and does not itself prove human approval.
+Dry-run returns the same policy decision and canonical intended side effect but never invokes transport, reconciliation, or journal persistence. It is inspection, not execution and does not itself prove human approval.
 
 ## Adapter boundary
 
-The controller should receive a `GuardedGitHubSideEffects` capability, not a generic REST/GraphQL/CLI executor. The guard dispatches a validated closed operation kind to a trusted adapter. There is deliberately no `request(method, url, body)` escape hatch.
+The controller receives a `GuardedGitHubSideEffects` capability, not a generic REST/GraphQL/CLI executor. The guard dispatches a validated closed operation kind to a trusted adapter. There is deliberately no `request(method, url, body)` escape hatch.
 
 A generic-adapter bypass attempt therefore fails at the intent parser/policy boundary before any transport method is selected. The target is taken from the validated `GitHubTarget`, never inferred from URLs or repository names embedded in payload data.
 
@@ -129,9 +132,12 @@ Tests cover at least:
 - registered exact upstream approval -> allowed by policy without a live upstream transport in CI;
 - approval mismatch by operation ID, target, ref, action, payload, approval identity, or registered grant contents -> denied;
 - approval registry serialization/restart;
-- sensitive fork merge/workflow actions require approval;
+- sensitive fork merge/workflow actions require approval and an explicit target ref;
 - operation-ID reuse with changed payload -> denied;
 - distinct JSON container types preserve distinct fingerprints and round-trip identity;
+- PREPARED state is durably persisted before provider dispatch;
+- persistence failure produces zero provider calls;
+- real restart from only the durable PREPARED snapshot reconciles instead of duplicating the write;
 - completed replay -> no duplicate write;
 - prepared/unknown-outcome replay -> reconcile first, then avoid duplicate if found;
 - prepared sensitive replay requires the restored trusted approval registry;
@@ -143,4 +149,4 @@ Tests cover at least:
 
 ## Scope decision
 
-Implement the policy, exact intent/approval/registry/journal contracts, type-preserving canonicalization, and trusted-adapter dispatch in HARN-009. Do not yet wire live GitHub credentials or the full HARN-010 loop. That separation keeps the safety boundary testable without network access and makes HARN-010 consume a proven capability rather than reimplement permissions.
+Implement the policy, exact intent/approval/registry/journal contracts, synchronous durable journal hook, type-preserving canonicalization, and trusted-adapter dispatch in HARN-009. Do not yet wire live GitHub credentials or the full HARN-010 loop. That separation keeps the safety boundary testable without network access and makes HARN-010 consume a proven capability rather than reimplement permissions.
