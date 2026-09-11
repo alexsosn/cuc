@@ -33,22 +33,22 @@ from harness.development_reviewer import (
     DevelopmentReviewReport,
     IndependentReviewer,
 )
-from harness.github_side_effects import (
-    GitHubOperationIntent,
-    GitHubOperationKind,
-    GitHubTarget,
-    GuardedGitHubSideEffects,
-    HumanApprovalGrant,
-    HumanApprovalRegistry,
-    OperationJournal,
+from harness.github_effects import (
+    GitHubAction,
+    GitHubEffectGateway,
+    GitHubEffectRequest,
+    GitHubOperationPermission,
+    GitHubTaskPolicy,
+    HumanApproval,
+    HumanApprovalAuthority,
 )
 
 
 BASE = "a" * 40
 HEAD1 = "b" * 40
 HEAD2 = "c" * 40
-FORK = GitHubTarget("alexsosn", "cuc")
-UPSTREAM = GitHubTarget("DT-UCPH", "cuc")
+FORK = "alexsosn/cuc"
+UPSTREAM = "DT-UCPH/cuc"
 
 
 class FakeGitHubAdapter:
@@ -56,29 +56,11 @@ class FakeGitHubAdapter:
         self.calls: list[tuple[str, str]] = []
         self.results: dict[str, str] = {}
 
-    def read(self, intent):
-        self.calls.append(("read", intent.operation_id))
-        return f"read:{intent.operation_id}"
-
-    def reconcile(self, intent):
-        self.calls.append(("reconcile", intent.operation_id))
-        return self.results.get(intent.operation_id)
-
-    def _write(self, name, intent):
-        self.calls.append((name, intent.operation_id))
-        result = f"{name}:{intent.operation_id}"
-        self.results[intent.operation_id] = result
+    def execute(self, request):
+        self.calls.append((request.action.value, request.operation_id))
+        result = f"{request.action.value}:{request.operation_id}"
+        self.results[request.operation_id] = result
         return result
-
-    def create_branch(self, intent): return self._write("create_branch", intent)
-    def update_branch(self, intent): return self._write("update_branch", intent)
-    def create_issue(self, intent): return self._write("create_issue", intent)
-    def update_issue(self, intent): return self._write("update_issue", intent)
-    def create_pr(self, intent): return self._write("create_pr", intent)
-    def update_pr(self, intent): return self._write("update_pr", intent)
-    def comment(self, intent): return self._write("comment", intent)
-    def merge_pr(self, intent): return self._write("merge_pr", intent)
-    def trigger_workflow(self, intent): return self._write("trigger_workflow", intent)
 
 
 def task() -> TaskSpec:
@@ -110,29 +92,35 @@ def regression() -> TestIntent:
     )
 
 
-def approval_for(intent: GitHubOperationIntent, approval_id="human-1") -> HumanApprovalGrant:
-    return HumanApprovalGrant(
+def approval_for(request: GitHubEffectRequest, approval_id="human-1") -> HumanApproval:
+    return HumanApproval(
         approval_id,
         "human-user",
-        intent.operation_id,
-        intent.fingerprint,
-        "2026-09-11T16:00:00+03:00",
+        request.operation_id,
+        request.request_sha256,
     )
 
 
-def side_effects(*, durable=True):
+def gateway_for(operations=()):
+    operations = tuple(operations)
+    fork_permissions = tuple(
+        GitHubOperationPermission(item.operation_id, item.action)
+        for item in operations
+        if item.repository.casefold() == FORK.casefold()
+    )
+    upstream_ids = tuple(
+        item.operation_id
+        for item in operations
+        if item.repository.casefold() == UPSTREAM.casefold()
+    )
+    policy = GitHubTaskPolicy(
+        allowed_fork_write_operations=fork_permissions,
+        allowed_upstream_operation_ids=upstream_ids,
+    )
     adapter = FakeGitHubAdapter()
-    journal_snapshots = []
-    journal = OperationJournal(
-        persist=(lambda payload: journal_snapshots.append(payload)) if durable else None
-    )
-    approvals = HumanApprovalRegistry()
-    guard = GuardedGitHubSideEffects(
-        adapter=adapter,
-        journal=journal,
-        approvals=approvals,
-    )
-    return guard, adapter, approvals
+    authority = HumanApprovalAuthority()
+    gateway = GitHubEffectGateway(policy, adapter, approval_authority=authority)
+    return gateway, adapter, authority
 
 
 class ScriptedPorts:
@@ -141,8 +129,10 @@ class ScriptedPorts:
         self.implementation_count = 0
         self.test_failures_remaining = 0
         self.review_rejections_remaining = 0
-        self.github_operations: tuple[GitHubOperationIntent, ...] = ()
+        self.review_escalations_remaining = 0
+        self.github_operations: tuple[GitHubEffectRequest, ...] = ()
         self.block_research = False
+        self.stale_verification = False
 
     def research(self, _task, provenance_refs):
         self.calls.append("research")
@@ -208,12 +198,13 @@ class ScriptedPorts:
                 "still failing",
                 ("ci:fail",),
             )
+        executed = "d" * 40 if self.stale_verification else head_sha
         return TestResult(
             intent.intent_id,
             change.change_id,
             GateOutcome.SUCCESS,
             head_sha,
-            head_sha,
+            executed,
             0,
             1,
             0,
@@ -232,6 +223,17 @@ class ScriptedPorts:
     def reviewer(self):
         def review(context):
             self.calls.append(f"review:{context.head_sha}")
+            if self.review_escalations_remaining:
+                self.review_escalations_remaining -= 1
+                return DevelopmentReviewReport.create(
+                    review_id="review-escalate",
+                    reviewer_id="clean-reviewer",
+                    review_context_id=context.review_context_id,
+                    inspected_sha=context.head_sha,
+                    disposition=ReviewDisposition.ESCALATE,
+                    summary="human decision required",
+                    findings=(),
+                )
             if self.review_rejections_remaining:
                 self.review_rejections_remaining -= 1
                 finding = DevelopmentReviewFinding(
@@ -273,9 +275,8 @@ def make_controller(
     scripted: ScriptedPorts,
     *,
     policy=None,
-    guard=None,
+    gateway=None,
     persist=None,
-    approval_state_persist=lambda payload: None,
 ):
     ports = DevelopmentControllerPorts(
         research=scripted.research,
@@ -287,8 +288,8 @@ def make_controller(
         run_evals=scripted.run_evals,
         final_diff=scripted.final_diff,
     )
-    if guard is None:
-        guard, _, _ = side_effects()
+    if gateway is None:
+        gateway, _, _ = gateway_for(scripted.github_operations)
     snapshots = [] if persist is None else persist
     controller = BoundedDevelopmentController(
         policy=policy
@@ -302,10 +303,9 @@ def make_controller(
         ),
         ports=ports,
         reviewer=scripted.reviewer(),
-        side_effects=guard,
+        github_gateway=gateway,
         persist=snapshots.append,
-        approval_state_persist=approval_state_persist,
-        policy_refs=("AGENTS.md", "HARN-009"),
+        policy_refs=("AGENTS.md", "HARN-023", "HARN-009"),
         review_rubric=("correctness", "tests", "side-effect safety"),
         implementer_id="implementer",
     )
@@ -423,6 +423,22 @@ def test_reviewer_rejection_causes_fresh_bounded_revision_and_review() -> None:
     assert "review:" + HEAD2 in scripted.calls
 
 
+def test_reviewer_escalation_pauses_and_human_resume_retries_review_boundedly() -> None:
+    scripted = ScriptedPorts()
+    scripted.review_escalations_remaining = 1
+    controller, _ = make_controller(scripted)
+    paused = controller.run_until_stop(start(controller))
+
+    assert paused.core.phase is RunPhase.AWAITING_HUMAN
+    assert paused.stop_code is ControllerStopCode.NEEDS_HUMAN
+    assert paused.review_attempts == 1
+
+    resumed = controller.resume(paused)
+    finished = controller.run_until_stop(resumed)
+    assert finished.core.phase is RunPhase.COMPLETE
+    assert finished.review_attempts == 2
+
+
 def test_blocked_dependency_has_explicit_terminal_reason() -> None:
     scripted = ScriptedPorts()
     scripted.block_research = True
@@ -432,6 +448,18 @@ def test_blocked_dependency_has_explicit_terminal_reason() -> None:
     assert state.core.phase is RunPhase.BLOCKED
     assert state.stop_code is ControllerStopCode.BLOCKED_EXECUTION
     assert "dependency unavailable" in state.stop_reason
+
+
+def test_stale_executed_revision_is_explicit_policy_block_not_review_success() -> None:
+    scripted = ScriptedPorts()
+    scripted.stale_verification = True
+    controller, _ = make_controller(scripted)
+    state = controller.run_until_stop(start(controller))
+
+    assert state.core.phase is RunPhase.BLOCKED
+    assert state.stop_code is ControllerStopCode.POLICY_BLOCK
+    assert "revision" in state.stop_reason.casefold() or "sha" in state.stop_reason.casefold()
+    assert not any(call.startswith("review:") for call in scripted.calls)
 
 
 def test_verification_budget_blocks_before_over_budget_test_port_call() -> None:
@@ -491,15 +519,15 @@ def test_cost_budget_blocks_before_second_implementation() -> None:
 
 def test_approval_interrupt_persists_pending_implementation_and_resumes_same_operation() -> None:
     scripted = ScriptedPorts()
-    intent = GitHubOperationIntent(
+    request = GitHubEffectRequest(
         "upstream-op-1",
-        GitHubOperationKind.CREATE_ISSUE,
         UPSTREAM,
+        GitHubAction.CREATE_ISSUE,
         {"title": "requires human"},
     )
-    scripted.github_operations = (intent,)
-    guard, adapter, approvals = side_effects()
-    controller, _ = make_controller(scripted, guard=guard)
+    scripted.github_operations = (request,)
+    gateway, adapter, authority = gateway_for(scripted.github_operations)
+    controller, _ = make_controller(scripted, gateway=gateway)
     state = start(controller)
 
     while state.core.phase is not RunPhase.AWAITING_HUMAN:
@@ -507,28 +535,27 @@ def test_approval_interrupt_persists_pending_implementation_and_resumes_same_ope
 
     assert state.stop_code is ControllerStopCode.NEEDS_HUMAN
     assert state.pending_implementation is not None
-    assert state.pending_operation_id == intent.operation_id
+    assert state.pending_operation_id == request.operation_id
     assert scripted.implementation_count == 1
     assert adapter.calls == []
 
-    grant = approval_for(intent)
-    approvals.register(grant)
-    resumed = controller.resume(state, approval_id=grant.approval_id)
+    approval = approval_for(request)
+    authority.register(approval)
+    resumed = controller.resume(state, approval=approval)
     finished = controller.run_until_stop(resumed)
 
     assert finished.core.phase is RunPhase.COMPLETE
     assert scripted.implementation_count == 1
-    writes = [call for call in adapter.calls if call[0] == "create_issue"]
-    assert writes == [("create_issue", intent.operation_id)]
+    assert adapter.calls == [(GitHubAction.CREATE_ISSUE.value, request.operation_id)]
 
 
 def test_github_write_budget_blocks_before_provider_write() -> None:
     scripted = ScriptedPorts()
     scripted.github_operations = (
-        GitHubOperationIntent(
+        GitHubEffectRequest(
             "fork-write-1",
-            GitHubOperationKind.CREATE_ISSUE,
             FORK,
+            GitHubAction.CREATE_ISSUE,
             {"title": "one"},
         ),
     )
@@ -540,8 +567,8 @@ def test_github_write_budget_blocks_before_provider_write() -> None:
         max_cost_units=10.0,
         production_mode=True,
     )
-    guard, adapter, _ = side_effects()
-    controller, _ = make_controller(scripted, policy=policy, guard=guard)
+    gateway, adapter, _ = gateway_for(scripted.github_operations)
+    controller, _ = make_controller(scripted, policy=policy, gateway=gateway)
     state = controller.run_until_stop(start(controller))
 
     assert state.stop_code is ControllerStopCode.GITHUB_WRITE_BUDGET_EXHAUSTED
@@ -569,27 +596,17 @@ def test_serialized_restart_does_not_repeat_research_plan_or_red() -> None:
     assert scripted.calls[: len(before)] == before
 
 
-def test_production_mode_rejects_in_memory_journal_or_missing_approval_persistence() -> None:
-    scripted = ScriptedPorts()
-    guard, _, _ = side_effects(durable=False)
-    with pytest.raises(ValueError, match="durable|journal|production"):
-        make_controller(scripted, guard=guard)
-
-    guard, _, _ = side_effects(durable=True)
-    with pytest.raises(ValueError, match="durable|approval|production"):
-        make_controller(scripted, guard=guard, approval_state_persist=None)
-
-
-def test_controller_uses_only_harn009_authority_not_legacy_gateway() -> None:
+def test_controller_uses_only_harn023_canonical_gateway() -> None:
     import harness.development_controller as module
 
     source = inspect.getsource(module)
-    assert "github_effects" not in source
-    assert "GitHubEffectGateway" not in source
-    assert "GuardedGitHubSideEffects" in source
+    assert "github_side_effects" not in source
+    assert "GuardedGitHubSideEffects" not in source
+    assert "github_effects" in source
+    assert "GitHubEffectGateway" in source
 
 
-def test_state_round_trip_preserves_terminal_reason_and_provenance() -> None:
+def test_state_round_trip_preserves_terminal_reason_provenance_and_journal() -> None:
     scripted = ScriptedPorts()
     scripted.block_research = True
     controller, _ = make_controller(scripted)
@@ -599,6 +616,7 @@ def test_state_round_trip_preserves_terminal_reason_and_provenance() -> None:
     assert restored == blocked
     assert restored.stop_code is ControllerStopCode.BLOCKED_EXECUTION
     assert restored.provenance_refs == ("github:issue:11",)
+    assert restored.github_journal == blocked.github_journal
     assert restored.stop_reason
 
 
