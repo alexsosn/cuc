@@ -396,6 +396,11 @@ class DevelopmentReviewContext:
                 raise ValueError(
                     f"review verification test is not successful: {item.intent_id}"
                 )
+            if item.exit_code != 0 or item.failed_tests != 0 or item.passed_tests == 0:
+                raise ValueError(
+                    "review verification test success evidence is inconsistent: "
+                    f"{item.intent_id}"
+                )
             if item.head_sha != self.head_sha:
                 raise ValueError(
                     f"review verification test head does not match context: {item.intent_id}"
