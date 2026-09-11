@@ -4,6 +4,8 @@ from harness.systematic_findings import (
     FindingClassification,
     FindingOccurrence,
     SystematicFindingCandidate,
+    SystematicSignal,
+    SystematicSignalKind,
     plan_development_issue,
 )
 
@@ -31,7 +33,18 @@ def _occurrence(occurrence_id: str, tablet: str, locus_ref: str, token_id: str):
     )
 
 
-def _candidate(occurrences):
+def _signal(signal_id: str):
+    return SystematicSignal(
+        signal_id=signal_id,
+        kind=SystematicSignalKind.MODEL_COMPARISON,
+        subsystem="pipeline.tablet-parsing",
+        problem_key="verb-stem-overgeneration",
+        summary=f"Signal {signal_id}",
+        evidence_refs=(f"signal:{signal_id}",),
+    )
+
+
+def _candidate(occurrences, *, signals=()):
     return SystematicFindingCandidate(
         classification=FindingClassification.PARSER_CONFIG_DEFECT,
         subsystem="pipeline.tablet-parsing",
@@ -40,18 +53,35 @@ def _candidate(occurrences):
         objective="Prevent the systematic overgeneration while preserving supported ambiguity.",
         acceptance_criteria=("add a regression test before the parser fix",),
         occurrences=tuple(occurrences),
+        systematic_signals=tuple(signals),
         positive_cases=("positive:fixture",),
         negative_cases=("negative:fixture",),
         boundary_cases=("boundary:fixture",),
     )
 
 
-def test_issue_request_rendering_is_order_invariant_for_case_colliding_ids():
+def test_issue_request_rendering_is_order_invariant_for_case_colliding_occurrence_ids():
     upper = _occurrence("A", "KTU 1.1", "I:1", "t1")
     lower = _occurrence("a", "KTU 1.2", "I:2", "t2")
 
     forward = plan_development_issue(_candidate((upper, lower)))
     reverse = plan_development_issue(_candidate((lower, upper)))
+
+    assert forward.fingerprint == reverse.fingerprint
+    assert forward.task == reverse.task
+    assert forward.github_request == reverse.github_request
+
+
+def test_issue_request_rendering_is_order_invariant_for_case_colliding_signal_ids():
+    occurrences = (
+        _occurrence("one", "KTU 1.1", "I:1", "t1"),
+        _occurrence("two", "KTU 1.2", "I:2", "t2"),
+    )
+    upper = _signal("S")
+    lower = _signal("s")
+
+    forward = plan_development_issue(_candidate(occurrences, signals=(upper, lower)))
+    reverse = plan_development_issue(_candidate(occurrences, signals=(lower, upper)))
 
     assert forward.fingerprint == reverse.fingerprint
     assert forward.task == reverse.task
