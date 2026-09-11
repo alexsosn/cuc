@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 from harness.contracts import (
@@ -25,38 +23,28 @@ from harness.development_controller import (
     RedGateEvidence,
 )
 from harness.development_reviewer import IndependentReviewer
-from harness.github_side_effects import (
-    GitHubOperationIntent,
-    GitHubOperationKind,
-    GitHubTarget,
-    GuardedGitHubSideEffects,
-    HumanApprovalRegistry,
-    OperationJournal,
+from harness.github_effects import (
+    GitHubAction,
+    GitHubEffectGateway,
+    GitHubEffectJournal,
+    GitHubEffectRequest,
+    GitHubOperationPermission,
+    GitHubTaskPolicy,
 )
 
 
 BASE = "a" * 40
 HEAD = "b" * 40
-FORK = GitHubTarget("alexsosn", "cuc")
+FORK = "alexsosn/cuc"
 
 
 class Adapter:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
-        self.results: dict[str, str] = {}
 
-    def read(self, intent):
-        raise AssertionError("read is not expected")
-
-    def reconcile(self, intent):
-        self.calls.append(("reconcile", intent.operation_id))
-        return self.results.get(intent.operation_id)
-
-    def create_issue(self, intent):
-        self.calls.append(("create_issue", intent.operation_id))
-        result = f"issue:{intent.operation_id}"
-        self.results[intent.operation_id] = result
-        return result
+    def execute(self, request):
+        self.calls.append((request.action.value, request.operation_id))
+        return f"issue:{request.operation_id}"
 
 
 class SimulatedControllerCrash(RuntimeError):
@@ -95,15 +83,24 @@ def _policy(*, max_github_writes: int = 1) -> DevelopmentControllerPolicy:
     )
 
 
-def _controller(guard, persist, *, policy=None) -> BoundedDevelopmentController:
+def _gateway(requests, adapter):
+    permissions = tuple(
+        GitHubOperationPermission(item.operation_id, item.action) for item in requests
+    )
+    return GitHubEffectGateway(
+        GitHubTaskPolicy(allowed_fork_write_operations=permissions),
+        adapter,
+    )
+
+
+def _controller(gateway, persist, *, policy=None) -> BoundedDevelopmentController:
     return BoundedDevelopmentController(
         policy=policy or _policy(),
         ports=_ports(),
         reviewer=_reviewer(),
-        side_effects=guard,
+        github_gateway=gateway,
         persist=persist,
-        approval_state_persist=lambda _payload: None,
-        policy_refs=("AGENTS.md", "HARN-009"),
+        policy_refs=("AGENTS.md", "HARN-023"),
         review_rubric=("termination", "replay safety"),
         implementer_id="implementer",
     )
@@ -150,11 +147,11 @@ def _pending_state() -> DevelopmentControllerState:
         plan=PlanArtifact("plan", "done", ("test", "implement")),
         test_intents=(intent,),
     )
-    op1 = GitHubOperationIntent(
-        "write-1", GitHubOperationKind.CREATE_ISSUE, FORK, {"title": "first"}
+    op1 = GitHubEffectRequest(
+        "write-1", FORK, GitHubAction.CREATE_ISSUE, {"title": "first"}
     )
-    op2 = GitHubOperationIntent(
-        "write-2", GitHubOperationKind.CREATE_ISSUE, FORK, {"title": "second"}
+    op2 = GitHubEffectRequest(
+        "write-2", FORK, GitHubAction.CREATE_ISSUE, {"title": "second"}
     )
     implementation = ImplementationResult(
         ChangeSet(
@@ -174,58 +171,56 @@ def _pending_state() -> DevelopmentControllerState:
         pending_implementation=implementation,
         current_head_sha=HEAD,
         revision_attempts=1,
+        github_journal=GitHubEffectJournal(),
     )
 
 
 def test_replayed_completed_write_consumes_budget_after_controller_snapshot_crash() -> None:
+    state = _pending_state()
+    requests = state.pending_implementation.github_operations
     adapter = Adapter()
-    journal_snapshots: list[dict[str, object]] = []
-    journal = OperationJournal(persist=journal_snapshots.append)
-    guard = GuardedGitHubSideEffects(
-        adapter=adapter,
-        journal=journal,
-        approvals=HumanApprovalRegistry(),
-    )
-    durable_before_dispatch = _pending_state().to_dict()
+    gateway = _gateway(requests, adapter)
 
-    def crash_controller_persist(_payload):
-        raise SimulatedControllerCrash(
-            "controller died after HARN-009 completion but before controller snapshot"
-        )
+    durable_snapshots: list[dict[str, object]] = []
+    persist_calls = 0
 
-    crashing = _controller(guard, crash_controller_persist)
+    def crash_after_completed_journal_checkpoint(payload):
+        nonlocal persist_calls
+        persist_calls += 1
+        if persist_calls == 3:
+            raise SimulatedControllerCrash(
+                "controller died after durable receipt but before index/counter snapshot"
+            )
+        durable_snapshots.append(payload)
+
+    crashing = _controller(gateway, crash_after_completed_journal_checkpoint)
     with pytest.raises(SimulatedControllerCrash):
-        crashing.step(DevelopmentControllerState.from_dict(durable_before_dispatch))
+        crashing.step(state)
 
-    assert journal.status("write-1") == "completed"
-    assert [call for call in adapter.calls if call[0] == "create_issue"] == [
-        ("create_issue", "write-1")
-    ]
+    assert adapter.calls == [(GitHubAction.CREATE_ISSUE.value, "write-1")]
+    assert len(durable_snapshots) == 2
+    restored = DevelopmentControllerState.from_dict(durable_snapshots[-1])
+    assert restored.pending_operation_index == 0
+    assert restored.github_writes == 0
+    assert restored.github_journal.receipt_for("write-1") is not None
 
-    restored = DevelopmentControllerState.from_dict(durable_before_dispatch)
-    persisted_after_restart: list[dict[str, object]] = []
-    resumed = _controller(guard, persisted_after_restart.append)
-
+    resumed_snapshots: list[dict[str, object]] = []
+    resumed = _controller(gateway, resumed_snapshots.append)
     replayed = resumed.step(restored)
+
     assert replayed.pending_operation_index == 1
     assert replayed.github_writes == 1
+    assert adapter.calls == [(GitHubAction.CREATE_ISSUE.value, "write-1")]
 
     blocked = resumed.step(replayed)
     assert blocked.stop_code is ControllerStopCode.GITHUB_WRITE_BUDGET_EXHAUSTED
-    assert [call for call in adapter.calls if call[0] == "create_issue"] == [
-        ("create_issue", "write-1")
-    ]
+    assert adapter.calls == [(GitHubAction.CREATE_ISSUE.value, "write-1")]
 
 
 def test_reused_operation_id_is_blocked_before_replay_or_provider_dispatch() -> None:
-    adapter = Adapter()
-    journal = OperationJournal(persist=lambda _payload: None)
-    approvals = HumanApprovalRegistry()
-    guard = GuardedGitHubSideEffects(adapter=adapter, journal=journal, approvals=approvals)
-
     intent = _targeted()
-    reused = GitHubOperationIntent(
-        "write-1", GitHubOperationKind.CREATE_ISSUE, FORK, {"title": "same"}
+    reused = GitHubEffectRequest(
+        "write-1", FORK, GitHubAction.CREATE_ISSUE, {"title": "same"}
     )
     prior = ChangeSet(
         "prior-change",
@@ -260,12 +255,12 @@ def test_reused_operation_id_is_blocked_before_replay_or_provider_dispatch() -> 
         pending_implementation=pending,
         current_head_sha=HEAD,
         revision_attempts=2,
+        github_journal=GitHubEffectJournal(),
     )
 
-    journal.prepare(reused, approval_id=None)
-    journal.complete(reused, "issue:write-1")
-
-    controller = _controller(guard, lambda _payload: None, policy=_policy(max_github_writes=5))
+    adapter = Adapter()
+    gateway = _gateway((reused,), adapter)
+    controller = _controller(gateway, lambda _payload: None, policy=_policy(max_github_writes=5))
     blocked = controller.step(state)
 
     assert blocked.core.phase is RunPhase.BLOCKED
