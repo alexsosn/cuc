@@ -1,21 +1,36 @@
-"""Trusted durable host primitives for the bounded development controller.
+"""Trusted durable host for the bounded development controller.
 
-This module deliberately keeps durability outside ``development_controller`` and
-GitHub authorization outside this module.  HARN-010 remains the controller state
-machine; HARN-023 ``GitHubEffectGateway`` remains the sole mutation authority.
+Durability stays outside ``development_controller`` and GitHub authorization stays
+inside HARN-023 ``GitHubEffectGateway``.  This module composes those existing
+authorities; it does not create another side-effect journal or executor.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
 import tempfile
 from typing import Any, Mapping
 
-from .development_controller import DevelopmentControllerState
-from .github_effects import HumanApproval
+from .contracts import RunPhase, TaskSpec
+from .development_controller import (
+    BoundedDevelopmentController,
+    ControllerStopCode,
+    DevelopmentControllerPolicy,
+    DevelopmentControllerPorts,
+    DevelopmentControllerState,
+)
+from .development_reviewer import IndependentReviewer
+from .github_effects import (
+    GitHubEffectGateway,
+    GitHubEffectJournal,
+    GitHubTaskPolicy,
+    HumanApproval,
+    HumanApprovalAuthority,
+)
+from .state_machine import ResumeRequested, apply_event
 
 
 _HOST_SCHEMA_VERSION = 1
@@ -215,3 +230,194 @@ class AtomicJsonDevelopmentHostStore:
                     temporary.unlink()
                 except FileNotFoundError:
                     pass
+
+
+class TrustedDevelopmentHost:
+    """Production composition boundary for durable HARN-010 execution.
+
+    Privileged dependencies are intentionally private. Public methods expose only
+    controller lifecycle operations and the narrowly authorized recovery actions
+    needed after restart.
+    """
+
+    def __init__(
+        self,
+        durable_store: AtomicJsonDevelopmentHostStore,
+        *,
+        controller_policy: DevelopmentControllerPolicy,
+        controller_ports: DevelopmentControllerPorts,
+        reviewer: IndependentReviewer,
+        github_policy: GitHubTaskPolicy,
+        github_adapter: object,
+        github_reconciler: object,
+        policy_refs: tuple[str, ...],
+        review_rubric: tuple[str, ...],
+        implementer_id: str,
+    ) -> None:
+        if not isinstance(durable_store, AtomicJsonDevelopmentHostStore):
+            raise ValueError("an explicit durable AtomicJsonDevelopmentHostStore is required")
+
+        loaded = durable_store.load()
+        envelope = loaded or DevelopmentHostEnvelope(_HOST_SCHEMA_VERSION, None, ())
+        authority = HumanApprovalAuthority()
+        for approval in envelope.trusted_approvals:
+            authority.register(approval)
+
+        gateway = GitHubEffectGateway(
+            github_policy,
+            github_adapter,
+            approval_authority=authority,
+            reconciler=github_reconciler,
+        )
+
+        self._store = durable_store
+        self._envelope = envelope
+        self._authority = authority
+        self._gateway = gateway
+        self._controller = BoundedDevelopmentController(
+            policy=controller_policy,
+            ports=controller_ports,
+            reviewer=reviewer,
+            github_gateway=gateway,
+            persist=self._persist_controller_payload,
+            policy_refs=policy_refs,
+            review_rubric=review_rubric,
+            implementer_id=implementer_id,
+        )
+
+    @property
+    def envelope(self) -> DevelopmentHostEnvelope:
+        return self._envelope
+
+    @property
+    def state(self) -> DevelopmentControllerState | None:
+        return self._envelope.controller_state
+
+    def _save_envelope(self, candidate: DevelopmentHostEnvelope) -> None:
+        self._store.save(candidate)
+        self._envelope = candidate
+
+    def _persist_controller_payload(self, payload: dict[str, object]) -> None:
+        # Re-enter the canonical state validator before caller-provided serialized
+        # data becomes trusted durable state.
+        validated = DevelopmentControllerState.from_dict(payload)
+        self._save_envelope(replace(self._envelope, controller_state=validated))
+
+    def _persist_controller_state(self, state: DevelopmentControllerState) -> None:
+        if not isinstance(state, DevelopmentControllerState):
+            raise ValueError("state must be DevelopmentControllerState")
+        self._persist_controller_payload(state.to_dict())
+
+    def start(
+        self,
+        *,
+        run_id: str,
+        task: TaskSpec,
+        base_sha: str,
+        provenance_refs: tuple[str, ...] = (),
+    ) -> DevelopmentControllerState:
+        if self.state is not None:
+            raise ValueError("durable development host already contains controller state")
+        return self._controller.start(
+            run_id=run_id,
+            task=task,
+            base_sha=base_sha,
+            provenance_refs=provenance_refs,
+        )
+
+    def step(self) -> DevelopmentControllerState:
+        state = self.state
+        if state is None:
+            raise ValueError("durable development host has no controller state")
+        return self._controller.step(state)
+
+    def run(self, *, max_steps: int | None = None) -> DevelopmentControllerState:
+        state = self.state
+        if state is None:
+            raise ValueError("durable development host has no controller state")
+        return self._controller.run_until_stop(state, max_steps=max_steps)
+
+    def _pending_request(self):
+        state = self.state
+        if state is None:
+            raise ValueError("durable development host has no controller state")
+        pending = state.pending_implementation
+        if pending is None or state.pending_operation_index >= len(pending.github_operations):
+            raise ValueError("controller state has no pending GitHub request")
+        return state, pending.github_operations[state.pending_operation_index]
+
+    def resume_with_approval(self, approval: HumanApproval) -> DevelopmentControllerState:
+        if not isinstance(approval, HumanApproval):
+            raise ValueError("approval must be HumanApproval")
+        state, request = self._pending_request()
+        if state.core.phase is not RunPhase.AWAITING_HUMAN:
+            raise ValueError("human approval can resume only AWAITING_HUMAN state")
+        if approval.operation_id != request.operation_id:
+            raise ValueError("approval operation does not match pending GitHub request")
+        if approval.request_sha256 != request.request_sha256:
+            raise ValueError("approval digest does not match pending GitHub request")
+
+        existing = next(
+            (
+                item
+                for item in self._envelope.trusted_approvals
+                if item.approval_id == approval.approval_id
+            ),
+            None,
+        )
+        if existing is not None and existing != approval:
+            raise ValueError("trusted approval ID already binds different approval content")
+
+        if existing is None:
+            # Durable authority first: a crash after this save is safe because a new
+            # process restores the authority from the envelope. The live authority
+            # cannot authorize anything unless this persistence succeeds.
+            candidate = replace(
+                self._envelope,
+                trusted_approvals=self._envelope.trusted_approvals + (approval,),
+            )
+            self._save_envelope(candidate)
+            self._authority.register(approval)
+
+        return self._controller.resume(self.state, approval=approval)  # type: ignore[arg-type]
+
+    def reconcile_uncertain(self) -> DevelopmentControllerState:
+        state, request = self._pending_request()
+        if state.core.phase is not RunPhase.BLOCKED:
+            raise ValueError("trusted reconciliation requires BLOCKED controller state")
+        if state.stop_code is not ControllerStopCode.BLOCKED_EXECUTION:
+            raise ValueError("only blocked-execution state is eligible for trusted reconciliation")
+        if state.github_journal.uncertain_for(request.operation_id) is None:
+            raise ValueError("pending request is not quarantined as an uncertain GitHub effect")
+
+        def checkpoint(journal: GitHubEffectJournal) -> None:
+            current = self.state
+            if current is None:
+                raise ValueError("durable development host lost controller state")
+            self._persist_controller_state(replace(current, github_journal=journal))
+
+        self._gateway.reconcile_uncertain(
+            request,
+            state.github_journal,
+            checkpoint=checkpoint,
+        )
+
+        current = self.state
+        if current is None:
+            raise ValueError("durable development host lost controller state")
+        # UNKNOWN reconciliation does not checkpoint/clear the quarantine, so it
+        # must remain blocked. EXECUTED and NOT_EXECUTED both clear uncertainty.
+        if current.github_journal.uncertain_for(request.operation_id) is not None:
+            return current
+
+        resumed_core = apply_event(current.core, ResumeRequested())
+        resumed = replace(
+            current,
+            core=resumed_core,
+            stop_code=None,
+            stop_reason=None,
+            audit_events=current.audit_events
+            + (f"github:{request.operation_id}:reconciled",),
+        )
+        self._persist_controller_state(resumed)
+        return resumed
