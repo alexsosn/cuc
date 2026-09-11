@@ -50,7 +50,14 @@ class GitHubAction(str, Enum):
 _WRITE_ACTIONS = frozenset(action for action in GitHubAction if action is not GitHubAction.READ)
 _REF_REQUIRED_ACTIONS = frozenset(
     {
+        GitHubAction.CREATE_BRANCH,
         GitHubAction.UPDATE_REF,
+        GitHubAction.MERGE_PULL_REQUEST,
+        GitHubAction.DISPATCH_WORKFLOW,
+    }
+)
+_SENSITIVE_FORK_ACTIONS = frozenset(
+    {
         GitHubAction.MERGE_PULL_REQUEST,
         GitHubAction.DISPATCH_WORKFLOW,
     }
@@ -439,7 +446,7 @@ class HumanApprovalAuthority:
     """Trusted host-owned registry of exact human-issued approvals.
 
     Approval-shaped values carried in model/controller state are not authority by
-    themselves. An upstream effect is authorized only when the exact value has also
+    themselves. A sensitive effect is authorized only when the exact value has also
     been registered here by trusted host code.
     """
 
@@ -679,7 +686,7 @@ class GitHubEffectJournal:
 
 
 class HumanApprovalRequired(RuntimeError):
-    """Structured interrupt raised before an upstream write adapter is invoked."""
+    """Structured interrupt raised before a sensitive write adapter is invoked."""
 
     def __init__(self, challenge: HumanApprovalChallenge) -> None:
         if not isinstance(challenge, HumanApprovalChallenge):
@@ -813,12 +820,46 @@ class GitHubEffectGateway:
             raise PermissionError(f"{request.action.value} requires an explicit target ref")
         if (
             repository_class is RepositoryClass.FORK
-            and request.action is GitHubAction.UPDATE_REF
+            and request.action in {GitHubAction.CREATE_BRANCH, GitHubAction.UPDATE_REF}
             and request.target_ref is not None
             and request.target_ref.casefold() in _PROTECTED_FORK_REFS
         ):
             raise PermissionError(
-                "generic ref update cannot target protected fork integration ref"
+                "generic branch/ref mutation cannot target protected fork integration ref"
+            )
+
+    def _require_human_approval(
+        self,
+        request: GitHubEffectRequest,
+        journal: GitHubEffectJournal,
+        *,
+        reason: str,
+        require_registered_approval: bool,
+    ) -> None:
+        approval = journal.approval_for(request.operation_id)
+        if approval is None:
+            raise HumanApprovalRequired(
+                HumanApprovalChallenge(
+                    request.operation_id,
+                    request.request_sha256,
+                    request.repository,
+                    request.action,
+                    reason,
+                )
+            )
+        if approval.request_sha256 != request.request_sha256:
+            raise PermissionError(
+                "human approval does not match the exact GitHub write request digest"
+            )
+        if require_registered_approval and self.__approval_authority.resolve(approval) is None:
+            raise HumanApprovalRequired(
+                HumanApprovalChallenge(
+                    request.operation_id,
+                    request.request_sha256,
+                    request.repository,
+                    request.action,
+                    "approval value is not registered by the trusted human authority",
+                )
             )
 
     def _authorize_write_request(
@@ -843,6 +884,16 @@ class GitHubEffectGateway:
                 raise PermissionError(
                     "fork operation/action pair is not allowed by task policy"
                 )
+            if request.action in _SENSITIVE_FORK_ACTIONS:
+                self._require_human_approval(
+                    request,
+                    journal,
+                    reason=(
+                        "fork integration/publication actions require explicit human "
+                        "authorization at execution time"
+                    ),
+                    require_registered_approval=require_registered_approval,
+                )
             return repository_class
 
         if repository_class is RepositoryClass.UPSTREAM:
@@ -850,31 +901,12 @@ class GitHubEffectGateway:
                 raise PermissionError(
                     "upstream write operation ID was not declared by task policy"
                 )
-            approval = journal.approval_for(request.operation_id)
-            if approval is None:
-                raise HumanApprovalRequired(
-                    HumanApprovalChallenge(
-                        request.operation_id,
-                        request.request_sha256,
-                        request.repository,
-                        request.action,
-                        "upstream writes require explicit human authorization at execution time",
-                    )
-                )
-            if approval.request_sha256 != request.request_sha256:
-                raise PermissionError(
-                    "human approval does not match the exact upstream write request digest"
-                )
-            if require_registered_approval and self.__approval_authority.resolve(approval) is None:
-                raise HumanApprovalRequired(
-                    HumanApprovalChallenge(
-                        request.operation_id,
-                        request.request_sha256,
-                        request.repository,
-                        request.action,
-                        "upstream approval value is not registered by the trusted human authority",
-                    )
-                )
+            self._require_human_approval(
+                request,
+                journal,
+                reason="upstream writes require explicit human authorization at execution time",
+                require_registered_approval=require_registered_approval,
+            )
             return repository_class
 
         raise PermissionError("writes to an unknown repository are denied")
