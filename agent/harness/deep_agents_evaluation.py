@@ -2,7 +2,7 @@
 
 This module deliberately contains no Deep Agents/LangGraph runtime types.  It records
 what an executable comparison observed and prevents an ADR from claiming primary
-semantic equivalence when the fixed complete-column workload was not fully traversed.
+semantic equivalence unless the fixed complete-column workload completed successfully.
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ class DeepAgentsDecisionRecord:
                 "observed_token_ids must belong to the fixed required workload: "
                 + ", ".join(sorted(unknown))
             )
-        # Observations must respect the fixed textual order.  A framework that
+        # Observations must respect the fixed textual order. A framework that
         # visits all tokens in a different order is also not equivalent to the
         # review-automatic-parsing contract.
         positions = {token_id: index for index, token_id in enumerate(required)}
@@ -147,10 +147,12 @@ class DeepAgentsDecisionRecord:
             _text_tuple(self.evidence_refs, "evidence_refs", required=True),
         )
 
-        if disposition is DeepAgentsDisposition.ADOPT_PRIMARY and self.early_termination_observed:
+        if disposition is DeepAgentsDisposition.ADOPT_PRIMARY and (
+            not self.completed_normally or self.observed_token_ids != self.required_token_ids
+        ):
             raise ValueError(
-                "primary adoption cannot claim equivalent complete-token semantics when "
-                "the executable probe completed with required tokens unreviewed"
+                "primary adoption requires a successful equivalent probe that completes "
+                "normally after every required token in textual order"
             )
 
     @property
