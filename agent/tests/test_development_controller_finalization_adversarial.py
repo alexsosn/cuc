@@ -13,11 +13,20 @@ from harness.contracts import (
     TestKind as HarnessTestKind,
 )
 from harness.development_controller import (
+    BoundedDevelopmentController,
     ControllerStopCode,
+    DevelopmentControllerPolicy,
+    DevelopmentControllerPorts,
     DevelopmentControllerState,
     ImplementationResult,
 )
-from harness.github_effects import GitHubAction, GitHubEffectRequest
+from harness.development_reviewer import IndependentReviewer
+from harness.github_effects import (
+    GitHubAction,
+    GitHubEffectGateway,
+    GitHubEffectRequest,
+    GitHubTaskPolicy,
+)
 
 
 def _initial_implement_core() -> RunState:
@@ -41,6 +50,15 @@ def _initial_implement_core() -> RunState:
         plan=PlanArtifact("plan", "done", ("test", "implement")),
         test_intents=(intent,),
     )
+
+
+def _never(*_args, **_kwargs):
+    raise AssertionError("port must not be called")
+
+
+class _Adapter:
+    def execute(self, _request):
+        raise AssertionError("GitHub adapter must not be called")
 
 
 def test_implementation_result_cannot_schedule_merge_before_verification_and_review() -> None:
@@ -121,4 +139,37 @@ def test_pending_implementation_head_must_match_current_head() -> None:
             pending_implementation=pending,
             current_head_sha="c" * 40,
             revision_attempts=1,
+        )
+
+
+def test_controller_requires_reviewer_bound_to_declared_implementer_identity() -> None:
+    ports = DevelopmentControllerPorts(
+        research=_never,
+        plan=_never,
+        declare_tests=_never,
+        run_red=_never,
+        implement=_never,
+        run_test=_never,
+        run_evals=_never,
+        final_diff=_never,
+    )
+    policy = DevelopmentControllerPolicy(
+        max_revision_attempts=1,
+        max_verification_executions=1,
+        max_review_attempts=1,
+        max_github_writes=0,
+    )
+    reviewer = IndependentReviewer("implementer", _never)
+    gateway = GitHubEffectGateway(GitHubTaskPolicy(), _Adapter())
+
+    with pytest.raises(ValueError, match="independent|reviewer|implementer"):
+        BoundedDevelopmentController(
+            policy=policy,
+            ports=ports,
+            reviewer=reviewer,
+            github_gateway=gateway,
+            persist=lambda _payload: None,
+            policy_refs=("AGENTS.md",),
+            review_rubric=("independence",),
+            implementer_id="implementer",
         )
