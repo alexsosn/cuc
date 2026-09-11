@@ -210,18 +210,17 @@ def test_systematic_signal_for_different_problem_cannot_justify_single_locus():
         summary="Regression belongs to another general defect.",
         evidence_refs=("eval:other",),
     )
-    candidate = _candidate(
-        classification=mod.FindingClassification.EVAL_BENCHMARK_DEFECT,
-        occurrences=(_occurrence(occurrence_id="only"),),
-        signals=(unrelated,),
-        positive_cases=(),
-        negative_cases=(),
-        boundary_cases=(),
-        subsystem="harness.parsing-evaluation",
-        problem_key="metric-artifact-mismatch",
-    )
     with pytest.raises(ValueError, match="signal|subsystem|problem"):
-        _plan(candidate)
+        _candidate(
+            classification=mod.FindingClassification.EVAL_BENCHMARK_DEFECT,
+            occurrences=(_occurrence(occurrence_id="only"),),
+            signals=(unrelated,),
+            positive_cases=(),
+            negative_cases=(),
+            boundary_cases=(),
+            subsystem="harness.parsing-evaluation",
+            problem_key="metric-artifact-mismatch",
+        )
 
 
 @pytest.mark.parametrize(
