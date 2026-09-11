@@ -120,18 +120,13 @@ def approval_for(intent: GitHubOperationIntent, approval_id="human-1") -> HumanA
     )
 
 
-def side_effects(*, durable=True, approvals_durable=True):
+def side_effects(*, durable=True):
     adapter = FakeGitHubAdapter()
     journal_snapshots = []
-    approval_snapshots = []
     journal = OperationJournal(
         persist=(lambda payload: journal_snapshots.append(payload)) if durable else None
     )
-    approvals = HumanApprovalRegistry(
-        persist=(lambda payload: approval_snapshots.append(payload))
-        if approvals_durable
-        else None
-    )
+    approvals = HumanApprovalRegistry()
     guard = GuardedGitHubSideEffects(
         adapter=adapter,
         journal=journal,
@@ -280,6 +275,7 @@ def make_controller(
     policy=None,
     guard=None,
     persist=None,
+    approval_state_persist=lambda payload: None,
 ):
     ports = DevelopmentControllerPorts(
         research=scripted.research,
@@ -308,6 +304,7 @@ def make_controller(
         reviewer=scripted.reviewer(),
         side_effects=guard,
         persist=snapshots.append,
+        approval_state_persist=approval_state_persist,
         policy_refs=("AGENTS.md", "HARN-009"),
         review_rubric=("correctness", "tests", "side-effect safety"),
         implementer_id="implementer",
@@ -359,9 +356,9 @@ def test_first_implementation_is_impossible_until_targeted_red_is_real_failure()
     controller, _ = make_controller(scripted)
     controller.ports = replace(controller.ports, run_red=false_red)
     state = start(controller)
-    state = controller.step(state)  # research
-    state = controller.step(state)  # plan
-    state = controller.step(state)  # tests
+    state = controller.step(state)
+    state = controller.step(state)
+    state = controller.step(state)
 
     with pytest.raises(ValueError, match="RED|failure|targeted"):
         controller.step(state)
@@ -572,15 +569,15 @@ def test_serialized_restart_does_not_repeat_research_plan_or_red() -> None:
     assert scripted.calls[: len(before)] == before
 
 
-def test_production_mode_rejects_in_memory_journal_or_approval_registry() -> None:
+def test_production_mode_rejects_in_memory_journal_or_missing_approval_persistence() -> None:
     scripted = ScriptedPorts()
-    guard, _, _ = side_effects(durable=False, approvals_durable=True)
+    guard, _, _ = side_effects(durable=False)
     with pytest.raises(ValueError, match="durable|journal|production"):
         make_controller(scripted, guard=guard)
 
-    guard, _, _ = side_effects(durable=True, approvals_durable=False)
+    guard, _, _ = side_effects(durable=True)
     with pytest.raises(ValueError, match="durable|approval|production"):
-        make_controller(scripted, guard=guard)
+        make_controller(scripted, guard=guard, approval_state_persist=None)
 
 
 def test_controller_uses_only_harn009_authority_not_legacy_gateway() -> None:
