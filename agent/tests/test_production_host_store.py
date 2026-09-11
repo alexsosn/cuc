@@ -85,6 +85,21 @@ def test_host_envelope_rejects_wrong_schema_and_duplicate_authority_records() ->
         ProductionHostEnvelope.from_dict(duplicate_operation)
 
 
+def test_host_envelope_rejects_valid_json_missing_required_state_fields() -> None:
+    with pytest.raises(ValueError, match="controller_state|trusted_approvals|required"):
+        ProductionHostEnvelope.from_dict({"schema_version": 1})
+
+    with pytest.raises(ValueError, match="trusted_approvals|required"):
+        ProductionHostEnvelope.from_dict(
+            {"schema_version": 1, "controller_state": _state().to_dict()}
+        )
+
+    with pytest.raises(ValueError, match="controller_state|required"):
+        ProductionHostEnvelope.from_dict(
+            {"schema_version": 1, "trusted_approvals": []}
+        )
+
+
 def test_atomic_store_round_trips_and_corrupt_existing_state_fails_closed(tmp_path) -> None:
     path = tmp_path / "development-host.json"
     store = AtomicHostStateStore(path)
