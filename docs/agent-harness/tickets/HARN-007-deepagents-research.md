@@ -30,14 +30,16 @@ The graph does not let model output choose token scope, remove completion verifi
 
 This means subagent isolation is already an application invariant, not a missing framework primitive.
 
-## Current Deep Agents architecture checked on 2026-09-11
+## Deep Agents architecture checked on 2026-09-11
+
+Pinned upstream revision: `54696577caf3dfcefb662db08b4a8034ec6a35cd`.
 
 Primary sources:
 
-- https://github.com/langchain-ai/deepagents
-- https://github.com/langchain-ai/deepagents/blob/main/README.md
-- https://github.com/langchain-ai/deepagents/blob/main/libs/ARCHITECTURE.md
-- https://docs.langchain.com/oss/python/deepagents/overview
+- https://github.com/langchain-ai/deepagents/tree/54696577caf3dfcefb662db08b4a8034ec6a35cd
+- https://github.com/langchain-ai/deepagents/blob/54696577caf3dfcefb662db08b4a8034ec6a35cd/README.md
+- https://github.com/langchain-ai/deepagents/blob/54696577caf3dfcefb662db08b4a8034ec6a35cd/libs/ARCHITECTURE.md
+- https://docs.langchain.com/oss/python/deepagents/overview (dated convenience reference; the GitHub sources above are the immutable evidence)
 
 Observed properties relevant to CUC:
 
@@ -70,12 +72,12 @@ Observed properties relevant to CUC:
 
 Replacing HARN-004 with a Deep Agents loop does not remove CUC-specific orchestration. To preserve the accepted semantics, CUC would still need an external deterministic cursor, authenticated capability binding, revisit queue, completion-verifier loop, evaluator boundary, and exact state transitions. At that point the existing HARN-004 graph is the deterministic component being reconstructed.
 
-Deep Agents offers more leverage for open-ended development-controller phases: research, planning, bounded implementation delegation, filesystem/context management, and isolated helper/subagents. Those are not sufficient safety boundaries for HARN-009, and they should only receive explicit CUC capabilities after the side-effect policy is implemented.
+Deep Agents offers plausible leverage for open-ended development-controller phases: research, planning, bounded implementation delegation, filesystem/context management, and isolated helper/subagents. Those are not sufficient safety boundaries for HARN-009. This research therefore does not adopt Deep Agents for the development controller; it defers any runtime integration until HARN-009 exists and a bounded helper prototype can be evaluated behind those capabilities.
 
-## Research conclusion to test in the architecture model
+## Research conclusion
 
 1. **Parsing runtime:** retain explicit HARN-004 LangGraph as the primary orchestrator. Do not add Deep Agents to the parsing correctness path.
-2. **Development controller:** keep HARN-010 contracts framework-neutral. After HARN-009 exists, Deep Agents may be evaluated as a selective execution harness for open-ended research/implementation helpers, while HARN-002/HARN-006/HARN-009 remain the authoritative state, review, and side-effect boundaries.
-3. **Dependency:** do not add `deepagents` to the core agent environment for this research ticket. A dependency is justified only by a later concrete implementation that uses it.
+2. **Development controller:** keep HARN-010 contracts framework-neutral and defer Deep Agents execution until HARN-009 provides the runtime side-effect boundary. A later ticket may evaluate Deep Agents selectively for open-ended helpers behind HARN-002/HARN-006/HARN-009.
+3. **Dependency:** do not add `deepagents` to the core agent environment for HARN-007. A dependency is justified only by a later concrete implementation that uses it.
 
-The next gate is an executable repository model that checks this conclusion against the current HARN-004/HARN-006 source shape rather than leaving the ADR as prose.
+The executable evaluator in `agent/scripts/evaluate_harn007_architecture.py` checks the CUC-side invariants against the current HARN-004/HARN-006 source and records the pinned external observations used by the final ADR.
