@@ -245,6 +245,10 @@ class ImplementationResult:
             raise ValueError("github_operations must contain only GitHubEffectRequest")
         if any(item.action is GitHubAction.READ for item in operations):
             raise ValueError("implementation GitHub operations must be write actions")
+        if any(item.action is GitHubAction.MERGE_PULL_REQUEST for item in operations):
+            raise ValueError(
+                "implementation GitHub operations cannot merge pull requests before verification and independent review"
+            )
         operation_ids = tuple(item.operation_id for item in operations)
         if operation_ids != self.change.operation_ids:
             raise ValueError(
