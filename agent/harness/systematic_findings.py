@@ -80,6 +80,10 @@ def _machine_id(value: object, field: str) -> str:
     return text
 
 
+def _normalized_source_text(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
 def _safe_markdown(value: str) -> str:
     """Prevent caller text from manufacturing hidden bridge markers/comments."""
     return value.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
@@ -175,18 +179,18 @@ class FindingOccurrence:
     @property
     def locus_key(self) -> tuple[str, str, str, str]:
         """Stable textual locus identity; token IDs are evidence, not recurrence identity."""
-        return (
-            self.corpus.casefold(),
-            self.tablet.casefold(),
-            self.column.casefold(),
-            self.locus_ref.casefold(),
-        )
+        return tuple(
+            _normalized_source_text(item)
+            for item in (self.corpus, self.tablet, self.column, self.locus_ref)
+        )  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
 class SystematicSignal:
     signal_id: str
     kind: SystematicSignalKind
+    subsystem: str
+    problem_key: str
     summary: str
     evidence_refs: tuple[str, ...]
 
@@ -197,6 +201,8 @@ class SystematicSignal:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid systematic signal kind: {self.kind!r}") from exc
         object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "subsystem", _machine_id(self.subsystem, "subsystem"))
+        object.__setattr__(self, "problem_key", _machine_id(self.problem_key, "problem_key"))
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
         object.__setattr__(
             self,
@@ -230,8 +236,10 @@ class SystematicFindingCandidate:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid finding classification: {self.classification!r}") from exc
         object.__setattr__(self, "classification", classification)
-        object.__setattr__(self, "subsystem", _machine_id(self.subsystem, "subsystem"))
-        object.__setattr__(self, "problem_key", _machine_id(self.problem_key, "problem_key"))
+        subsystem = _machine_id(self.subsystem, "subsystem")
+        problem_key = _machine_id(self.problem_key, "problem_key")
+        object.__setattr__(self, "subsystem", subsystem)
+        object.__setattr__(self, "problem_key", problem_key)
         object.__setattr__(self, "title", _single_line(self.title, "title"))
         object.__setattr__(self, "objective", _required_text(self.objective, "objective"))
         object.__setattr__(
@@ -262,6 +270,16 @@ class SystematicFindingCandidate:
         signal_ids = tuple(item.signal_id for item in signals)
         if len(signal_ids) != len(set(signal_ids)):
             raise ValueError("systematic signal IDs must be unique")
+        mismatched = tuple(
+            item.signal_id
+            for item in signals
+            if item.subsystem != subsystem or item.problem_key != problem_key
+        )
+        if mismatched:
+            raise ValueError(
+                "systematic signal subsystem/problem identity does not match candidate: "
+                + ", ".join(mismatched)
+            )
         object.__setattr__(self, "systematic_signals", signals)
 
         positive = _text_tuple(self.positive_cases, "positive_cases", single_line=True)
@@ -396,7 +414,8 @@ def _render_issue_body(
         lines.extend(["## Systematic signals", ""])
         for signal in sorted(candidate.systematic_signals, key=lambda item: item.signal_id.casefold()):
             lines.append(
-                f"- `{_safe_markdown(signal.signal_id)}` ({signal.kind.value}): "
+                f"- `{_safe_markdown(signal.signal_id)}` ({signal.kind.value}; "
+                f"`{signal.subsystem}` / `{signal.problem_key}`): "
                 f"{_safe_markdown(signal.summary)} — refs: {_render_refs(signal.evidence_refs)}"
             )
         lines.append("")
