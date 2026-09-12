@@ -380,7 +380,10 @@ def _render_issue_body(
     lines.extend(f"- {_safe_markdown(item)}" for item in task.acceptance_criteria)
     lines.extend(["", "## Reproducible occurrences", ""])
 
-    for occurrence in sorted(candidate.occurrences, key=lambda item: item.occurrence_id.casefold()):
+    for occurrence in sorted(
+        candidate.occurrences,
+        key=lambda item: (item.occurrence_id.casefold(), item.occurrence_id),
+    ):
         tokens = ", ".join(_safe_markdown(item) for item in sorted(occurrence.token_ids))
         lines.extend(
             [
@@ -412,7 +415,10 @@ def _render_issue_body(
 
     if candidate.systematic_signals:
         lines.extend(["## Systematic signals", ""])
-        for signal in sorted(candidate.systematic_signals, key=lambda item: item.signal_id.casefold()):
+        for signal in sorted(
+            candidate.systematic_signals,
+            key=lambda item: (item.signal_id.casefold(), item.signal_id),
+        ):
             lines.append(
                 f"- `{_safe_markdown(signal.signal_id)}` ({signal.kind.value}; "
                 f"`{signal.subsystem}` / `{signal.problem_key}`): "
