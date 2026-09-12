@@ -13,6 +13,11 @@ dependencies = [
 # HARN-005 observability remains a lazy sidecar, never a core runtime dependency.
 observability = ["langfuse==4.15.1"]
 
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"
