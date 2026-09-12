@@ -470,7 +470,7 @@ class ProductionDevelopmentHost:
             raise ValueError("trusted reconciliation did not resolve pending uncertainty")
 
         core = apply_event(state.core, ResumeRequested())
-        resumed = replace(
+        return replace(
             state,
             core=core,
             stop_code=None,
@@ -479,8 +479,6 @@ class ProductionDevelopmentHost:
                 f"trusted-reconciliation:{request.operation_id}",
             ),
         )
-        self.__persist_controller_payload(resumed.to_dict())
-        return resumed
 
     def reconcile_uncertain(self) -> DevelopmentControllerState:
         state = self.__require_state()
@@ -492,16 +490,25 @@ class ProductionDevelopmentHost:
         if state.github_journal.uncertain_for(request.operation_id) is None:
             raise ValueError("pending GitHub request is not quarantined as uncertain")
 
-        def checkpoint(journal) -> None:
-            checkpoint_state = replace(state, github_journal=journal)
-            self.__persist_controller_payload(checkpoint_state.to_dict())
+        staged_journal = None
+
+        def stage_checkpoint(journal) -> None:
+            nonlocal staged_journal
+            staged_journal = journal
 
         journal, _receipt = self.__gateway.reconcile_uncertain(
             request,
             state.github_journal,
-            checkpoint=checkpoint,
+            checkpoint=stage_checkpoint,
         )
-        durable = self.__require_state()
-        if durable.github_journal != journal:
-            raise RuntimeError("durable reconciliation checkpoint does not match gateway result")
-        return self.__resume_after_reconciliation(durable)
+        if staged_journal != journal:
+            raise RuntimeError("trusted reconciliation did not stage the returned journal")
+
+        reconciled_state = replace(state, github_journal=journal)
+        resumed = self.__resume_after_reconciliation(reconciled_state)
+        # Reconciliation is read-only with respect to GitHub. Persist its resolved
+        # journal and the controller resume together so no crash can strand a
+        # resolved journal in an otherwise unrecoverable BLOCKED state. If this
+        # save fails, the previous durable uncertainty remains safe to reconcile.
+        self.__persist_controller_payload(resumed.to_dict())
+        return resumed
