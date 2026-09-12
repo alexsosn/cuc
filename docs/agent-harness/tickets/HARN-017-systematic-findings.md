@@ -2,7 +2,7 @@
 
 ## Status
 
-Research and implementation plan. No production code exists yet on this branch.
+Implementation candidate is complete on this branch. The framework-neutral bridge, contract tests, and review-driven determinism regressions are present; finalization requires exact-head CI and a fresh logically independent adversarial review.
 
 ## Problem
 
@@ -124,7 +124,7 @@ Each signal carries stable ID, summary and evidence refs.
 2. Compute stable fingerprint from classification + normalized subsystem + normalized problem key.
 3. If classification is local scholarly reading: stop with no issue.
 4. If fingerprint is already in trusted `existing_issue_fingerprints`: stop as duplicate.
-5. Compute distinct loci from corpus/tablet/column/token IDs.
+5. Compute distinct source loci from normalized corpus/tablet/column/locus reference. Token IDs remain reproducibility evidence but are deliberately **not** recurrence identity, so token-ID churn cannot fake a second occurrence.
 6. Require either >=2 distinct loci or >=1 typed systematic signal.
 7. For parser/config, linter or skill/procedure defects require positive + negative + boundary cases.
 8. Render deterministic HARN-010-compatible task and fork-local CREATE_ISSUE request.
