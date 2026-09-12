@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+from pathlib import Path
 
 import pytest
 
@@ -12,8 +13,8 @@ from harness.contracts import (
     RunPhase,
     RunState,
     TaskSpec,
-    TestIntent,
-    TestKind,
+    TestIntent as ContractTestIntent,
+    TestKind as ContractTestKind,
 )
 from harness.development_controller import (
     ControllerStopCode,
@@ -61,9 +62,9 @@ def _blocked_state(request: GitHubEffectRequest) -> DevelopmentControllerState:
         "persist resolved GitHub journal and resumed controller state atomically",
         ("no crash window may strand a resolved journal in BLOCKED state",),
     )
-    intent = TestIntent(
+    intent = ContractTestIntent(
         "orphan-regression",
-        TestKind.TARGETED,
+        ContractTestKind.TARGETED,
         ("python", "-m", "pytest", "tests/test_production_host_superseded_branch_regressions.py"),
         "agent",
         "atomic reconciliation recovery regression",
@@ -228,5 +229,5 @@ def test_directory_fsync_propagates_real_io_failure(monkeypatch) -> None:
 
     monkeypatch.setattr(production_host.os, "fsync", fail_fsync)
     with pytest.raises(OSError) as caught:
-        AtomicHostStateStore._fsync_parent_directory(tmp_path := __import__("pathlib").Path("."))
+        AtomicHostStateStore._fsync_parent_directory(Path("."))
     assert caught.value.errno == errno.EIO
