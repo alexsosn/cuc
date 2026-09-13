@@ -39,7 +39,7 @@ jobs:
         run: uv sync --locked --no-install-project
 
       - name: Run full agent test suite
-        run: .venv/bin/python -m pytest -q
+        run: .venv/bin/python -m pytest -q -rs
 
   langfuse-sdk-smoke:
     runs-on: ubuntu-latest
