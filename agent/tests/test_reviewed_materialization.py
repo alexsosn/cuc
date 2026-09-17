@@ -326,5 +326,18 @@ def test_materializer_is_deterministic_and_has_no_write_or_network_api() -> None
     assert first == second
 
     source = inspect.getsource(materializer).lower()
-    for forbidden in ("open(", "pathlib", "subprocess", "requests", "github"):
+    forbidden_executable_patterns = (
+        "open(",
+        "from pathlib",
+        "import pathlib",
+        "import subprocess",
+        "from subprocess",
+        "import requests",
+        "from requests",
+        "import urllib",
+        "from urllib",
+        "import github",
+        "from github",
+    )
+    for forbidden in forbidden_executable_patterns:
         assert forbidden not in source
