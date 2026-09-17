@@ -144,6 +144,32 @@ def _source_line_contexts(source_rows: tuple[_SourceRow, ...]) -> dict[int, str 
     return contexts
 
 
+def _validate_source_column_coverage(
+    source_rows: tuple[_SourceRow, ...],
+    state: ColumnRunState,
+    line_contexts: dict[int, str | None],
+) -> None:
+    """Require the seeded source target column to equal the complete snapshot token set."""
+
+    prefix = f"{state.task.tablet} {state.task.column}:"
+    source_ids: list[str] = []
+    seen: set[str] = set()
+    for row in source_rows:
+        if row.token_id.startswith(_LINE_MARKER_PREFIX):
+            continue
+        context = line_contexts.get(row.index)
+        if context is None or not context.startswith(prefix):
+            continue
+        if row.token_id not in seen:
+            source_ids.append(row.token_id)
+            seen.add(row.token_id)
+
+    if tuple(source_ids) != state.snapshot.token_ids:
+        raise ValueError(
+            "source target-column token sequence does not exactly match complete snapshot tokens"
+        )
+
+
 def _build_target_blocks(
     source_rows: tuple[_SourceRow, ...],
     state: ColumnRunState,
@@ -157,6 +183,8 @@ def _build_target_blocks(
             by_token[row.token_id].append(row)
 
     line_contexts = _source_line_contexts(source_rows)
+    _validate_source_column_coverage(source_rows, state, line_contexts)
+
     blocks: list[_TargetBlock] = []
     for token in state.snapshot.tokens:
         rows = tuple(by_token[token.token_id])
