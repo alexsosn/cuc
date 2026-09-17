@@ -16,6 +16,7 @@ _HEADER = (
     "id\tsurface form\tsign span\tmorphological parsing\tDULAT\tPOS\tgloss\tcomments"
 )
 _SEED_MARKER = "SEEDED from auto-parse"
+_LINE_MARKER_PREFIX = "# KTU "
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,19 @@ def _parse_source_lines(reviewed_tsv_text: str) -> tuple[list[str], tuple[_Sourc
     return raw_lines, tuple(parsed)
 
 
+def _source_line_contexts(source_rows: tuple[_SourceRow, ...]) -> dict[int, str | None]:
+    """Map each ordinary source row to the nearest preceding KTU line marker."""
+
+    current: str | None = None
+    contexts: dict[int, str | None] = {}
+    for row in source_rows:
+        if row.token_id.startswith(_LINE_MARKER_PREFIX):
+            current = row.token_id[2:]
+            continue
+        contexts[row.index] = current
+    return contexts
+
+
 def _build_target_blocks(
     source_rows: tuple[_SourceRow, ...],
     state: ColumnRunState,
@@ -142,6 +156,7 @@ def _build_target_blocks(
         if row.token_id in by_token:
             by_token[row.token_id].append(row)
 
+    line_contexts = _source_line_contexts(source_rows)
     blocks: list[_TargetBlock] = []
     for token in state.snapshot.tokens:
         rows = tuple(by_token[token.token_id])
@@ -161,6 +176,14 @@ def _build_target_blocks(
         if len(sign_spans) != 1:
             raise ValueError(
                 f"immutable sign span differs across source alternatives for {token.token_id}"
+            )
+
+        expected_line_context = f"{state.task.tablet} {token.line_ref}"
+        observed_line_contexts = {line_contexts.get(row.index) for row in rows}
+        if observed_line_contexts != {expected_line_context}:
+            raise ValueError(
+                f"source line marker identity for {token.token_id} does not match "
+                f"snapshot/task context {expected_line_context!r}"
             )
 
         blocks.append(_TargetBlock(token, rows, decisions[token.token_id]))
