@@ -11,9 +11,10 @@ from harness import column_state as cs
 
 SHA0 = "0" * 64
 HEADER = "id\tsurface form\tsign span\tmorphological parsing\tDULAT\tPOS\tgloss\tcomments\n"
-PRELUDE = "# KTU 9.9 I:0\t\t\t\t\t\t\t\n"
+PRELUDE = "# KTU 9.9 II:0\t\t\t\t\t\t\t\n"
 LINE_I1 = "# KTU 9.9 I:1\t\t\t\t\t\t\t\n"
 LINE_I2 = "# KTU 9.9 I:2\t\t\t\t\t\t\t\n"
+LINE_II1 = "# KTU 9.9 II:1\t\t\t\t\t\t\t\n"
 OUTSIDE_BEFORE = "u0\toutside\t[out]\told/\told\tn.\toutside\tkeep-before\n"
 OUTSIDE_AFTER = "u9\tafter\t[after]\told/\told\tn.\tafter\tkeep-after\n"
 
@@ -148,6 +149,7 @@ def _source_text() -> str:
         + "t2\tb\t[b ]\tOLD-B\told-b\tn.\told B\t## SEEDED from auto-parse; not yet hand-reviewed.\n"
         + LINE_I2
         + "t3\tc\t[c ]\tOLD-C\told-c\tn.\told C\told C comment\n"
+        + LINE_II1
         + OUTSIDE_AFTER
     )
 
@@ -163,6 +165,7 @@ def _expected_text() -> str:
         + "t2\tb\t[b ]\tb/\tb (II)\tvb G impv. m. sg.\tB-two\treading two\n"
         + LINE_I2
         + "t3\tc\t[c ]\tc/\tc\tprep.\tC\t\n"
+        + LINE_II1
         + OUTSIDE_AFTER
     )
 
@@ -210,8 +213,8 @@ def test_duplicate_morphology_lexical_alternatives_survive_materialization() -> 
                 "t1\ta\t[a ]\tOLD-A-2\told-a-2\tn.\told A2\told alternative\n",
                 "",
             ).replace(
-                OUTSIDE_AFTER,
-                OUTSIDE_AFTER + "t1\ta\t[a ]\tLATE\tlate\tn.\tlate\tlate alternative\n",
+                LINE_II1,
+                "t1\ta\t[a ]\tLATE\tlate\tn.\tlate\tlate alternative\n" + LINE_II1,
             ),
             "contiguous|block|t1",
         ),
@@ -239,13 +242,34 @@ def test_source_identity_and_block_shape_fail_closed(source: str, match: str) ->
 
 def test_source_line_marker_must_match_snapshot_line_ref_and_task_tablet() -> None:
     materializer = _load_materializer()
-    wrong_line = _source_text().replace("# KTU 9.9 I:2", "# KTU 9.9 II:2")
+    wrong_line = _source_text().replace("# KTU 9.9 I:2", "# KTU 9.9 III:2")
     with pytest.raises(ValueError, match="line|marker|snapshot|identity"):
         materializer.materialize_completed_column(wrong_line, _state())
 
     wrong_tablet = _source_text().replace("# KTU 9.9 I:1", "# KTU 9.8 I:1")
     with pytest.raises(ValueError, match="tablet|line|marker|snapshot|identity"):
         materializer.materialize_completed_column(wrong_tablet, _state())
+
+
+def test_source_column_token_set_must_exactly_match_snapshot() -> None:
+    materializer = _load_materializer()
+    extra = "tx\textra\t[extra]\told/\told\tn.\textra\tstale source token\n"
+    source = _source_text().replace(
+        "t2\tb\t[b ]\tOLD-B",
+        extra + "t2\tb\t[b ]\tOLD-B",
+        1,
+    )
+    with pytest.raises(ValueError, match="complete|column|snapshot|token"):
+        materializer.materialize_completed_column(source, _state())
+
+
+def test_task_column_must_match_source_column() -> None:
+    materializer = _load_materializer()
+    state = _state()
+    wrong_task = replace(state.task, column="III")
+    forged = replace(state, task=wrong_task)
+    with pytest.raises(ValueError, match="column|snapshot|source|identity"):
+        materializer.materialize_completed_column(_source_text(), forged)
 
 
 def test_source_target_order_must_match_snapshot_order() -> None:
