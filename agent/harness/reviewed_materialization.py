@@ -164,9 +164,12 @@ def _validate_source_column_coverage(
             source_ids.append(row.token_id)
             seen.add(row.token_id)
 
-    if tuple(source_ids) != state.snapshot.token_ids:
+    observed = tuple(source_ids)
+    expected = state.snapshot.token_ids
+    if observed != expected:
         raise ValueError(
-            "source target-column token sequence does not exactly match complete snapshot tokens"
+            "source target-column token sequence does not exactly match complete snapshot "
+            f"tokens: observed={observed!r}, expected={expected!r}"
         )
 
 
