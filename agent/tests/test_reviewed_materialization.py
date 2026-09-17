@@ -12,6 +12,8 @@ from harness import column_state as cs
 SHA0 = "0" * 64
 HEADER = "id\tsurface form\tsign span\tmorphological parsing\tDULAT\tPOS\tgloss\tcomments\n"
 PRELUDE = "# KTU 9.9 I:0\t\t\t\t\t\t\t\n"
+LINE_I1 = "# KTU 9.9 I:1\t\t\t\t\t\t\t\n"
+LINE_I2 = "# KTU 9.9 I:2\t\t\t\t\t\t\t\n"
 OUTSIDE_BEFORE = "u0\toutside\t[out]\told/\told\tn.\toutside\tkeep-before\n"
 OUTSIDE_AFTER = "u9\tafter\t[after]\told/\told\tn.\tafter\tkeep-after\n"
 
@@ -66,16 +68,12 @@ def _decision(token_id: str, rows: tuple[cs.ReviewedRow, ...]) -> cs.TokenDecisi
 
 def _default_rows() -> dict[str, tuple[cs.ReviewedRow, ...]]:
     return {
-        "t1": (
-            _row("a/", "a", "n. m. sg. abs.", "A", "DULAT s.v. a"),
-        ),
+        "t1": (_row("a/", "a", "n. m. sg. abs.", "A", "DULAT s.v. a"),),
         "t2": (
             _row("b/", "b (I)", "n. m. sg. abs.", "B-one", "reading one"),
             _row("b/", "b (II)", "vb G impv. m. sg.", "B-two", "reading two"),
         ),
-        "t3": (
-            _row("c/", "c", "prep.", "C", ""),
-        ),
+        "t3": (_row("c/", "c", "prep.", "C", ""),),
     }
 
 
@@ -102,10 +100,11 @@ def _state(
             state,
             cs.EvidenceRecorded(f"record-{token_id}", evidence),
         )
-        rows = rows_by_token[token_id]
         state = cs.apply_column_event(
             state,
-            cs.TokenReviewed(f"review-{token_id}", _decision(token_id, rows)),
+            cs.TokenReviewed(
+                f"review-{token_id}", _decision(token_id, rows_by_token[token_id])
+            ),
         )
 
     if unresolved_revisit:
@@ -120,7 +119,6 @@ def _state(
 
     if close_reconciliation:
         state = cs.apply_column_event(state, cs.ReconciliationClosed("close-reconciliation"))
-    if close_reconciliation:
         state = cs.apply_column_event(
             state,
             cs.CompletionGateRecorded(
@@ -144,9 +142,11 @@ def _source_text() -> str:
         HEADER
         + PRELUDE
         + OUTSIDE_BEFORE
+        + LINE_I1
         + "t1\ta\t[a ]\tOLD-A-1\told-a-1\tn.\told A1\t## SEEDED from auto-parse; not yet hand-reviewed.\n"
         + "t1\ta\t[a ]\tOLD-A-2\told-a-2\tn.\told A2\told alternative\n"
         + "t2\tb\t[b ]\tOLD-B\told-b\tn.\told B\t## SEEDED from auto-parse; not yet hand-reviewed.\n"
+        + LINE_I2
         + "t3\tc\t[c ]\tOLD-C\told-c\tn.\told C\told C comment\n"
         + OUTSIDE_AFTER
     )
@@ -157,9 +157,11 @@ def _expected_text() -> str:
         HEADER
         + PRELUDE
         + OUTSIDE_BEFORE
+        + LINE_I1
         + "t1\ta\t[a ]\ta/\ta\tn. m. sg. abs.\tA\tDULAT s.v. a\n"
         + "t2\tb\t[b ]\tb/\tb (I)\tn. m. sg. abs.\tB-one\treading one\n"
         + "t2\tb\t[b ]\tb/\tb (II)\tvb G impv. m. sg.\tB-two\treading two\n"
+        + LINE_I2
         + "t3\tc\t[c ]\tc/\tc\tprep.\tC\t\n"
         + OUTSIDE_AFTER
     )
@@ -168,9 +170,7 @@ def _expected_text() -> str:
 def test_completed_column_replaces_target_blocks_and_preserves_unrelated_lines() -> None:
     materializer = _load_materializer()
     source = _source_text()
-    state = _state()
-
-    rendered = materializer.materialize_completed_column(source, state)
+    rendered = materializer.materialize_completed_column(source, _state())
 
     assert rendered == _expected_text()
     assert OUTSIDE_BEFORE in rendered
@@ -235,6 +235,17 @@ def test_source_identity_and_block_shape_fail_closed(source: str, match: str) ->
     materializer = _load_materializer()
     with pytest.raises(ValueError, match=match):
         materializer.materialize_completed_column(source, _state())
+
+
+def test_source_line_marker_must_match_snapshot_line_ref_and_task_tablet() -> None:
+    materializer = _load_materializer()
+    wrong_line = _source_text().replace("# KTU 9.9 I:2", "# KTU 9.9 II:2")
+    with pytest.raises(ValueError, match="line|marker|snapshot|identity"):
+        materializer.materialize_completed_column(wrong_line, _state())
+
+    wrong_tablet = _source_text().replace("# KTU 9.9 I:1", "# KTU 9.8 I:1")
+    with pytest.raises(ValueError, match="tablet|line|marker|snapshot|identity"):
+        materializer.materialize_completed_column(wrong_tablet, _state())
 
 
 def test_source_target_order_must_match_snapshot_order() -> None:
