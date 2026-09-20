@@ -126,6 +126,18 @@ def test_duplicate_identical_curated_rows_are_rejected() -> None:
         ("pos", "n.\tbad"),
         ("gloss", "king\nbad"),
         ("comments", "public\tbad"),
+        # Every separator str.splitlines() honours must be rejected, or the
+        # rendered file re-parses with a phantom row.
+        ("comments", "before\u2028after"),
+        ("comments", "before\u2029after"),
+        ("gloss", "before\x85after"),
+        ("dulat", "before\x0bafter"),
+        ("pos", "before\x0cafter"),
+        ("morphology", "a/\x1cb"),
+        ("comments", "before\x1dafter"),
+        ("comments", "before\x1eafter"),
+        ("gloss", "king\n"),
+        ("comments", "\r"),
     ],
 )
 def test_curated_row_fields_reject_tsv_control_characters(field: str, value: str) -> None:
@@ -139,3 +151,16 @@ def test_curated_row_fields_reject_tsv_control_characters(field: str, value: str
     kwargs[field] = value
     with pytest.raises(ValueError, match="tab|newline|TSV|control"):
         _row(**kwargs)
+
+
+def test_reviewed_rows_none_payload_is_a_value_error() -> None:
+    payload = {
+        "decision_id": "decision-1",
+        "token_id": "t1",
+        "analyses": ["mlk/"],
+        "evidence_ids": ["evidence-1"],
+        "summary": "s",
+        "reviewed_rows": None,
+    }
+    with pytest.raises(ValueError, match="reviewed_rows"):
+        cs.TokenDecision.from_dict(payload)

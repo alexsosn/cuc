@@ -58,11 +58,19 @@ def _text_tuple(
 def _tsv_field(value: object, field: str, *, required: bool = True) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
-    if any(marker in value for marker in ("\t", "\n", "\r")):
+    # Reject tabs plus every separator str.splitlines() honours, so a rendered
+    # row never re-parses as more than one line for any reviewed-TSV consumer.
+    if "\t" in value or (value and value.splitlines() != [value]):
         raise ValueError(f"{field} must not contain tab/newline TSV control characters")
     if required and not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
     return value
+
+
+def _reviewed_rows_payload(value: object) -> tuple[Any, ...]:
+    if value is None or isinstance(value, (str, bytes, Mapping)) or not isinstance(value, (list, tuple)):
+        raise ValueError("reviewed_rows payload must be a list of row payloads")
+    return tuple(value)
 
 
 def _nonnegative_int(value: object, field: str) -> int:
@@ -358,7 +366,8 @@ class TokenDecision:
             payload.get("revisit_of"),
             payload.get("revisit_request_id"),
             reviewed_rows=tuple(
-                ReviewedRow.from_dict(item) for item in payload.get("reviewed_rows", ())
+                ReviewedRow.from_dict(item)
+                for item in _reviewed_rows_payload(payload.get("reviewed_rows", ()))
             ),
         )
 

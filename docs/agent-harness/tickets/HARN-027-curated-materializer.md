@@ -97,3 +97,35 @@ Reject the PR if it can:
 - leak `SEEDED from auto-parse` into curated output;
 - mutate `reviewed/**`, `auto_parsing/**`, GitHub, or the network from the pure materializer;
 - break existing morphology-only benchmark/evaluation decisions or their JSON round trips.
+
+## Adversarial review — 2026-09-20
+
+Clean-context review of the final diff against issue #70. No rubric blocker
+reproduced; two MEDIUM findings were fixed test-first in the same PR, and the
+remaining LOW findings are recorded here as explicit scope limits.
+
+### Fixed
+
+- **MEDIUM** — the seed marker was rejected only in `comments`; it could be
+  emitted through `dulat`, `pos`, `gloss` or `morphological_parsing`. The
+  materializer now checks every structured field.
+- **MEDIUM** — `_tsv_field` rejected only `\t`, `\n`, `\r`, but the materializer
+  and every reviewed-TSV consumer in `agent/scripts/` split on
+  `str.splitlines()`, which also honours U+2028/U+2029, NEL, VT, FF and
+  FS/GS/RS. A structured field containing one of those rendered a file that
+  re-parsed with a phantom row. The guard now rejects any value for which
+  `value.splitlines() != [value]`.
+- **LOW** — `TokenDecision.from_dict` raised `TypeError` instead of the
+  contract's `ValueError` for `"reviewed_rows": None`.
+
+### Escalated, not fixed here
+
+- **LOW** — `reviewed/KTU 1.5.tsv`, `KTU 2.10.tsv` and `KTU 2.11.tsv` contain
+  hand-curated rows with other than 8 columns; the strict parser therefore
+  refuses the whole file. Fail-closed is the intended behaviour; the data
+  repair belongs to a reviewed-data ticket, not the materializer.
+- **LOW** — columnless tablets (`# KTU 2.10 1`, no roman column) are not
+  addressable because the line-marker prefix is `"{tablet} {column}:"`. The
+  production runner (HARN-028) must define the columnless work unit.
+- **LOW** — mixed line endings inside one target block are normalised to the
+  first source row's ending; lines outside the block are byte-preserved.

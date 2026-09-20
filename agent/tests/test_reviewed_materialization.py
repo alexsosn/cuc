@@ -342,12 +342,21 @@ def test_latest_decision_without_structured_rows_cannot_materialize() -> None:
         materializer.materialize_completed_column(_source_text(), state)
 
 
-def test_seed_marker_cannot_be_reintroduced_by_structured_comment() -> None:
+@pytest.mark.parametrize(
+    "row",
+    [
+        ("a/", "a", "n.", "A", "DULAT ## SEEDED from auto-parse; not yet hand-reviewed."),
+        ("a/", "a SEEDED from auto-parse", "n.", "A", ""),
+        ("a/", "a", "n. SEEDED from auto-parse", "A", ""),
+        ("a/", "a", "n.", "A SEEDED from auto-parse", ""),
+        ("SEEDED from auto-parse/", "a", "n.", "A", ""),
+    ],
+    ids=["comments", "dulat", "pos", "gloss", "morphology"],
+)
+def test_seed_marker_cannot_be_reintroduced_through_any_structured_field(row) -> None:
     materializer = _load_materializer()
     rows = _default_rows()
-    rows["t1"] = (
-        _row("a/", "a", "n.", "A", "DULAT ## SEEDED from auto-parse; not yet hand-reviewed."),
-    )
+    rows["t1"] = (_row(*row),)
     state = _state(rows_by_token=rows)
     with pytest.raises(ValueError, match="SEEDED|seed|workflow"):
         materializer.materialize_completed_column(_source_text(), state)

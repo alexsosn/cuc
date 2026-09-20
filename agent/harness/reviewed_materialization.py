@@ -100,7 +100,7 @@ def _latest_structured_decisions(state: ColumnRunState) -> dict[str, TokenDecisi
                 f"latest decision for {token.token_id} lacks structured reviewed_rows"
             )
         for row in decision.reviewed_rows:
-            if _SEED_MARKER in row.comments:
+            if any(_SEED_MARKER in value for value in row.to_dict().values()):
                 raise ValueError(
                     f"workflow seed marker cannot be emitted for token {token.token_id}"
                 )
