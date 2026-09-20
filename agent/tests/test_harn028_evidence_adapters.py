@@ -426,3 +426,149 @@ def test_resource_text_appears_only_in_evidence_summaries(tmp_path: Path) -> Non
     assert all(SENTINEL not in r.source_ref and SENTINEL not in r.provenance_ref for r in records)
     assert str(tmp_path) not in policy.to_json()
     assert str(tmp_path) not in json.dumps(context, ensure_ascii=False)
+
+
+# --- review findings (2026-09-21) ---------------------------------------------------------
+
+
+def test_absent_sqlite_resource_is_never_created_and_yields_nothing(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    missing = tmp_path / "gone.sqlite"
+    records = mod.DulatAdapter().collect(
+        mod.TokenEvidenceContext(loaded, state, _token(loaded, "1003"), "op-x"), missing
+    )
+    assert records == ()
+    assert not missing.exists()
+
+
+@pytest.mark.parametrize("breakage", ["junk-file", "missing-table", "missing-column"])
+def test_present_but_unreadable_resource_degrades_to_marker_record(
+    tmp_path: Path, breakage: str
+) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    db = tmp_path / "modules_cache.sqlite"
+    if breakage == "junk-file":
+        db.write_bytes(b"not a database")
+    else:
+        con = sqlite3.connect(db)
+        if breakage == "missing-table":
+            con.execute("CREATE TABLE other (x)")
+        else:
+            con.execute("CREATE TABLE module_records (module_id TEXT, ref_norm TEXT)")
+        con.commit()
+        con.close()
+    locator = mod.StaticLocator({"modules": (db, "explicit")})
+    collector, policy = _collector(mod, loaded, ("auto-parsing", "eupt"), locator)
+    assert policy.available_sources == ("auto-parsing", "eupt")
+    context = collector.initialize_skill_context(state, "run:init")
+    records = collector.collect_evidence(
+        state, _token(loaded, "1003"), context, "run:initial:1003:evidence"
+    )
+    eupt = [r for r in records if r.source_id == "eupt"]
+    assert len(eupt) == 1
+    assert eupt[0].source_ref.startswith("eupt:unreadable:")
+    assert "unreadable" in eupt[0].summary
+    # The failure is reported by exception type only; never a path.
+    assert str(tmp_path) not in eupt[0].summary and str(tmp_path) not in eupt[0].source_ref
+    assert collector.adapter_failures == {"eupt": eupt[0].source_ref.split(":")[-1]}
+
+
+def test_static_locator_treats_missing_explicit_path_as_absent(tmp_path: Path) -> None:
+    mod = _adapters()
+    locator = mod.StaticLocator({"modules": (tmp_path / "missing.sqlite", "explicit")})
+    assert locator.locate("modules") is None
+    policy = mod.build_policy(("auto-parsing", "eupt"), locator)
+    assert policy.absent_sources == ("eupt",)
+
+
+def test_build_policy_survives_a_raising_locator_without_leaking_paths(tmp_path: Path) -> None:
+    mod = _adapters()
+
+    class Raising:
+        def locate(self, kind):
+            raise RuntimeError(f"boom {tmp_path}")
+
+    policy = mod.build_policy(("auto-parsing", "dulat"), Raising())
+    assert policy.absent_sources == ("dulat",)
+    assert str(tmp_path) not in policy.to_json()
+
+
+def test_burns_adapter_tolerates_extra_fields_and_expands_line_ranges(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    burns = tmp_path / "context_labeling" / "Workbooks"
+    burns.mkdir(parents=True)
+    (burns / "terms.csv").write_text(
+        "headword,root,category,ktu,references\n"
+        "ġr,ġ-r-r,cultic,9.9,I.1-3,extra,fields\n"
+        "zz,z,cultic,9.9,II.1\n",
+        encoding="utf-8",
+    )
+    records = mod.BurnsAdapter().collect(
+        mod.TokenEvidenceContext(loaded, state, _token(loaded, "1003"), "op-b"), burns.parent
+    )
+    assert [r.source_ref for r in records] == ["burns:Workbooks/terms.csv:KTU 9.9 I:2:ġr"]
+
+
+def test_legacy_review_is_absent_when_the_tablet_has_no_legacy_file(tmp_path: Path) -> None:
+    mod = _adapters()
+    root = _repo(tmp_path)
+    loaded = _loaded(root)
+    policy = mod.build_policy(("auto-parsing", "legacy-review"), mod.StaticLocator({}), loaded)
+    assert policy.absent_sources == ("legacy-review",)
+    _legacy_review(root)
+    policy = mod.build_policy(("auto-parsing", "legacy-review"), mod.StaticLocator({}), loaded)
+    assert policy.absent_sources == ()
+    assert policy.availability_for("legacy-review").locator_kind == "repository"
+
+
+def test_legacy_review_adapter_survives_non_utf8_and_markerless_files(tmp_path: Path) -> None:
+    mod = _adapters()
+    root = _repo(tmp_path)
+    loaded = _loaded(root)
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    ctx = mod.TokenEvidenceContext(loaded, state, _token(loaded, "1003"), "op-l")
+    bad = root / "reviewed" / "KTU 9.9.txt"
+    bad.write_bytes(b"\xff\xfe\x00 not utf-8")
+    assert mod.LegacyReviewAdapter().collect(ctx, bad) == ()
+    bad.write_text("id\tsurface\tanalysis\n1\tġr\tġr(II)/\n", encoding="utf-8")
+    assert mod.LegacyReviewAdapter().collect(ctx, bad) == ()
+
+
+def test_corpus_parallels_exclude_the_column_under_review(tmp_path: Path) -> None:
+    mod = _adapters()
+    root = _repo(tmp_path)
+    # Column II of the same tablet is reviewed and shares a surface with column I's 1001.
+    (root / "reviewed" / "KTU 9.9.tsv").write_text(
+        (root / "reviewed" / "KTU 9.9.tsv").read_text(encoding="utf-8")
+        + "# KTU 9.9 II:2\t\t\t\t\t\t\t\n"
+        + "1005\tl\tl \tl(I)\tl (I)\tprep.\tto\treviewed elsewhere\n"
+        + "# KTU 9.9 I:3\t\t\t\t\t\t\t\n",
+        encoding="utf-8",
+    )
+    # A reviewed (non-seeded) row for another token of column I itself.
+    text = (root / "reviewed" / "KTU 9.9.tsv").read_text(encoding="utf-8")
+    text = text.replace(
+        "1002\tbˤl\tbʿl\tbˤl(II)/\tbʕl (II)\tn. m. sg. abs. gen.\tBaal\t## SEEDED from auto-parse; not yet hand-reviewed.\n",
+        "1002\tbˤl\tbʿl\tbˤl(II)/\tbʕl (II)\tn. m. sg. abs. gen.\tBaal\treviewed gold\n",
+    )
+    (root / "reviewed" / "KTU 9.9.tsv").write_text(text, encoding="utf-8")
+    (root / "auto_parsing" / "0.2.8" / "KTU 9.9.tsv").write_text(
+        (root / "auto_parsing" / "0.2.8" / "KTU 9.9.tsv").read_text(encoding="utf-8")
+        + "# KTU 9.9 II:2\t\t\t\t\t\t\n"
+        + "1005\tl\tl(I)\tl (I)\tprep.\tto\t\n",
+        encoding="utf-8",
+    )
+    loaded = _loaded(root)
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    adapter = mod.CorpusParallelsAdapter()
+    l_records = adapter.collect(mod.TokenEvidenceContext(loaded, state, _token(loaded, "1001"), "op-p"), None)
+    assert [r.source_ref for r in l_records] == ["corpus-parallels:reviewed/KTU 9.9.tsv:1005"]
+    # Another column-I token's reviewed row must not be evidence for column I.
+    b_records = adapter.collect(mod.TokenEvidenceContext(loaded, state, _token(loaded, "1003"), "op-q"), None)
+    assert not any(":1002" in r.source_ref for r in b_records)

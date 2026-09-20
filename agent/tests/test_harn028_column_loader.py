@@ -259,3 +259,32 @@ def test_loader_reads_real_ktu_1_6_column_i_from_the_repository() -> None:
     assert loaded.snapshot.tokens[0].surface == "l"
     assert loaded.snapshot.tokens[0].line_ref == "I:1"
     assert all(len(loaded.automatic_rows[t]) >= 1 for t in loaded.snapshot.token_ids)
+
+
+# --- review findings (2026-09-21) ---------------------------------------------------------
+
+
+def test_loader_rejects_non_contiguous_reviewed_rows_for_one_token(tmp_path: Path) -> None:
+    reviewed = _reviewed_text().replace(
+        f"1002\tbˤl\tbʿl\tbˤl(II)/\tbʕl (II)\tn. m. sg. abs. gen.\tBaal\t{SEED}\n",
+        f"1002\tbˤl\tbʿl\tbˤl(II)/\tbʕl (II)\tn. m. sg. abs. gen.\tBaal\t{SEED}\n"
+        f"1001\tl\tl \tl(I)\tl (I)\tprep.\tto\t{SEED}\n",
+    )
+    with pytest.raises(ValueError, match="1001.*contiguous|contiguous.*1001"):
+        _load(_repo(tmp_path, reviewed=reviewed))
+
+
+def test_loader_rejects_priority_ids_outside_the_column_early(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="1004"):
+        _load(_repo(tmp_path), evidence_priority_token_ids=("1004",))
+
+
+def test_loader_keeps_line_context_across_non_marker_comment_lines(tmp_path: Path) -> None:
+    auto = _auto_text().replace(
+        "1002\tbˤl\tbˤl(II)/", "# editorial note, not a marker\n1002\tbˤl\tbˤl(II)/"
+    )
+    reviewed = _reviewed_text().replace(
+        "1002\tbˤl\tbʿl", "# editorial note, not a marker\t\t\t\t\t\t\t\n1002\tbˤl\tbʿl"
+    )
+    loaded = _load(_repo(tmp_path, auto=auto, reviewed=reviewed))
+    assert loaded.snapshot.token_ids == ("1001", "1002", "1003")

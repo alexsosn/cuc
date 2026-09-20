@@ -151,3 +151,10 @@ def test_policy_json_round_trip_and_order_normalisation() -> None:
     assert set(payload) == {"enabled_sources", "availability"}
     # No filesystem path can appear in the serialised policy.
     assert "/" not in policy.to_json()
+
+
+def test_from_json_hostile_payloads_raise_value_error() -> None:
+    mod = _policy_module()
+    for payload in ("{}", '{"enabled_sources": 5, "availability": []}', "[]", "not json", '{"enabled_sources": ["auto-parsing"], "availability": [{}]}'):
+        with pytest.raises(ValueError):
+            mod.EvidencePolicy.from_json(payload)

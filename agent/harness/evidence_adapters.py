@@ -45,6 +45,8 @@ _SKILL_SCRIPTS = Path(".agents/skills/review-automatic-parsing/scripts")
 _SEED_MARK = "SEEDED from auto-parse"
 _EUPT_MODULES = ("EUPT_vocalisation", "EUPT_translation", "EUPT_commentary")
 _BURNS_COL_RE = re.compile(r"^([IVX]+)\.(.*)$")
+_BURNS_RANGE_RE = re.compile(r"(\d+)\s*[-–]\s*(\d+)")
+_LINE_MARKER_RE = re.compile(r"^# (KTU \S+)(?: ([IVX]+):| )(\d+)$")
 _HTML_RE = re.compile(r"<[^>]+>")
 _MAX_PARALLELS = 12
 
@@ -63,11 +65,24 @@ class StaticLocator:
         self._mapping = {kind: (Path(path), locator_kind) for kind, (path, locator_kind) in mapping.items()}
 
     def locate(self, kind: str) -> tuple[Path, str] | None:
-        return self._mapping.get(kind)
+        located = self._mapping.get(kind)
+        if located is None or not located[0].exists():
+            return None
+        return located
+
+
+_SCRIPT_MODULES: dict[tuple[Path, str], Any] = {}
 
 
 def _load_script_module(repo_root: Path, name: str):
-    path = repo_root / _SKILL_SCRIPTS / f"{name}.py"
+    """Execute a skill script once per (repository, script); cached for the process."""
+
+    key = (Path(repo_root).resolve(), name)
+    if key in _SCRIPT_MODULES:
+        return _SCRIPT_MODULES[key]
+    path = key[0] / _SKILL_SCRIPTS / f"{name}.py"
+    if not path.is_file():
+        raise ValueError(f"skill script {name}.py is not present under the capability root")
     spec = importlib.util.spec_from_file_location(f"cuc_skill_scripts.{name}", path)
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot load skill script {path}")
@@ -84,6 +99,7 @@ def _load_script_module(repo_root: Path, name: str):
         spec.loader.exec_module(module)
     finally:
         os.chdir(previous)
+    _SCRIPT_MODULES[key] = module
     return module
 
 
@@ -193,13 +209,22 @@ def _record(ctx: TokenEvidenceContext, source_id: str, index: int, source_ref: s
     )
 
 
-def _connect_ro(path: Path) -> sqlite3.Connection:
+class _ResourceUnreadable(RuntimeError):
+    """A located resource could not be read; carries the cause type only."""
+
+
+def _connect_ro(path: Path) -> sqlite3.Connection | None:
+    """Read-only connection, or ``None`` when the file is absent. Never creates a file."""
+
+    if not Path(path).is_file():
+        return None
+    con = sqlite3.connect(f"file:{Path(path).as_posix()}?mode=ro", uri=True)
     try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         con.execute("select name from sqlite_master limit 1").fetchall()
-        return con
     except sqlite3.Error:
-        return sqlite3.connect(str(path))
+        con.close()
+        raise
+    return con
 
 
 def _repository_provenance(ctx: TokenEvidenceContext) -> str:
@@ -235,9 +260,9 @@ class DulatAdapter:
     source_id = DULAT
 
     def collect(self, ctx: TokenEvidenceContext, resource: Path | None) -> tuple[EvidenceRecord, ...]:
-        if resource is None:
+        con = _connect_ro(resource) if resource is not None else None
+        if con is None:
             return ()
-        con = _connect_ro(resource)
         try:
             rows = con.execute(
                 "select norm_ref, entry_id, payload from dulat_reverse_refs where norm_ref=? "
@@ -275,9 +300,9 @@ class EuptAdapter:
     source_id = EUPT
 
     def collect(self, ctx: TokenEvidenceContext, resource: Path | None) -> tuple[EvidenceRecord, ...]:
-        if resource is None:
+        con = _connect_ro(resource) if resource is not None else None
+        if con is None:
             return ()
-        con = _connect_ro(resource)
         try:
             placeholders = ",".join("?" * len(_EUPT_MODULES))
             rows = con.execute(
@@ -318,6 +343,8 @@ class TropperAdapter:
             return ()
         column = "" if ctx.column == COLUMNLESS else ctx.column
         con = _connect_ro(index)
+        if con is None:
+            return ()
         try:
             rows = con.execute(
                 "select pages from ktu where tablet=? and column=? and line=? and verified=1 order by pages",
@@ -363,7 +390,8 @@ class LegacyReviewAdapter:
             legacy_align = _load_script_module(scripts_root, "legacy_align")
             try:
                 self._cache[path] = legacy_align.load(path, legacy_align.LEGACY_IDX)
-            except SystemExit:
+            except (SystemExit, UnicodeDecodeError, OSError, csv.Error, IndexError, KeyError):
+                # Markerless, undecodable or malformed legacy files align nothing.
                 self._cache[path] = {}
         return self._cache[path]
 
@@ -413,14 +441,31 @@ class CorpusParallelsAdapter:
     source_id = CORPUS_PARALLELS
 
     def __init__(self) -> None:
-        self._index: dict[Path, dict[str, list[tuple[str, str, str, str, str, str]]]] = {}
+        self._index: dict[tuple[Path, str, str], dict[str, list[tuple[str, str, str, str, str, str]]]] = {}
 
-    def _build(self, repo_root: Path) -> dict[str, list[tuple[str, str, str, str, str, str]]]:
+    @staticmethod
+    def _build(
+        repo_root: Path, *, exclude_tablet: str, exclude_column: str
+    ) -> dict[str, list[tuple[str, str, str, str, str, str]]]:
+        """Index reviewed rows by surface, excluding seeded rows and the column under review.
+
+        The target column's own reviewed rows are the evaluation gold on a benchmark
+        rerun and the run's own output otherwise; either way they are not evidence.
+        """
+
         index: dict[str, list[tuple[str, str, str, str, str, str]]] = {}
         for path in sorted((repo_root / "reviewed").glob("KTU *.tsv")):
             relative = path.relative_to(repo_root).as_posix()
+            current_tablet: str | None = None
+            current_column: str | None = None
             for raw in path.read_text(encoding="utf-8").splitlines()[1:]:
                 if raw.startswith("#"):
+                    marker = _LINE_MARKER_RE.match(raw.rstrip("\t"))
+                    if marker is not None:
+                        current_tablet = marker.group(1)
+                        current_column = marker.group(2) or COLUMNLESS
+                    continue
+                if current_tablet == exclude_tablet and current_column == exclude_column:
                     continue
                 fields = raw.split("\t")
                 if len(fields) != 8 or not fields[0].strip().isdigit():
@@ -433,12 +478,12 @@ class CorpusParallelsAdapter:
         return index
 
     def collect(self, ctx: TokenEvidenceContext, resource: Path | None) -> tuple[EvidenceRecord, ...]:
-        repo_root = Path(ctx.loaded_column.repo_root)
-        if repo_root not in self._index:
-            self._index[repo_root] = self._build(repo_root)
+        key = (Path(ctx.loaded_column.repo_root), ctx.tablet, ctx.column)
+        if key not in self._index:
+            self._index[key] = self._build(key[0], exclude_tablet=ctx.tablet, exclude_column=ctx.column)
         hits = [
             hit
-            for hit in self._index[repo_root].get(_normalize_surface(ctx.token.surface), [])
+            for hit in self._index[key].get(_normalize_surface(ctx.token.surface), [])
             if hit[1] != ctx.token.token_id
         ]
         groups: dict[tuple[str, str, str, str], list[tuple[str, str]]] = {}
@@ -493,7 +538,8 @@ class BurnsAdapter:
         for csv_path in sorted(root.glob("*/*.csv")):
             relative = csv_path.relative_to(root).as_posix()
             with csv_path.open(encoding="utf-8", newline="") as handle:
-                for row in csv.DictReader(handle):
+                for raw_row in csv.DictReader(handle, restkey="_extra"):
+                    row = {k: v for k, v in raw_row.items() if isinstance(k, str) and isinstance(v, str)}
                     tablet = (row.get("ktu") or "").strip()
                     refs = (row.get("references") or "").strip()
                     if not tablet or not refs or tablet.lower().startswith("not attested"):
@@ -504,7 +550,7 @@ class BurnsAdapter:
                             continue
                         match = _BURNS_COL_RE.match(chunk)
                         column, rest = (match.group(1), match.group(2)) if match else ("", chunk)
-                        for line in re.findall(r"\d+", rest):
+                        for line in _burns_lines(rest):
                             index.setdefault((tablet, column, line), []).append((relative, row))
         self._cache[root] = index
         return index
@@ -539,6 +585,20 @@ class BurnsAdapter:
                 )
             )
         return tuple(records)
+
+
+def _burns_lines(text: str) -> list[str]:
+    """Expand ``2-5`` style ranges; otherwise every number cited."""
+
+    lines: list[str] = []
+    remaining = text
+    for match in _BURNS_RANGE_RE.finditer(text):
+        start, end = int(match.group(1)), int(match.group(2))
+        if 0 < end - start <= 60:
+            lines.extend(str(n) for n in range(start, end + 1))
+            remaining = remaining.replace(match.group(0), " ")
+    lines.extend(re.findall(r"\d+", remaining))
+    return list(dict.fromkeys(lines))
 
 
 def _digest_marker(ctx: TokenEvidenceContext, source_id: str) -> str:
@@ -592,15 +652,59 @@ def _policy_digest(path: Path) -> str:
     return resource_digest(target)
 
 
-def build_policy(requested: tuple[str, ...] | list[str], locator: ResourceLocator) -> EvidencePolicy:
-    return build_evidence_policy(requested, locator, resource_digest_for=_policy_digest)
+def build_policy(
+    requested: tuple[str, ...] | list[str],
+    locator: ResourceLocator,
+    loaded_column: LoadedColumn | None = None,
+) -> EvidencePolicy:
+    """Resolve a policy; with a loaded column the legacy review resolves per tablet."""
+
+    def repository_resolver(source_id: str) -> Path | None:
+        if source_id == LEGACY_REVIEW and loaded_column is not None:
+            candidate = Path(loaded_column.repo_root) / "reviewed" / f"{loaded_column.task.tablet}.txt"
+            return candidate if candidate.is_file() else None
+        return None
+
+    return build_evidence_policy(
+        requested,
+        locator,
+        resource_digest_for=_policy_digest,
+        repository_resolver=repository_resolver if loaded_column is not None else None,
+    )
 
 
 # --- collector -------------------------------------------------------------------------
 
 
 class EvidenceCollector:
-    """Compose enabled adapters into the HARN-004 ``collect_evidence`` boundary."""
+    """Compose enabled adapters into the HARN-004 ``collect_evidence`` boundary.
+
+    A resource that was located but cannot be read (corrupt file, missing table,
+    undecodable text) must neither abort the column run nor vanish silently: the
+    collector emits one marker record naming the source and the exception type,
+    records the failure in ``adapter_failures``, and continues. Exception messages
+    are never forwarded because they can carry local paths.
+    """
+
+    def _collect_degrading(
+        self, adapter: Any, ctx: TokenEvidenceContext, resource: Path | None
+    ) -> tuple[EvidenceRecord, ...]:
+        try:
+            return tuple(adapter.collect(ctx, resource))
+        except Exception as exc:  # noqa: BLE001 - degrade, never abort the column
+            error_type = type(exc).__name__
+            self.adapter_failures[adapter.source_id] = error_type
+            return (
+                _record(
+                    ctx,
+                    adapter.source_id,
+                    0,
+                    f"{adapter.source_id}:unreadable:{error_type}",
+                    f"{adapter.source_id}:{_digest_marker(ctx, adapter.source_id)}",
+                    f"{adapter.source_id} resource is present but unreadable ({error_type}); "
+                    "no evidence from this source for this token",
+                ),
+            )
 
     def __init__(
         self,
@@ -618,6 +722,7 @@ class EvidenceCollector:
         factories.update(adapter_factories or {})
         self.policy = policy
         self.loaded_column = loaded_column
+        self.adapter_failures: dict[str, str] = {}
         self._adapters: dict[str, Any] = {}
         self._resources: dict[str, Path | None] = {}
         for source_id in policy.enabled_sources:
@@ -680,7 +785,10 @@ class EvidenceCollector:
             adapter = self._adapters.get(source_id)
             if adapter is None:
                 continue
-            collected = adapter.collect(ctx, self._resources.get(source_id))
+            if source_id == AUTO_PARSING:
+                collected = adapter.collect(ctx, None)
+            else:
+                collected = self._collect_degrading(adapter, ctx, self._resources.get(source_id))
             for item in collected:
                 if not isinstance(item, EvidenceRecord) or item.source_id != source_id:
                     raise ValueError(f"adapter {source_id} returned a foreign evidence record")

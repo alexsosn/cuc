@@ -116,7 +116,8 @@ def _read_column_rows(
         if raw.startswith("#"):
             marker = _LINE_MARKER_RE.match(raw.rstrip("\t"))
             if marker is None:
-                current_tablet = current_column = current_line = None
+                # An editorial comment that is not a KTU marker keeps the line context;
+                # resetting it would silently drop the tokens that follow it.
                 continue
             current_tablet = marker.group(1)
             current_column = marker.group(2) or COLUMNLESS
@@ -191,6 +192,17 @@ def load_column(
 
     auto_grouped = _group_in_order(auto_rows)
     reviewed_grouped = _group_in_order(reviewed_rows)
+    for label, rows in ((auto_relative, auto_rows), (reviewed_relative, reviewed_rows)):
+        seen: list[str] = []
+        for row in rows:
+            if seen and seen[-1] == row.token_id:
+                continue
+            if row.token_id in seen:
+                raise ValueError(
+                    f"rows for token {row.token_id} are not contiguous in {label} "
+                    f"(line {row.line_number})"
+                )
+            seen.append(row.token_id)
     auto_ids = tuple(auto_grouped)
     reviewed_ids = tuple(reviewed_grouped)
     missing_in_reviewed = [tid for tid in auto_ids if tid not in reviewed_grouped]
@@ -209,6 +221,13 @@ def load_column(
         raise ValueError(
             "reviewed token order differs from the automatic token sequence for "
             f"{tablet} {column}: reviewed={reviewed_ids!r} automatic={auto_ids!r}"
+        )
+
+    unknown_priority = [tid for tid in evidence_priority_token_ids if tid not in auto_grouped]
+    if unknown_priority:
+        raise ValueError(
+            "evidence priority token ids are outside the target column: "
+            + ", ".join(unknown_priority)
         )
 
     tokens: list[ColumnToken] = []

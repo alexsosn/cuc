@@ -13,7 +13,7 @@ import json
 import re
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 AUTO_PARSING = "auto-parsing"
 DULAT = "dulat"
@@ -109,13 +109,18 @@ class ResourceAvailability:
     def from_dict(cls, payload: Mapping[str, Any]) -> "ResourceAvailability":
         if not isinstance(payload, Mapping):
             raise ValueError("ResourceAvailability payload must be a mapping")
-        return cls(
-            payload["source_id"],
-            payload["enabled"],
-            payload["available"],
-            payload["locator_kind"],
-            payload.get("resource_sha256"),
-        )
+        try:
+            return cls(
+                payload["source_id"],
+                payload["enabled"],
+                payload["available"],
+                payload["locator_kind"],
+                payload.get("resource_sha256"),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError(
+                f"malformed ResourceAvailability payload: {type(exc).__name__}"
+            ) from None
 
 
 def _source_order(source_id: str) -> int:
@@ -187,10 +192,19 @@ class EvidencePolicy:
     def from_dict(cls, payload: Mapping[str, Any]) -> "EvidencePolicy":
         if not isinstance(payload, Mapping):
             raise ValueError("EvidencePolicy payload must be a mapping")
-        return cls(
-            tuple(payload["enabled_sources"]),
-            tuple(ResourceAvailability.from_dict(item) for item in payload["availability"]),
-        )
+        try:
+            enabled = payload["enabled_sources"]
+            availability = payload["availability"]
+            if isinstance(enabled, (str, bytes)) or not isinstance(enabled, (list, tuple)):
+                raise ValueError("enabled_sources must be a list of source ids")
+            if isinstance(availability, (str, bytes)) or not isinstance(availability, (list, tuple)):
+                raise ValueError("availability must be a list of availability records")
+            return cls(
+                tuple(enabled),
+                tuple(ResourceAvailability.from_dict(item) for item in availability),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"malformed EvidencePolicy payload: {type(exc).__name__}") from None
 
     def to_json(self) -> str:
         return _canonical_json(self.to_dict())
@@ -240,27 +254,53 @@ def build_evidence_policy(
     locator: ResourceLocator,
     *,
     resource_digest_for=resource_digest,
+    repository_resolver: Callable[[str], Any] | None = None,
 ) -> EvidencePolicy:
-    """Resolve requested sources to a policy; absent resources are recorded, never fatal."""
+    """Resolve requested sources to a policy; absent resources are recorded, never fatal.
+
+    ``repository_resolver(source_id)`` may return the repository file backing a
+    repository-scoped source (currently the legacy expert review) or ``None`` when
+    the repository has none for this tablet. A locator or digest that raises is
+    treated as an absent resource; the exception text (which may contain a path)
+    is never propagated.
+    """
 
     enabled = tuple(requested)
     availability: list[ResourceAvailability] = []
     for source_id in enabled:
         if source_id in REPOSITORY_SOURCE_IDS:
-            availability.append(
-                ResourceAvailability(source_id, True, True, "repository", _REPOSITORY_DIGEST)
-            )
+            if repository_resolver is None or source_id != LEGACY_REVIEW:
+                availability.append(
+                    ResourceAvailability(source_id, True, True, "repository", _REPOSITORY_DIGEST)
+                )
+                continue
+            backing = _safe_call(repository_resolver, source_id)
+            digest = _safe_call(resource_digest_for, backing) if backing is not None else None
+            if digest is None:
+                availability.append(ResourceAvailability(source_id, True, False, "absent", None))
+            else:
+                availability.append(ResourceAvailability(source_id, True, True, "repository", digest))
             continue
         kind = RESOURCE_KIND_BY_SOURCE.get(source_id)
-        located = locator.locate(kind) if kind is not None else None
-        if located is None:
+        located = _safe_call(locator.locate, kind) if kind is not None else None
+        digest = None
+        locator_kind = "absent"
+        if isinstance(located, tuple) and len(located) == 2:
+            path, locator_kind = located
+            if locator_kind in LOCATOR_KINDS and locator_kind != "absent":
+                digest = _safe_call(resource_digest_for, path)
+        if digest is None:
             availability.append(ResourceAvailability(source_id, True, False, "absent", None))
-            continue
-        path, locator_kind = located
-        availability.append(
-            ResourceAvailability(source_id, True, True, locator_kind, resource_digest_for(path))
-        )
+        else:
+            availability.append(ResourceAvailability(source_id, True, True, locator_kind, digest))
     return EvidencePolicy(enabled, tuple(availability))
+
+
+def _safe_call(function: Callable[..., Any], *args: Any) -> Any:
+    try:
+        return function(*args)
+    except Exception:
+        return None
 
 
 # Repository-internal sources are versioned by the repository revision carried in the

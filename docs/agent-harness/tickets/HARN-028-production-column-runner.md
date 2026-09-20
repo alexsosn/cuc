@@ -157,3 +157,36 @@ whose reviewed and automatic token sequences differ; produce equal policy
 hashes for different enabled sets or resource versions; crash on an absent
 resource; put a resource path or resource text anywhere except
 `EvidenceRecord.summary`/`source_ref`; return zero evidence for a token.
+
+## Adversarial review — 028a, 2026-09-21
+
+Clean-context review of PR #73. No rubric violation on the production path;
+findings fixed test-first in the same PR:
+
+- **MEDIUM** — the read-only sqlite fallback could create a zero-byte file at an
+  absent resource path. Connections are now `mode=ro` only and an absent file
+  yields no evidence.
+- **MEDIUM** — a located but unreadable resource (corrupt file, missing table or
+  column, undecodable legacy text, malformed Burns row) aborted the run, and
+  `StaticLocator` raised with the absolute path for a missing explicit path.
+  The collector now degrades: one marker record `<source>:unreadable:<ErrorType>`
+  per token, the failure in `EvidenceCollector.adapter_failures`, no exception
+  text forwarded. `StaticLocator` and `build_evidence_policy` treat a missing
+  path, a raising locator or a failing digest as absent.
+- **MEDIUM (decision)** — corpus parallels served the reviewed rows of other
+  tokens in the column under review, which are the evaluation gold on a
+  benchmark rerun. Decision: the target column of the target tablet is excluded
+  from the parallels index; other columns of the same tablet remain evidence.
+  Excluding the whole tablet is the stricter alternative if a benchmark ever
+  targets a whole tablet.
+- **LOW** fixed — non-contiguous rows for one token now fail closed; priority
+  ids outside the column are rejected by the loader; an editorial `#` line that
+  is not a KTU marker keeps the line context instead of dropping tokens;
+  `legacy-review` is absent when the tablet has no `reviewed/<tablet>.txt`;
+  `from_json` raises `ValueError` on hostile payloads; skill scripts execute
+  once per process; Burns rows with extra fields and `2-5` line ranges are read.
+- **LOW** recorded, not fixed — `reviewed/KTU 1.5`, `2.10`, `2.11` contain
+  7-column rows (trailing tab missing) that the loader and the HARN-027
+  materializer both refuse; the linter accepts them. Normalising those rows is a
+  reviewed-data task and a precondition for running those tablets. Rows with a
+  non-numeric id are skipped as every other reviewed-TSV consumer does.
