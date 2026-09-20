@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import importlib
 import json
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from harness.column_state import ColumnRunState, EvidenceRecord
-
 from tests.test_harn028_column_loader import REPO_ROOT, _repo  # noqa: F401
 
 SENTINEL = "LEAK-SENTINEL-8b1f"
