@@ -55,6 +55,24 @@ def _text_tuple(
     return items
 
 
+def _tsv_field(value: object, field: str, *, required: bool = True) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    # Reject tabs plus every separator str.splitlines() honours, so a rendered
+    # row never re-parses as more than one line for any reviewed-TSV consumer.
+    if "\t" in value or (value and value.splitlines() != [value]):
+        raise ValueError(f"{field} must not contain tab/newline TSV control characters")
+    if required and not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _reviewed_rows_payload(value: object) -> tuple[Any, ...]:
+    if value is None or isinstance(value, (str, bytes, Mapping)) or not isinstance(value, (list, tuple)):
+        raise ValueError("reviewed_rows payload must be a list of row payloads")
+    return tuple(value)
+
+
 def _nonnegative_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field} must be a non-negative integer")
@@ -255,6 +273,44 @@ class EvidenceRecord:
 
 
 @dataclass(frozen=True)
+class ReviewedRow:
+    """One complete proposed curated TSV alternative for a reviewed token."""
+
+    morphological_parsing: str
+    dulat: str
+    pos: str
+    gloss: str
+    comments: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "morphological_parsing", _tsv_field(self.morphological_parsing, "morphological_parsing"))
+        object.__setattr__(self, "dulat", _tsv_field(self.dulat, "dulat"))
+        object.__setattr__(self, "pos", _tsv_field(self.pos, "pos"))
+        object.__setattr__(self, "gloss", _tsv_field(self.gloss, "gloss"))
+        object.__setattr__(self, "comments", _tsv_field(self.comments, "comments", required=False))
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "morphological_parsing": self.morphological_parsing,
+            "dulat": self.dulat,
+            "pos": self.pos,
+            "gloss": self.gloss,
+            "comments": self.comments,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ReviewedRow":
+        payload = _mapping(payload, "ReviewedRow payload")
+        return cls(
+            payload["morphological_parsing"],
+            payload["dulat"],
+            payload["pos"],
+            payload["gloss"],
+            payload.get("comments", ""),
+        )
+
+
+@dataclass(frozen=True)
 class TokenDecision:
     decision_id: str
     token_id: str
@@ -263,18 +319,29 @@ class TokenDecision:
     summary: str
     revisit_of: str | None = None
     revisit_request_id: str | None = None
+    reviewed_rows: tuple[ReviewedRow, ...] = ()
 
     def __post_init__(self) -> None:
+        analyses = _text_tuple(self.analyses, "analyses", required=True)
+        reviewed_rows = _object_tuple(self.reviewed_rows, ReviewedRow, "reviewed_rows")
+        if len(reviewed_rows) != len(set(reviewed_rows)):
+            raise ValueError("reviewed_rows must not contain duplicate curated rows")
+        if reviewed_rows:
+            projected = tuple(dict.fromkeys(row.morphological_parsing for row in reviewed_rows))
+            if projected != analyses:
+                raise ValueError("reviewed row morphology projection must match analyses")
+
         object.__setattr__(self, "decision_id", _required_text(self.decision_id, "decision_id"))
         object.__setattr__(self, "token_id", _required_text(self.token_id, "token_id"))
-        object.__setattr__(self, "analyses", _text_tuple(self.analyses, "analyses", required=True))
+        object.__setattr__(self, "analyses", analyses)
         object.__setattr__(self, "evidence_ids", _text_tuple(self.evidence_ids, "evidence_ids", required=True))
         object.__setattr__(self, "summary", _required_text(self.summary, "summary"))
         object.__setattr__(self, "revisit_of", _optional_text(self.revisit_of, "revisit_of"))
         object.__setattr__(self, "revisit_request_id", _optional_text(self.revisit_request_id, "revisit_request_id"))
+        object.__setattr__(self, "reviewed_rows", reviewed_rows)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "decision_id": self.decision_id,
             "token_id": self.token_id,
             "analyses": list(self.analyses),
@@ -283,6 +350,9 @@ class TokenDecision:
             "revisit_of": self.revisit_of,
             "revisit_request_id": self.revisit_request_id,
         }
+        if self.reviewed_rows:
+            payload["reviewed_rows"] = [row.to_dict() for row in self.reviewed_rows]
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "TokenDecision":
@@ -295,6 +365,10 @@ class TokenDecision:
             payload["summary"],
             payload.get("revisit_of"),
             payload.get("revisit_request_id"),
+            reviewed_rows=tuple(
+                ReviewedRow.from_dict(item)
+                for item in _reviewed_rows_payload(payload.get("reviewed_rows", ()))
+            ),
         )
 
 
