@@ -93,11 +93,15 @@ def _load_script_module(repo_root: Path, name: str):
         if entry not in sys.path:
             sys.path.append(entry)
     previous = os.getcwd()
+    previous_bytecode = sys.dont_write_bytecode
     try:
         # sources.py resolves the repository root from the working directory at import.
+        # Never write __pycache__ into the skill package: it is measured by provenance.
         os.chdir(repo_root)
+        sys.dont_write_bytecode = True
         spec.loader.exec_module(module)
     finally:
+        sys.dont_write_bytecode = previous_bytecode
         os.chdir(previous)
     _SCRIPT_MODULES[key] = module
     return module
@@ -214,17 +218,34 @@ class _ResourceUnreadable(RuntimeError):
 
 
 def _connect_ro(path: Path) -> sqlite3.Connection | None:
-    """Read-only connection, or ``None`` when the file is absent. Never creates a file."""
+    """Read-only connection, or ``None`` when the file is absent. Never creates a file.
 
-    if not Path(path).is_file():
+    The path is percent-encoded through ``Path.as_uri`` so ``?``, ``#`` or ``%`` in a
+    file name cannot truncate the URI and silently drop ``mode=ro``.
+    """
+
+    target = Path(path)
+    if not target.is_file():
         return None
-    con = sqlite3.connect(f"file:{Path(path).as_posix()}?mode=ro", uri=True)
+    con = sqlite3.connect(target.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         con.execute("select name from sqlite_master limit 1").fetchall()
     except sqlite3.Error:
         con.close()
         raise
     return con
+
+
+def _probe_sqlite(path: Path | None, table: str, columns: tuple[str, ...]) -> None:
+    """Raise if the resource is absent, unreadable, or lacks the schema the adapter needs."""
+
+    con = _connect_ro(path) if path is not None else None
+    if con is None:
+        raise ValueError("resource file is absent")
+    try:
+        con.execute(f"select {', '.join(columns)} from {table} limit 1").fetchall()
+    finally:
+        con.close()
 
 
 def _repository_provenance(ctx: TokenEvidenceContext) -> str:
@@ -258,6 +279,9 @@ class AutoParsingAdapter:
 
 class DulatAdapter:
     source_id = DULAT
+
+    def probe(self, resource: Path | None) -> None:
+        _probe_sqlite(resource, "dulat_reverse_refs", ("norm_ref", "entry_id", "payload"))
 
     def collect(self, ctx: TokenEvidenceContext, resource: Path | None) -> tuple[EvidenceRecord, ...]:
         con = _connect_ro(resource) if resource is not None else None
@@ -299,6 +323,9 @@ class DulatAdapter:
 class EuptAdapter:
     source_id = EUPT
 
+    def probe(self, resource: Path | None) -> None:
+        _probe_sqlite(resource, "module_records", ("id", "module_id", "ref_norm", "content_text"))
+
     def collect(self, ctx: TokenEvidenceContext, resource: Path | None) -> tuple[EvidenceRecord, ...]:
         con = _connect_ro(resource) if resource is not None else None
         if con is None:
@@ -322,6 +349,12 @@ class EuptAdapter:
 
 class TropperAdapter:
     source_id = TROPPER
+
+    def probe(self, resource: Path | None) -> None:
+        index = self.index_path(Path(resource)) if resource is not None else None
+        if index is None:
+            raise ValueError("Tropper index database not found under the OCR resource")
+        _probe_sqlite(index, "ktu", ("tablet", "column", "line", "pages", "verified"))
 
     @staticmethod
     def index_path(resource: Path) -> Path | None:
@@ -531,9 +564,19 @@ class BurnsAdapter:
     def effective_dir(resource: Path) -> Path:
         return resource / "output" if (resource / "output").is_dir() else resource
 
+    def probe(self, resource: Path | None) -> None:
+        if resource is None or not Path(resource).is_dir():
+            raise ValueError("Burns workbook directory is absent")
+        root = self.effective_dir(Path(resource))
+        if not any(root.glob("*/*.csv")):
+            raise ValueError("Burns workbook directory holds no CSV workbooks")
+        self._index(root)
+
     def _index(self, root: Path):
         if root in self._cache:
             return self._cache[root]
+        # Cache before building so a failing build is not retried for every token.
+        self._cache[root] = {}
         index: dict[tuple[str, str, str], list[tuple[str, dict[str, str]]]] = {}
         for csv_path in sorted(root.glob("*/*.csv")):
             relative = csv_path.relative_to(root).as_posix()
@@ -585,6 +628,16 @@ class BurnsAdapter:
                 )
             )
         return tuple(records)
+
+
+def _safe_locate(locator: ResourceLocator, kind: str) -> tuple[Path, str] | None:
+    try:
+        found = locator.locate(kind)
+    except Exception:  # noqa: BLE001 - a raising locator means absent, never a path leak
+        return None
+    if not isinstance(found, tuple) or len(found) != 2:
+        return None
+    return Path(found[0]), found[1]
 
 
 def _burns_lines(text: str) -> list[str]:
@@ -676,35 +729,20 @@ def build_policy(
 # --- collector -------------------------------------------------------------------------
 
 
+_CONSECUTIVE_FAILURE_LIMIT = 3
+
+
 class EvidenceCollector:
     """Compose enabled adapters into the HARN-004 ``collect_evidence`` boundary.
 
-    A resource that was located but cannot be read (corrupt file, missing table,
-    undecodable text) must neither abort the column run nor vanish silently: the
-    collector emits one marker record naming the source and the exception type,
-    records the failure in ``adapter_failures``, and continues. Exception messages
-    are never forwarded because they can carry local paths.
+    Readiness is decided once: ``build`` locates every enabled resource, probes that
+    the adapter can actually read it, and only then builds the ``EvidencePolicy``, so
+    an unreadable resource is recorded as absent and the policy hash (the ablation-arm
+    identity) reflects it. A failure that appears only for some tokens degrades to one
+    marker record per token and is counted in ``adapter_failures``; a source that
+    fails on ``_CONSECUTIVE_FAILURE_LIMIT`` consecutive tokens is a defect, not data,
+    and aborts the run. Exception messages are never forwarded (they can carry paths).
     """
-
-    def _collect_degrading(
-        self, adapter: Any, ctx: TokenEvidenceContext, resource: Path | None
-    ) -> tuple[EvidenceRecord, ...]:
-        try:
-            return tuple(adapter.collect(ctx, resource))
-        except Exception as exc:  # noqa: BLE001 - degrade, never abort the column
-            error_type = type(exc).__name__
-            self.adapter_failures[adapter.source_id] = error_type
-            return (
-                _record(
-                    ctx,
-                    adapter.source_id,
-                    0,
-                    f"{adapter.source_id}:unreadable:{error_type}",
-                    f"{adapter.source_id}:{_digest_marker(ctx, adapter.source_id)}",
-                    f"{adapter.source_id} resource is present but unreadable ({error_type}); "
-                    "no evidence from this source for this token",
-                ),
-            )
 
     def __init__(
         self,
@@ -713,6 +751,7 @@ class EvidenceCollector:
         *,
         locator: ResourceLocator,
         adapter_factories: Mapping[str, Callable[[], Any]] | None = None,
+        resource_paths: Mapping[str, Path | None] | None = None,
     ) -> None:
         if not isinstance(policy, EvidencePolicy):
             raise ValueError("policy must be EvidencePolicy")
@@ -722,9 +761,10 @@ class EvidenceCollector:
         factories.update(adapter_factories or {})
         self.policy = policy
         self.loaded_column = loaded_column
-        self.adapter_failures: dict[str, str] = {}
+        self.adapter_failures: dict[str, dict[str, Any]] = {}
         self._adapters: dict[str, Any] = {}
-        self._resources: dict[str, Path | None] = {}
+        self.resource_paths: dict[str, Path | None] = {}
+        located = dict(resource_paths or {})
         for source_id in policy.enabled_sources:
             availability = policy.availability_for(source_id)
             if availability is None or not availability.available:
@@ -732,12 +772,99 @@ class EvidenceCollector:
             adapter = factories[source_id]()
             if adapter.source_id != source_id:
                 raise ValueError(f"adapter for {source_id} reports source_id {adapter.source_id}")
-            self._adapters[source_id] = adapter
             if source_id in REPOSITORY_SOURCE_IDS:
-                self._resources[source_id] = None
+                resource = None
+            elif source_id in located:
+                resource = located[source_id]
             else:
-                located = locator.locate(RESOURCE_KIND_BY_SOURCE[source_id])
-                self._resources[source_id] = Path(located[0]) if located is not None else None
+                found = _safe_locate(locator, RESOURCE_KIND_BY_SOURCE[source_id])
+                resource = found[0] if found is not None else None
+            probe = getattr(adapter, "probe", None)
+            if callable(probe):
+                try:
+                    probe(resource)
+                except Exception as exc:  # noqa: BLE001 - reported by type only
+                    raise ValueError(
+                        f"policy claims {source_id} is available but the resource failed "
+                        f"the readiness probe ({type(exc).__name__})"
+                    ) from None
+            self._adapters[source_id] = adapter
+            self.resource_paths[source_id] = resource
+
+    @classmethod
+    def build(
+        cls,
+        requested: tuple[str, ...] | list[str],
+        loaded_column: LoadedColumn,
+        *,
+        locator: ResourceLocator,
+        adapter_factories: Mapping[str, Callable[[], Any]] | None = None,
+    ) -> "EvidenceCollector":
+        """Locate, probe, then build the policy from what is actually readable."""
+
+        factories = dict(DEFAULT_ADAPTER_FACTORIES)
+        factories.update(adapter_factories or {})
+        readable: dict[str, Path] = {}
+
+        class _ProbedLocator:
+            def locate(self, kind: str) -> tuple[Path, str] | None:
+                source_id = next((s for s, k in RESOURCE_KIND_BY_SOURCE.items() if k == kind), None)
+                found = _safe_locate(locator, kind)
+                if found is None or source_id is None:
+                    return None
+                adapter = factories[source_id]()
+                probe = getattr(adapter, "probe", None)
+                if callable(probe):
+                    try:
+                        probe(found[0])
+                    except Exception:  # noqa: BLE001 - unreadable resource is absent
+                        return None
+                readable[source_id] = Path(found[0])
+                return found
+
+        policy = build_policy(requested, _ProbedLocator(), loaded_column)
+        return cls(
+            policy,
+            loaded_column,
+            locator=locator,
+            adapter_factories=adapter_factories,
+            resource_paths=readable,
+        )
+
+    def _collect_degrading(
+        self, adapter: Any, ctx: TokenEvidenceContext, resource: Path | None
+    ) -> tuple[EvidenceRecord, ...]:
+        source_id = adapter.source_id
+        try:
+            collected = tuple(adapter.collect(ctx, resource))
+        except Exception as exc:  # noqa: BLE001 - degrade once, abort when systematic
+            error_type = type(exc).__name__
+            failure = self.adapter_failures.setdefault(
+                source_id, {"count": 0, "consecutive": 0, "last_error_type": error_type}
+            )
+            failure["count"] += 1
+            failure["consecutive"] += 1
+            failure["last_error_type"] = error_type
+            if failure["consecutive"] >= _CONSECUTIVE_FAILURE_LIMIT:
+                raise RuntimeError(
+                    f"evidence source {source_id} failed on {failure['consecutive']} consecutive "
+                    f"tokens ({error_type}); treating as a defect rather than row-local data"
+                ) from None
+            return (
+                _record(
+                    ctx,
+                    source_id,
+                    0,
+                    f"{source_id}:unreadable:{error_type}",
+                    f"{source_id}:{_digest_marker(ctx, source_id)}",
+                    f"{source_id} evidence could not be read for this token ({error_type}); "
+                    "no evidence from this source for this token",
+                ),
+            )
+        failure = self.adapter_failures.get(source_id)
+        if failure is not None:
+            failure["consecutive"] = 0
+        return collected
 
     def initialize_skill_context(self, state: ColumnRunState, operation_id: str) -> dict[str, Any]:
         if not isinstance(state, ColumnRunState):
@@ -788,7 +915,7 @@ class EvidenceCollector:
             if source_id == AUTO_PARSING:
                 collected = adapter.collect(ctx, None)
             else:
-                collected = self._collect_degrading(adapter, ctx, self._resources.get(source_id))
+                collected = self._collect_degrading(adapter, ctx, self.resource_paths.get(source_id))
             for item in collected:
                 if not isinstance(item, EvidenceRecord) or item.source_id != source_id:
                     raise ValueError(f"adapter {source_id} returned a foreign evidence record")

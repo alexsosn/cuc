@@ -185,8 +185,33 @@ findings fixed test-first in the same PR:
   `legacy-review` is absent when the tablet has no `reviewed/<tablet>.txt`;
   `from_json` raises `ValueError` on hostile payloads; skill scripts execute
   once per process; Burns rows with extra fields and `2-5` line ranges are read.
-- **LOW** recorded, not fixed — `reviewed/KTU 1.5`, `2.10`, `2.11` contain
-  7-column rows (trailing tab missing) that the loader and the HARN-027
-  materializer both refuse; the linter accepts them. Normalising those rows is a
-  reviewed-data task and a precondition for running those tablets. Rows with a
-  non-numeric id are skipped as every other reviewed-TSV consumer does.
+- **LOW** recorded, not fixed — of the 59 (tablet, column) pairs in
+  `reviewed/` with an `auto_parsing/0.2.8` counterpart, 49 load and 10 refuse:
+  7-column rows (trailing tab missing) in KTU 1.5 I, 1.5 II, 2.10, 2.11, and
+  blank-surface tokens without a sign span in KTU 1.2 I, 1.2 III, 1.4 I,
+  1.4 III, 1.4 VII, 2.24. The HARN-027 materializer refuses the same files; the
+  linter accepts them. Normalising those rows is a reviewed-data task and a
+  precondition for running those columns. Rows with a non-numeric id are
+  skipped as every other reviewed-TSV consumer does.
+
+### Fix round 2 — 2026-09-21
+
+- **MEDIUM** — `_connect_ro` built the `file:` URI without percent-encoding, so a
+  resource path containing `?`, `#` or `%` opened a truncated path read-write.
+  Connections now use `Path.as_uri()`.
+- **MEDIUM (design)** — degrading on every adapter exception could turn a
+  broken adapter into a "completed" run with zero external evidence and an
+  unchanged policy hash. Readiness is now decided once: `EvidenceCollector.build`
+  locates and probes every enabled resource (open + schema query) before the
+  policy is built, so an unreadable resource is absent in the policy and in its
+  hash; the constructor refuses a policy that claims an unreadable resource.
+  Per-token failures still degrade to one marker record but are counted per
+  source, and three consecutive failures of one source abort the run as a defect.
+  Located paths are carried from build to the collector (no re-locate).
+- **LOW** — an external locator can no longer claim `locator_kind="repository"`;
+  a failed Burns index build is cached; executing skill scripts no longer writes
+  bytecode into the skill package (see HARN-030 for the provenance side).
+- **Note** — `mode=ro` on a WAL-mode database still creates `-wal`/`-shm`
+  sidecars in the resource directory; the real resources use
+  `journal_mode=delete`. `immutable=1` was not adopted because the DULAT
+  application may write to its cache while a run reads it.

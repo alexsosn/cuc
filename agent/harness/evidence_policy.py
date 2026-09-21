@@ -287,7 +287,7 @@ def build_evidence_policy(
         locator_kind = "absent"
         if isinstance(located, tuple) and len(located) == 2:
             path, locator_kind = located
-            if locator_kind in LOCATOR_KINDS and locator_kind != "absent":
+            if locator_kind in LOCATOR_KINDS and locator_kind not in ("absent", "repository"):
                 digest = _safe_call(resource_digest_for, path)
         if digest is None:
             availability.append(ResourceAvailability(source_id, True, False, "absent", None))
