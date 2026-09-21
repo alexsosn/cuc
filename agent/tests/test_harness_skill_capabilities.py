@@ -90,10 +90,12 @@ class SkillCapabilityContractTest(unittest.TestCase):
                 "one-column-per-review-commit",
             }.issubset(set(manifest.scope_invariants))
         )
-        self.assertIn("dulat", manifest.required_evidence)
-        self.assertIn("tropper", manifest.required_evidence)
-        self.assertIn("burns-cultic-vocabulary", manifest.required_evidence)
-        self.assertEqual(manifest.optional_evidence, ())
+        # External sources are optional local modules (HARN-028); only the automatic
+        # parse itself is always available.
+        self.assertEqual(manifest.required_evidence, ("auto-parsing",))
+        self.assertIn("dulat", manifest.optional_evidence)
+        self.assertIn("tropper", manifest.optional_evidence)
+        self.assertIn("burns-cultic-vocabulary", manifest.optional_evidence)
         self.assertIn(
             "agent/prompts/Morphological_Labeling_Agent_Guide.md",
             manifest.authoritative_resources,

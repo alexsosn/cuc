@@ -155,6 +155,14 @@ Nothing here hardcodes a path: co-located checkouts are found automatically,
 and the modules database is chosen by content, so a cache without the EUPT
 layer cannot shadow a complete one.
 
+Every external source is an **optional local module**. DULAT, Tropper, EUPT,
+Burns and the rest live only on local machines and are never committed to any
+public repository; a source that cannot be located is recorded as absent and
+the review proceeds on what is available, saying so in the comment. Only the
+automatic parse itself is always present. The agent harness runs ablations over
+these sources, so which of them a run actually had is part of the run's identity
+and is never assumed.
+
 ## Review Each Token
 
 **Every token, in order.** Not the interesting ones, not the ones a tool
