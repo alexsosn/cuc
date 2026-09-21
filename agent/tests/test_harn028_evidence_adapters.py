@@ -169,8 +169,8 @@ def _token(loaded, token_id: str):
 
 
 def _collector(mod, loaded, enabled, locator):
-    policy = _policy_module().build_evidence_policy(enabled, locator)
-    return mod.EvidenceCollector(policy, loaded, locator=locator), policy
+    collector = mod.EvidenceCollector.build(enabled, loaded, locator=locator)
+    return collector, collector.policy
 
 
 # --- locator --------------------------------------------------------------------------
@@ -444,9 +444,10 @@ def test_absent_sqlite_resource_is_never_created_and_yields_nothing(tmp_path: Pa
 
 
 @pytest.mark.parametrize("breakage", ["junk-file", "missing-table", "missing-column"])
-def test_present_but_unreadable_resource_degrades_to_marker_record(
-    tmp_path: Path, breakage: str
-) -> None:
+def test_present_but_unreadable_resource_is_absent_in_the_policy(tmp_path: Path, breakage: str) -> None:
+    """A resource that cannot be read is detected once, at build time, and the policy
+    hash reflects it; it is never a per-token degradation."""
+
     mod = _adapters()
     loaded = _loaded(_repo(tmp_path))
     state = ColumnRunState.initial(loaded.task, loaded.snapshot)
@@ -462,19 +463,128 @@ def test_present_but_unreadable_resource_degrades_to_marker_record(
         con.commit()
         con.close()
     locator = mod.StaticLocator({"modules": (db, "explicit")})
-    collector, policy = _collector(mod, loaded, ("auto-parsing", "eupt"), locator)
-    assert policy.available_sources == ("auto-parsing", "eupt")
-    context = collector.initialize_skill_context(state, "run:init")
-    records = collector.collect_evidence(
-        state, _token(loaded, "1003"), context, "run:initial:1003:evidence"
+    collector = mod.EvidenceCollector.build(("auto-parsing", "eupt"), loaded, locator=locator)
+    assert collector.policy.absent_sources == ("eupt",)
+    healthy = mod.EvidenceCollector.build(
+        ("auto-parsing", "eupt"), loaded, locator=mod.StaticLocator({"modules": (_modules_db(tmp_path / "ok.sqlite"), "explicit")})
     )
-    eupt = [r for r in records if r.source_id == "eupt"]
-    assert len(eupt) == 1
-    assert eupt[0].source_ref.startswith("eupt:unreadable:")
-    assert "unreadable" in eupt[0].summary
-    # The failure is reported by exception type only; never a path.
-    assert str(tmp_path) not in eupt[0].summary and str(tmp_path) not in eupt[0].source_ref
-    assert collector.adapter_failures == {"eupt": eupt[0].source_ref.split(":")[-1]}
+    assert healthy.policy.sha256 != collector.policy.sha256
+    context = collector.initialize_skill_context(state, "run:init")
+    records = collector.collect_evidence(state, _token(loaded, "1003"), context, "run:initial:1003:evidence")
+    assert {r.source_id for r in records} == {"auto-parsing"}
+    assert context["evidence"]["absent_sources"] == ["eupt"]
+    assert str(tmp_path) not in json.dumps(context, ensure_ascii=False)
+
+
+def test_constructor_rejects_a_policy_that_claims_an_unreadable_resource(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    db = tmp_path / "modules_cache.sqlite"
+    db.write_bytes(b"not a database")
+    locator = mod.StaticLocator({"modules": (db, "explicit")})
+    policy = _policy_module().build_evidence_policy(("auto-parsing", "eupt"), locator)
+    assert policy.available_sources == ("auto-parsing", "eupt")
+    with pytest.raises(ValueError, match="unreadable|readiness"):
+        mod.EvidenceCollector(policy, loaded, locator=locator)
+
+
+def test_row_local_adapter_failures_degrade_but_repeated_failures_abort(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    db = _dulat_search_db(tmp_path / "dulat_search.sqlite")
+
+    class Flaky(mod.DulatAdapter):
+        failing_tokens = {"1001", "1002", "1003"}
+
+        def collect(self, ctx, resource):
+            if ctx.token.token_id in self.failing_tokens:
+                raise KeyError("row-local problem")
+            return super().collect(ctx, resource)
+
+    factories = {"dulat": Flaky}
+    collector = mod.EvidenceCollector.build(
+        ("auto-parsing", "dulat"), loaded, locator=mod.StaticLocator({"dulat_search": (db, "explicit")}),
+        adapter_factories=factories,
+    )
+    context = collector.initialize_skill_context(state, "run:init")
+    # First two failures degrade to a marker record and are counted.
+    first = collector.collect_evidence(state, _token(loaded, "1001"), context, "run:initial:1001:evidence")
+    markers = [r for r in first if r.source_id == "dulat"]
+    assert len(markers) == 1 and markers[0].source_ref == "dulat:unreadable:KeyError"
+    assert "row-local" not in markers[0].summary
+    collector.collect_evidence(state, _token(loaded, "1002"), context, "run:initial:1002:evidence")
+    assert collector.adapter_failures["dulat"] == {"count": 2, "consecutive": 2, "last_error_type": "KeyError"}
+    # The third consecutive failure of one source is a defect, not data: abort.
+    with pytest.raises(RuntimeError, match="dulat.*3 consecutive|consecutive.*dulat"):
+        collector.collect_evidence(state, _token(loaded, "1003"), context, "run:initial:1003:evidence")
+
+
+def test_a_success_resets_the_consecutive_failure_count(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    db = _dulat_search_db(tmp_path / "dulat_search.sqlite")
+
+    class Flaky(mod.DulatAdapter):
+        def collect(self, ctx, resource):
+            if ctx.token.token_id != "1003":
+                raise ValueError("row-local")
+            return super().collect(ctx, resource)
+
+    collector = mod.EvidenceCollector.build(
+        ("auto-parsing", "dulat"), loaded, locator=mod.StaticLocator({"dulat_search": (db, "explicit")}),
+        adapter_factories={"dulat": Flaky},
+    )
+    context = collector.initialize_skill_context(state, "run:init")
+    collector.collect_evidence(state, _token(loaded, "1001"), context, "a")
+    collector.collect_evidence(state, _token(loaded, "1003"), context, "b")  # succeeds
+    collector.collect_evidence(state, _token(loaded, "1002"), context, "c")
+    assert collector.adapter_failures["dulat"] == {"count": 2, "consecutive": 1, "last_error_type": "ValueError"}
+
+
+def test_collector_reads_the_resource_the_policy_digested(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    good = _dulat_search_db(tmp_path / "dulat_search.sqlite")
+    other = _dulat_search_db(tmp_path / "other.sqlite")
+
+    class Shifty:
+        def __init__(self):
+            self.calls = 0
+
+        def locate(self, kind):
+            self.calls += 1
+            if kind != "dulat_search":
+                return None
+            return (good, "explicit") if self.calls == 1 else (other, "explicit")
+
+    collector = mod.EvidenceCollector.build(("auto-parsing", "dulat"), loaded, locator=Shifty())
+    context = collector.initialize_skill_context(state, "run:init")
+    records = collector.collect_evidence(state, _token(loaded, "1003"), context, "run:initial:1003:evidence")
+    assert collector.resource_paths["dulat"] == good
+    assert any(r.source_id == "dulat" for r in records)
+
+
+def test_connect_ro_handles_uri_special_characters_without_creating_files(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    ctx = mod.TokenEvidenceContext(loaded, state, _token(loaded, "1003"), "op-u")
+    for name in ("q?mode=rwc#frag.sqlite", "a#b.sqlite", "p%41.sqlite", "with space.sqlite"):
+        db = _dulat_search_db(tmp_path / name)
+        before = set(p.name for p in tmp_path.iterdir())
+        records = mod.DulatAdapter().collect(ctx, db)
+        assert len(records) == 2, name
+        assert set(p.name for p in tmp_path.iterdir()) == before, name
+
+
+def test_external_locator_cannot_claim_repository_kind(tmp_path: Path) -> None:
+    mod = _adapters()
+    db = _dulat_search_db(tmp_path / "dulat_search.sqlite")
+    policy = mod.build_policy(("auto-parsing", "dulat"), mod.StaticLocator({"dulat_search": (db, "repository")}))
+    assert policy.absent_sources == ("dulat",)
 
 
 def test_static_locator_treats_missing_explicit_path_as_absent(tmp_path: Path) -> None:
@@ -572,3 +682,47 @@ def test_corpus_parallels_exclude_the_column_under_review(tmp_path: Path) -> Non
     # Another column-I token's reviewed row must not be evidence for column I.
     b_records = adapter.collect(mod.TokenEvidenceContext(loaded, state, _token(loaded, "1003"), "op-q"), None)
     assert not any(":1002" in r.source_ref for r in b_records)
+
+
+def test_intermittent_failures_abort_once_they_exceed_a_share_of_the_column(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    db = _dulat_search_db(tmp_path / "dulat_search.sqlite")
+
+    class EveryOther(mod.DulatAdapter):
+        calls = 0
+
+        def collect(self, ctx, resource):
+            EveryOther.calls += 1
+            if EveryOther.calls % 2:
+                raise ValueError("flaky")
+            return super().collect(ctx, resource)
+
+    collector = mod.EvidenceCollector.build(
+        ("auto-parsing", "dulat"), loaded, locator=mod.StaticLocator({"dulat_search": (db, "explicit")}),
+        adapter_factories={"dulat": EveryOther}, max_failure_share=0.25,
+    )
+    context = collector.initialize_skill_context(state, "run:init")
+    # Alternating failures never trip the consecutive rule; the share rule (floor 2)
+    # aborts on the third failure of this 3-token column.
+    collector.collect_evidence(state, _token(loaded, "1001"), context, "a")  # fail 1
+    collector.collect_evidence(state, _token(loaded, "1002"), context, "b")  # ok
+    collector.collect_evidence(state, _token(loaded, "1003"), context, "c")  # fail 2
+    collector.collect_evidence(state, _token(loaded, "1001"), context, "d")  # ok
+    with pytest.raises(RuntimeError, match="share|of the column"):
+        collector.collect_evidence(state, _token(loaded, "1002"), context, "e")  # fail 3
+
+
+def test_constructor_cross_checks_carried_paths_against_the_policy_digest(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    good = _dulat_search_db(tmp_path / "dulat_search.sqlite")
+    other = _dulat_search_db(tmp_path / "other.sqlite")
+    con = sqlite3.connect(other)
+    con.execute("INSERT INTO dulat_reverse_refs VALUES ('KTU 9.9 I:9', 1, '{}')")
+    con.commit(); con.close()
+    locator = mod.StaticLocator({"dulat_search": (good, "explicit")})
+    policy = mod.build_policy(("auto-parsing", "dulat"), locator)
+    with pytest.raises(ValueError, match="digest"):
+        mod.EvidenceCollector(policy, loaded, locator=locator, resource_paths={"dulat": other})
