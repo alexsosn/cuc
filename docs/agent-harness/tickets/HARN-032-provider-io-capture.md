@@ -45,3 +45,20 @@ export CUC_LANGFUSE_CAPTURE_IO=1
 Do not set the flag when `LANGFUSE_BASE_URL` points anywhere but this machine;
 the sidecar refuses anyway, but the intent is that licensed evidence text and
 model prompts never leave the machine.
+
+## Adversarial review — 2026-09-21
+
+APPROVE; hardening applied in the same PR:
+
+- the wrapper itself drops the `provider_io` source unless `sidecar.capture_io`
+  is true, so no duck-typed sidecar can receive wire text without the opt-in;
+- `capture_io` is a read-only property derived from the flag and the base URL;
+- `*.localhost` is no longer treated as loopback (RFC 6761 is not implemented
+  by macOS/glibc resolvers); exact `localhost` / `127.0.0.1` / `::1` only;
+- `_is_loopback` never raises on a malformed URL; capture bookkeeping never
+  changes what a provider call raises or returns.
+
+Noted: the capture list is unbounded in memory (~1.7 MB for a 300-token column
+at real body sizes); no artifact serialises it. A runner should create the
+capture only when `sidecar.capture_io` is true. If `TYPESAFE_BASE_URL` ever
+carried credentials they would appear in the recorded `url`; headers never do.

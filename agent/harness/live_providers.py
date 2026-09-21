@@ -372,12 +372,20 @@ class _EnvironmentCredentialClient:
         try:
             result = self._transport(url, headers, body, timeout_seconds)
         except BaseException as exc:
-            if self.capture is not None:
-                self.capture.record(self._current_operation, url, body, None, type(exc).__name__)
+            self._record_exchange(url, body, None, type(exc).__name__)
             raise
-        if self.capture is not None:
-            self.capture.record(self._current_operation, url, body, result, None)
+        self._record_exchange(url, body, result if isinstance(result, Mapping) else None, None)
         return result
+
+    def _record_exchange(self, url, body, response, error_type) -> None:
+        """Capture bookkeeping never changes what the provider call raises or returns."""
+
+        if self.capture is None:
+            return
+        try:
+            self.capture.record(self._current_operation, url, body, response, error_type)
+        except Exception:
+            pass
 
     def _api_key(self) -> str:
         value = os.environ.get(self._api_key_env)

@@ -161,3 +161,62 @@ def test_capture_never_forwards_the_decision_or_evidence_text_itself() -> None:
     wrapped.adjudicate(state, state.snapshot.tokens[0], (), ("worklist",), "run-1:initial:t1:adjudicate", None)
     flat = json.dumps(client.observation_calls[-1], ensure_ascii=False, default=str)
     assert "secret summary" not in flat and "secret decision" not in flat
+
+
+# --- review findings (2026-09-21) ---------------------------------------------------------
+
+
+def test_wrapper_never_attaches_io_unless_the_sidecar_allows_capture() -> None:
+    """The loopback gate must hold for any sidecar, not only LangfuseSidecar."""
+
+    api = _sidecar_api()
+
+    class Recording:
+        enabled = True
+        capture_io = False
+        projections = []
+
+        def emit_observation(self, projection):
+            self.projections.append(projection)
+            return api.TelemetryOutcome(True, True)
+
+    sidecar = Recording()
+    calls, io = [], []
+    wrapped = _wrapped(FakeClient(), sidecar, calls, io)
+    state = _column_state()
+    wrapped.adjudicate(state, state.snapshot.tokens[0], (), ("worklist",), "run-1:initial:t1:adjudicate", None)
+    projection = sidecar.projections[-1]
+    assert projection.input is None and projection.output is None
+
+
+def test_capture_io_is_derived_and_cannot_be_flipped_after_construction() -> None:
+    api = _sidecar_api()
+    sidecar = api.LangfuseSidecar(enabled=True, public_key="pk", secret_key="sk", base_url="https://cloud.langfuse.com", capture_io=True)
+    assert sidecar.capture_io is False
+    with pytest.raises(AttributeError):
+        sidecar.capture_io = True  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("url", ["http://evil.localhost:3000", "http://a.b.localhost", "http://[::1", "http://", "   "])
+def test_loopback_gate_rejects_subdomains_and_never_raises(url) -> None:
+    api = _sidecar_api()
+    env = {"CUC_LANGFUSE_ENABLED": "1", "LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk",
+           "LANGFUSE_BASE_URL": url, "CUC_LANGFUSE_CAPTURE_IO": "1"}
+    sidecar = api.LangfuseSidecar.from_environment(env=env, client_factory=lambda **_: FakeClient())
+    assert sidecar.capture_io is False
+
+
+def test_capture_bookkeeping_never_changes_the_provider_exception(monkeypatch) -> None:
+    live, jev = _live(), _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    capture = live.ProviderIOCapture()
+
+    def transport(url, headers, body, timeout):
+        return "not a mapping"  # an injected transport misbehaving
+
+    client = jev.TypeSafeJevClient(api_key_env=KEY_ENV, http_json=transport, capture=capture)
+    with pytest.raises(Exception) as excinfo:
+        client.generate_json(_request(_adjudicate_payload()), 5.0)
+    # Whatever the client raises for a non-mapping result, it is not the capture's error.
+    assert "capture" not in str(excinfo.value).lower()
+    assert len(capture.records) == 1 and capture.records[0].response is None

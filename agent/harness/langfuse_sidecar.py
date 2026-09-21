@@ -45,13 +45,21 @@ def _flag(value: object, *, default: bool = False) -> bool:
     return default
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
 def _is_loopback(base_url: str | None) -> bool:
+    """Exact loopback hosts only; ``*.localhost`` is not loopback on macOS/glibc."""
+
     if not isinstance(base_url, str) or not base_url.strip():
         return False
     from urllib.parse import urlsplit
 
-    host = (urlsplit(base_url.strip()).hostname or "").lower()
-    return host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".localhost")
+    try:
+        host = (urlsplit(base_url.strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in _LOOPBACK_HOSTS
 
 
 def _safe_failure(enabled: bool, exc: BaseException) -> TelemetryOutcome:
@@ -225,7 +233,13 @@ class LangfuseSidecar:
         self._client_instance: Any | None = None
         # HARN-032: prompt/response capture is allowed only towards a loopback backend;
         # the SDK's default host is the cloud, so an unset base URL never qualifies.
-        self.capture_io = bool(capture_io) and _is_loopback(base_url)
+        self._capture_io_requested = bool(capture_io)
+
+    @property
+    def capture_io(self) -> bool:
+        """Derived, never assignable: the opt-in flag and a loopback base URL."""
+
+        return self._capture_io_requested and _is_loopback(self._base_url)
 
     @classmethod
     def from_environment(
@@ -494,6 +508,10 @@ def wrap_column_review_adapters(
     if provider_io is not None and not callable(provider_io):
         raise ValueError("provider_io must be callable")
     provider_type = "generation" if provider_calls is not None else None
+    # The loopback gate is enforced here as well as in the sidecar, so no duck-typed
+    # sidecar can receive wire text without having opted in.
+    if not bool(getattr(sidecar, "capture_io", False)):
+        provider_io = None
 
     def initialize_skill_context(state, operation_id):
         try:
