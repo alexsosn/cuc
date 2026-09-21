@@ -227,7 +227,8 @@ def test_state_never_carries_gold_or_paths(monkeypatch) -> None:
 def test_confident_choice_yields_single_analysis_with_structured_row(monkeypatch) -> None:
     mod = _jev()
     monkeypatch.setenv(KEY_ENV, "sk-test")
-    transport = Transport(probabilities_by_analysis={"ġr(III)/": 0.92, "ġr(I)/": 0.06, "ġr(II)/": 0.02})
+    # Two option rows share ġr(I)/ (auto + parallel POS variant): 0.90 + 0.04 + 0.04 + 0.02 = 1.
+    transport = Transport(probabilities_by_analysis={"ġr(III)/": 0.90, "ġr(I)/": 0.04, "ġr(II)/": 0.02})
     response = _client(mod, transport).generate_json(_request(_adjudicate_payload()), 5.0)
 
     assert response.model == "jev-1.13.0"
@@ -240,7 +241,7 @@ def test_confident_choice_yields_single_analysis_with_structured_row(monkeypatch
         {"morphological_parsing": "ġr(III)/", "dulat": "ġr (III)", "pos": "n. m. sg. abs. acc.", "gloss": "skin", "comments": ""}
     ]
     assert payload["jev"]["confidence"] == 0.8
-    assert "0.92" in payload["summary"]
+    assert "p=0.90" in payload["summary"]
 
 
 def test_spread_probabilities_keep_alternatives_in_probability_order(monkeypatch) -> None:
@@ -450,7 +451,7 @@ def test_jev_binding_completes_a_column_through_the_live_runtime(monkeypatch) ->
     assert trial.terminal_status == "completed"
     # Two adjudications + one reconciliation request.
     assert len(transport.calls) == 3
-    final = result.benchmark.trials[0].final_state
+    final = result.benchmark.results[0].final_state
     assert final.completion is not None
     assert final.latest_decision("1003").analyses == ("ġr(III)/",)
     # Redacted artifacts: no state text, no gold.
@@ -474,3 +475,56 @@ def test_model_drift_is_rejected_by_the_runtime(monkeypatch) -> None:
     assert result.complete is False
     assert result.provider_trials[0].terminal_status != "completed"
     assert any(call.error_type == "ProviderModelIdentityError" for call in result.provider_trials[0].calls)
+
+
+# --- estimated preflight counts (HARN-022 ledger extension) ------------------------------------
+
+
+def test_jev_client_declares_an_estimated_token_count() -> None:
+    mod = _jev()
+    client = mod.TypeSafeJevClient(api_key_env=KEY_ENV, http_json=Transport(probabilities_by_analysis={}))
+    assert client.input_token_count_kind == "estimate"
+
+
+def test_estimated_preflight_overrun_trips_the_budget_after_the_call(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+
+    class BigUsage(Transport):
+        def __call__(self, url, headers, body, timeout_seconds):
+            result = super().__call__(url, headers, body, timeout_seconds)
+            result["usage"] = {"input_tokens": 5_000, "output_tokens": 0}
+            return result
+
+    transport = BigUsage(probabilities_by_analysis={"l(I)": 1.0, "ġr(III)/": 1.0})
+    client = _client(mod, transport)
+    spec = BenchmarkBackendSpec("jev", "typesafe", "jev-latest", "jev-1.13.0", SHA0)
+    binding = mod.jev_binding(spec, requested_model="jev-latest", exact_model_version="jev-1.13.0", client=client,
+                              exact_version_provenance="docs")
+    case = BenchmarkCase(1, "harn029-case", _state(), SHA0, SHA0, SHA0,
+                         EvaluationTarget("t", GOLD_REF, "gold-provenance", "scorer", "scorer-provenance", SHA0))
+    # Trial input budget of 6_000: the first call's real usage (5_000) fits, the second overruns.
+    budget = ProviderBudgetPolicy(16, 32, 6_000, 40_000, 1_000, 2_000, 64, 1, 10.0)
+    result = run_live_benchmark(case, (binding,), shared_adapters=_shared(),
+                                execution_policy=ProviderExecutionPolicy(budget=budget, allow_paid_live_execution=True))
+    trial = result.provider_trials[0]
+    assert result.complete is False
+    assert trial.budget_exhausted is True
+    assert trial.input_tokens == 10_000  # actual usage is what the ledger records, not the estimate
+    assert trial.input_token_count_kind == "estimate"
+    assert len(transport.calls) == 2
+    assert any(call.error_type == "ProviderBudgetExceeded" for call in trial.calls)
+
+
+def test_exact_clients_keep_the_strict_preflight_check(monkeypatch) -> None:
+    """The existing OpenAI/Anthropic behaviour is unchanged: a mismatch is a permanent error."""
+
+    from harness.live_providers import _BudgetLedger, _Reservation
+
+    ledger = _BudgetLedger(ProviderBudgetPolicy(16, 32, 6_000, 40_000, 1_000, 2_000, 64, 1, 10.0))
+    reservation = ledger.reserve("run", 100)
+    from harness.live_providers import ProviderResponse, ProviderUsage
+    with pytest.raises(ProviderPermanentError, match="preflight"):
+        ledger.settle(reservation, ProviderResponse(model="m", payload={}, usage=ProviderUsage(101, 0)))
+    ledger.settle(_Reservation("run", 100, reservation.output_tokens), ProviderResponse(model="m", payload={}, usage=ProviderUsage(150, 0)), estimated=True)
+    assert ledger.trial("run").input_tokens == 150
