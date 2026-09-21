@@ -497,7 +497,9 @@ def test_estimated_preflight_overrun_trips_the_budget_after_the_call(monkeypatch
             return result
 
     transport = BigUsage(probabilities_by_analysis={"l(I)": 1.0, "ġr(III)/": 1.0})
-    client = _client(mod, transport)
+    # A deliberately optimistic estimator so the reserve check passes and the
+    # overrun is only discovered from the usage the provider reports.
+    client = _client(mod, transport, bytes_per_token=100.0)
     spec = BenchmarkBackendSpec("jev", "typesafe", "jev-latest", "jev-1.13.0", SHA0)
     binding = mod.jev_binding(spec, requested_model="jev-latest", exact_model_version="jev-1.13.0", client=client,
                               exact_version_provenance="docs")
@@ -528,3 +530,133 @@ def test_exact_clients_keep_the_strict_preflight_check(monkeypatch) -> None:
         ledger.settle(reservation, ProviderResponse(model="m", payload={}, usage=ProviderUsage(101, 0)))
     ledger.settle(_Reservation("run", 100, reservation.output_tokens), ProviderResponse(model="m", payload={}, usage=ProviderUsage(150, 0)), estimated=True)
     assert ledger.trial("run").input_tokens == 150
+
+
+# --- review findings (2026-09-21) ---------------------------------------------------------------
+
+
+def test_empty_analysis_auto_rows_become_unresolved_candidates_and_no_candidates_never_calls(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    # Real auto_parsing rows exist with an empty analysis but a DULAT/POS/gloss.
+    evidence = [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "auto:1", "p", _row("", "-n (IV)", "vb", "him/her/it")).to_dict(),
+                EvidenceRecord("op:dulat:1", "dulat", "d:1", "p", "{}").to_dict()]
+    transport = Transport(probabilities_by_analysis={"?": 1.0})
+    payload = _client(mod, transport).generate_json(_request(_adjudicate_payload(evidence=evidence)), 5.0).payload
+    assert payload["analyses"] == ["?"]
+    assert payload["reviewed_rows"][0]["dulat"] == "-n (IV)" and payload["reviewed_rows"][0]["pos"] == "vb"
+    assert payload["evidence_ids"] == ["op:auto-parsing:1"]
+
+    only_context = [EvidenceRecord("op:dulat:1", "dulat", "d:1", "p", "{}").to_dict()]
+    transport = Transport(probabilities_by_analysis={})
+    with pytest.raises(ProviderPermanentError, match="candidate"):
+        _client(mod, transport).generate_json(_request(_adjudicate_payload(evidence=only_context)), 5.0)
+    assert transport.calls == []
+
+
+def test_malformed_candidate_evidence_is_skipped_not_iterated(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    evidence = _evidence()
+    evidence.append(EvidenceRecord("op:legacy-review:2", "legacy-review", "l:2", "p", json.dumps({"analyses": "ab/"})).to_dict())
+    evidence.append(EvidenceRecord("op:legacy-review:3", "legacy-review", "l:3", "p", json.dumps({"analyses": 5})).to_dict())
+    evidence.append(EvidenceRecord("op:corpus-parallels:9", "corpus-parallels", "c:9", "p",
+                                   json.dumps({"morphological_parsing": "bad\tone/", "dulat": "x", "pos": "n.", "gloss": "g"})).to_dict())
+    evidence.append(EvidenceRecord("op:corpus-parallels:10", "corpus-parallels", "c:10", "p",
+                                   json.dumps({"morphological_parsing": "seeded/", "dulat": "x", "pos": "n.", "gloss": "SEEDED from auto-parse"})).to_dict())
+    evidence.append(EvidenceRecord("op:corpus-parallels:11", "corpus-parallels", "c:11", "p",
+                                   json.dumps({"morphological_parsing": "neg/", "dulat": "x", "pos": "n.", "gloss": "g", "attestations": -5})).to_dict())
+    transport = Transport(probabilities_by_analysis={"ġr(III)/": 1.0})
+    _client(mod, transport).generate_json(_request(_adjudicate_payload(evidence=evidence)), 5.0)
+    criteria = transport.calls[0][2]["questions"]["reading"]["criteria"]
+    analyses = [d.get("morphological_parsing") for d in criteria.values() if isinstance(d, dict)]
+    assert "a" not in analyses and "b" not in analyses and "/" not in analyses
+    assert not any("\t" in (a or "") for a in analyses)
+    assert "seeded/" not in analyses
+    neg = next(d for d in criteria.values() if isinstance(d, dict) and d.get("morphological_parsing") == "neg/")
+    assert "reviewed_attestations_elsewhere" not in neg
+
+
+def test_skill_context_is_whitelisted_per_key(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    transport = Transport(probabilities_by_analysis={"ġr(III)/": 1.0})
+    ctx = {"scope": {"tablet": "KTU 9.9", "root": "/Users/x/repo"}, "worklist": {"priority_token_ids": ["1003"], "file": "/Users/x/w.json"},
+           "evidence": {"absent_sources": [], "availability": [{"path": "/Users/x"}]}}
+    _client(mod, transport).generate_json(_request(_adjudicate_payload(skill_context=ctx)), 5.0)
+    encoded = json.dumps(transport.calls[0][2], ensure_ascii=False)
+    assert "/Users/x" not in encoded
+    assert transport.calls[0][2]["state"]["review_context"]["worklist"]["priority_token_ids"] == ["1003"]
+
+
+def test_choice_without_probability_is_a_permanent_error(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    inner = Transport(probabilities_by_analysis={"ġr(III)/": 1.0})
+
+    def transport(url, headers, body, timeout):
+        result = json.loads(json.dumps(inner(url, headers, body, timeout)))
+        reading = result["answers"]["reading"]
+        other = next(k for k in reading["probabilities"] if k != reading["choice"] and k != "none-of-these")
+        reading["probabilities"] = {reading["choice"]: 1.0}
+        reading["choice"] = other
+        return result
+
+    with pytest.raises(ProviderPermanentError, match="probabilit"):
+        _client(mod, transport).generate_json(_request(_adjudicate_payload()), 5.0)
+
+
+def test_reconcile_without_decisions_makes_no_call(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    transport = Transport(probabilities_by_analysis={})
+    payload = _reconcile_payload()
+    payload["decisions"] = []
+    response = _client(mod, transport).generate_json(_request(payload, operation="reconcile"), 5.0)
+    assert response.payload == {"findings": []}
+    assert transport.calls == []
+
+
+def test_reconcile_batches_questions_and_merges_findings(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    from harness.column_state import ColumnSnapshot, ColumnToken
+    tokens = tuple(ColumnToken(str(1000 + i), i + 1, "I:1", f"s{i}") for i in range(5))
+    state = _state()
+    snapshot = ColumnSnapshot("s", "f", "p", tokens).to_dict()
+    decisions = [{"decision_id": f"d{i}", "token_id": t.token_id, "analyses": ["x/"], "evidence_ids": [f"e{i}"], "summary": "s", "revisit_of": None, "revisit_request_id": None} for i, t in enumerate(tokens)]
+    payload = {"model_context": {"run_id": "r"}, "task": state.task.to_dict(), "snapshot": snapshot, "evidence": [], "decisions": decisions, "skill_context": {}}
+    transport = Transport(probabilities_by_analysis={}, noul_by_token={"1000": 0.9, "1004": 0.9})
+    client = _client(mod, transport, decision_policy=mod.JevDecisionPolicy(reconcile_batch_size=2))
+    response = client.generate_json(_request(payload, operation="reconcile"), 5.0)
+    assert len(transport.calls) == 3
+    assert [len(c[2]["questions"]) for c in transport.calls] == [2, 2, 1]
+    assert sorted(f["token_ids"][0] for f in response.payload["findings"]) == ["1000", "1004"]
+    # usage is summed across batches
+    assert response.usage.input_tokens == 3 * 120
+
+
+def test_estimated_clients_reconcile_output_against_budgets_not_the_per_request_ceiling(monkeypatch) -> None:
+    """Jev has no output limit parameter and output is not billable: actual output is
+    recorded against the trial/benchmark output budgets instead of failing on the
+    per-request reservation (real KTU 1.6 I reconcile returned 7,479 output tokens)."""
+
+    from harness.live_providers import (
+        ProviderBudgetExceeded,
+        ProviderResponse,
+        ProviderUsage,
+        _BudgetLedger,
+    )
+
+    ledger = _BudgetLedger(ProviderBudgetPolicy(16, 32, 100_000, 200_000, 8_000, 16_000, 512, 1, 10.0))
+    reservation = ledger.reserve("run", 1000)
+    ledger.settle(reservation, ProviderResponse(model="m", payload={}, usage=ProviderUsage(1000, 7_479)), estimated=True)
+    assert ledger.trial("run").output_tokens_reserved == 7_479
+    reservation = ledger.reserve("run", 1000)
+    with pytest.raises(ProviderBudgetExceeded):
+        ledger.settle(reservation, ProviderResponse(model="m", payload={}, usage=ProviderUsage(1000, 1_000)), estimated=True)
+    # exact clients keep the strict ceiling
+    exact = _BudgetLedger(ProviderBudgetPolicy(16, 32, 100_000, 200_000, 8_000, 16_000, 512, 1, 10.0))
+    reservation = exact.reserve("run", 1000)
+    with pytest.raises(ProviderPermanentError, match="ceiling"):
+        exact.settle(reservation, ProviderResponse(model="m", payload={}, usage=ProviderUsage(1000, 600)))

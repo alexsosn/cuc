@@ -40,8 +40,11 @@ UNRESOLVED = "?"
 _CANDIDATE_SOURCES = ("auto-parsing", "corpus-parallels", "legacy-review")
 _ROW_FIELDS = ("morphological_parsing", "dulat", "pos", "gloss", "comments")
 # Keys of the skill context that may reach the model; evaluation or path-like data never does.
-_SKILL_CONTEXT_KEYS = ("scope", "worklist", "evidence")
-_SKILL_EVIDENCE_KEYS = ("enabled_sources", "available_sources", "absent_sources")
+_SKILL_CONTEXT_KEYS: Mapping[str, tuple[str, ...]] = {
+    "scope": ("tablet", "column", "token_count", "every_token_in_order", "worklists_are_attention_only"),
+    "worklist": ("priority_token_ids",),
+    "evidence": ("enabled_sources", "available_sources", "absent_sources"),
+}
 
 _READING_INSTRUCTIONS = (
     "You are reviewing one token of a Ugaritic tablet column, in order, as a "
@@ -81,6 +84,7 @@ class JevDecisionPolicy:
     revisit_threshold: float = 0.7
     finding_threshold: float = 0.5
     max_candidates: int = 64
+    reconcile_batch_size: int = 150
 
     def __post_init__(self) -> None:
         for field in (
@@ -97,6 +101,8 @@ class JevDecisionPolicy:
             raise ValueError("finding_threshold must not exceed revisit_threshold")
         if isinstance(self.max_candidates, bool) or not isinstance(self.max_candidates, int) or not 1 <= self.max_candidates <= 254:
             raise ValueError("max_candidates must be between 1 and 254 (Jev allows 255 options)")
+        if isinstance(self.reconcile_batch_size, bool) or not isinstance(self.reconcile_batch_size, int) or self.reconcile_batch_size < 1:
+            raise ValueError("reconcile_batch_size must be a positive integer")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -106,6 +112,7 @@ class JevDecisionPolicy:
             "revisit_threshold": self.revisit_threshold,
             "finding_threshold": self.finding_threshold,
             "max_candidates": self.max_candidates,
+            "reconcile_batch_size": self.reconcile_batch_size,
         }
 
 
@@ -124,6 +131,17 @@ class Candidate:
 
 def _text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+_SEED_MARKER = "SEEDED from auto-parse"
+
+
+def _curated_field_ok(value: str) -> bool:
+    """A candidate field must be representable as a HARN-027 curated TSV field."""
+
+    if "\t" in value or (value and value.splitlines() != [value]):
+        return False
+    return _SEED_MARKER not in value
 
 
 def _parse_summary(summary: object) -> Mapping[str, Any] | None:
@@ -167,9 +185,12 @@ def extract_candidates(
         if data is None:
             continue
         if source == "legacy-review":
-            for analysis in data.get("analyses") or ():
+            analyses = data.get("analyses")
+            if not isinstance(analyses, list):
+                continue
+            for analysis in analyses:
                 analysis = _text(analysis)
-                if analysis:
+                if analysis and _curated_field_ok(analysis):
                     add(
                         {
                             "morphological_parsing": analysis,
@@ -183,18 +204,22 @@ def extract_candidates(
                         0,
                     )
             continue
-        analysis = _text(data.get("morphological_parsing"))
-        if not analysis:
-            continue
         row = {
-            "morphological_parsing": analysis,
+            "morphological_parsing": _text(data.get("morphological_parsing")) or UNRESOLVED,
             "dulat": _text(data.get("dulat")),
             "pos": _text(data.get("pos")),
             "gloss": _text(data.get("gloss")),
             "comments": "",
         }
+        if not (row["dulat"] or row["pos"] or row["gloss"]) and row["morphological_parsing"] == UNRESOLVED:
+            continue
+        if not all(_curated_field_ok(value) for value in row.values()):
+            # Control characters or workflow markers can never become curated rows.
+            continue
         attestations = data.get("attestations")
-        add(row, evidence_id, source, attestations if isinstance(attestations, int) and not isinstance(attestations, bool) else 0)
+        if isinstance(attestations, bool) or not isinstance(attestations, int) or attestations < 0:
+            attestations = 0
+        add(row, evidence_id, source, attestations)
 
     if len(order) > max_candidates:
         raise ProviderPermanentError(
@@ -229,17 +254,18 @@ def _option_description(candidate: Candidate) -> dict[str, object]:
 
 
 def _safe_skill_context(skill_context: object) -> dict[str, object]:
+    """Whitelist the review context per key; nothing path-like or evaluative can pass."""
+
     if not isinstance(skill_context, Mapping):
         return {}
     safe: dict[str, object] = {}
-    for key in _SKILL_CONTEXT_KEYS:
+    for key, allowed in _SKILL_CONTEXT_KEYS.items():
         value = skill_context.get(key)
         if not isinstance(value, Mapping):
             continue
-        if key == "evidence":
-            safe[key] = {k: value[k] for k in _SKILL_EVIDENCE_KEYS if k in value}
-        else:
-            safe[key] = dict(value)
+        picked = {k: value[k] for k in allowed if k in value}
+        if picked:
+            safe[key] = picked
     return safe
 
 
@@ -285,7 +311,7 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         http_json: HttpJSON = _default_http_json,
         base_url: str = DEFAULT_BASE_URL,
         decision_policy: JevDecisionPolicy | None = None,
-        bytes_per_token: float = 3.0,
+        bytes_per_token: float = 1.5,
     ) -> None:
         super().__init__(api_key_env=api_key_env, http_json=http_json, base_url=base_url)
         self.decision_policy = decision_policy or JevDecisionPolicy()
@@ -309,6 +335,10 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         if not isinstance(evidence, list):
             raise ProviderPermanentError("adjudicate payload lacks evidence")
         candidates = extract_candidates(evidence, max_candidates=self.decision_policy.max_candidates)
+        if not candidates:
+            raise ProviderPermanentError(
+                "no candidate readings for this token; the closed-choice backend needs at least one"
+            )
         criteria: dict[str, object] = {c.key: _option_description(c) for c in candidates}
         criteria[NONE_OF_THESE] = {
             "what": "No listed reading is defensible for this token in this context.",
@@ -394,7 +424,12 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
     # --- protocol ------------------------------------------------------------------------
 
     def count_input_tokens(self, request: ProviderJSONRequest, timeout_seconds: float) -> int:
-        """Conservative estimate: Jev has no count endpoint; the response carries real usage."""
+        """Conservative estimate: Jev has no count endpoint; the response carries real usage.
+
+        Measured 2026-09-21 on KTU 1.6 I: 13,087 reported input tokens for a 20 KB
+        adjudicate body, i.e. ~1.55 bytes per token (transliteration is diacritic-heavy),
+        hence the 1.5 default.
+        """
 
         encoded = json.dumps(self._body(request), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return max(1, math.ceil(len(encoded) / self._bytes_per_token))
@@ -403,16 +438,54 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         if request.operation == "adjudicate":
             body, candidates = self._adjudicate_body(request)
             result = self._http_json(f"{self._base_url}/systemone", self._headers(), body, timeout_seconds)
-            payload = self._adjudicate_payload(result, candidates)
-        else:
-            body, latest = self._reconcile_body(request)
-            result = self._http_json(f"{self._base_url}/systemone", self._headers(), body, timeout_seconds)
-            payload = self._reconcile_payload(result, latest)
+            return ProviderResponse(
+                model=_required(result.get("model"), "model"),
+                payload=self._adjudicate_payload(result, candidates),
+                usage=_usage(result.get("usage")),
+                request_id=_optional_text(result.get("id")),
+            )
+        return self._reconcile(request, timeout_seconds)
+
+    def _reconcile(self, request: ProviderJSONRequest, timeout_seconds: float) -> ProviderResponse:
+        """One noul per token, sent in batches; findings and usage are merged."""
+
+        body, latest = self._reconcile_body(request)
+        if not latest:
+            return ProviderResponse(
+                model=request.requested_model,
+                payload={"findings": []},
+                usage=ProviderUsage(0, 0),
+                request_id=None,
+            )
+        questions = body["questions"]
+        keys = list(questions)
+        size = self.decision_policy.reconcile_batch_size
+        findings: list[dict[str, object]] = []
+        input_tokens = output_tokens = 0
+        model: str | None = None
+        request_ids: list[str] = []
+        for start in range(0, len(keys), size):
+            batch_keys = keys[start : start + size]
+            batch_body = dict(body)
+            batch_body["questions"] = {key: questions[key] for key in batch_keys}
+            result = self._http_json(f"{self._base_url}/systemone", self._headers(), batch_body, timeout_seconds)
+            batch_model = _required(result.get("model"), "model")
+            if model is not None and batch_model != model:
+                raise ProviderPermanentError("Jev reconcile batches were answered by different models")
+            model = batch_model
+            usage = _usage(result.get("usage"))
+            input_tokens += usage.input_tokens
+            output_tokens += usage.output_tokens
+            request_id = _optional_text(result.get("id"))
+            if request_id:
+                request_ids.append(request_id)
+            batch_latest = {token_id: latest[token_id] for token_id in (k.split(":", 1)[1] for k in batch_keys)}
+            findings.extend(self._reconcile_payload(result, batch_latest)["findings"])
         return ProviderResponse(
-            model=_required(result.get("model"), "model"),
-            payload=payload,
-            usage=_usage(result.get("usage")),
-            request_id=_optional_text(result.get("id")),
+            model=model or request.requested_model,
+            payload={"findings": findings},
+            usage=ProviderUsage(input_tokens, output_tokens),
+            request_id=",".join(request_ids) or None,
         )
 
     # --- answer mapping ------------------------------------------------------------------
@@ -442,6 +515,8 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
                 raise ProviderPermanentError(str(exc)) from None
         if not math.isclose(sum(probabilities.values()), 1.0, abs_tol=0.05):
             raise ProviderPermanentError("Jev probabilities do not sum to one")
+        if choice not in probabilities:
+            raise ProviderPermanentError("Jev chose an option that has no probability")
         confidence = reading.get("confidence")
         try:
             confidence_value = _positive_fraction(confidence, "confidence") if confidence is not None else None

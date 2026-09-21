@@ -896,12 +896,18 @@ class _BudgetLedger:
         generation.
         """
 
+        trial = self._trial(reservation.run_id)
+        p = self.policy
         if estimated:
+            # Such providers expose no per-request output limit either (Jev answers every
+            # question it is asked): record actual output and enforce the trial and
+            # benchmark output budgets instead of the per-request reservation.
             delta = response.usage.input_tokens - reservation.input_tokens
-            trial = self._trial(reservation.run_id)
             trial.input_tokens += delta
             self.total.input_tokens += delta
-            p = self.policy
+            output_delta = response.usage.output_tokens - reservation.output_tokens
+            trial.output_tokens_reserved += output_delta
+            self.total.output_tokens_reserved += output_delta
             if (
                 trial.input_tokens > p.max_input_tokens_per_trial
                 or self.total.input_tokens > p.max_input_tokens_per_benchmark
@@ -909,7 +915,15 @@ class _BudgetLedger:
                 raise ProviderBudgetExceeded(
                     "input-token budget exceeded by actual usage after an estimated preflight"
                 )
-        elif response.usage.input_tokens != reservation.input_tokens:
+            if (
+                trial.output_tokens_reserved > p.max_output_tokens_per_trial
+                or self.total.output_tokens_reserved > p.max_output_tokens_per_benchmark
+            ):
+                raise ProviderBudgetExceeded(
+                    "output-token budget exceeded by actual usage after an estimated preflight"
+                )
+            return
+        if response.usage.input_tokens != reservation.input_tokens:
             raise ProviderPermanentError(
                 "provider usage input_tokens differs from token-count preflight"
             )
@@ -918,7 +932,6 @@ class _BudgetLedger:
                 "provider exceeded reserved output-token ceiling"
             )
         refund = reservation.output_tokens - response.usage.output_tokens
-        trial = self._trial(reservation.run_id)
         trial.output_tokens_reserved -= refund
         self.total.output_tokens_reserved -= refund
 

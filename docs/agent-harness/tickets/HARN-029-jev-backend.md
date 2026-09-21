@@ -103,3 +103,48 @@ comes back in the response.
 Live paid calls in CI; the Python `typesafe-sdk` dependency (the HTTP surface
 is small and the harness already owns transport, retries and redaction);
 Score-based candidate ranking (later experiment).
+
+## Adversarial review — 2026-09-21
+
+Clean-context review of PR #74 (fake transports only). No blocker; fixed test-first:
+
+- **MEDIUM** — a token whose evidence held no candidate reading burned a paid
+  call (only `none-of-these` offered) and then always failed. Automatic rows
+  with an empty analysis but a DULAT/POS/gloss (38 exist in `auto_parsing/0.2.8`)
+  are now `?`-analysis candidates, so every token has at least one; a token
+  with none at all fails before any network call.
+- **MEDIUM** — reconcile sent every token's noul in one request with no size
+  control. Verified live: the API accepts 299 questions in one request
+  (49k input tokens); the run nevertheless failed in the HARN-022 ledger
+  because the 7,479 output tokens exceeded the per-request reservation. Two
+  changes: reconcile is batched (`reconcile_batch_size`, default 150, findings
+  and usage merged), and estimated-count clients reconcile *output* against the
+  trial/benchmark budgets rather than the per-request ceiling, since Jev has no
+  output limit parameter and output is not billable.
+- **LOW** — legacy `analyses` that is not a list is ignored instead of iterated
+  per character; candidate fields with TSV control characters or the seed
+  marker are dropped; negative attestations are 0; a chosen option without a
+  probability is a permanent error; reconcile with no decisions makes no call;
+  the review context is whitelisted per key (`scope`, `worklist`, `evidence`).
+- Token estimate default changed from 3.0 to 1.5 bytes/token after measuring
+  13,087 reported tokens for a 20 KB body.
+
+## First live column — 2026-09-21
+
+KTU 1.6 column I, 299 tokens, all seven sources enabled (legacy review absent
+for this tablet), `jev-1.13.0`, 300 requests, 5.3M input tokens (~$0.22),
+~1.3 s per token. Morphology-set exactness against the reviewed gold, first
+pass (before reconciliation):
+
+| arm | exact |
+|---|---|
+| automatic parser, all alternatives kept | 203/299 (67.9%) |
+| automatic parser, first alternative only | 230/299 (76.9%) |
+| Jev, all sources | 231/299 (77.3%) |
+| ceiling reachable from automatic alternatives alone | 251/299 (83.9%) |
+
+Mismatches: 27 `none-of-these` abstentions where the gold reading was among
+the candidates, 27 different readings (largely homonym choices such as
+`ap(I)` vs `ap(II)`), 13 extra alternatives kept, 1 dropped alternative. The
+abstention rate and the presentation of homonym evidence are the first tuning
+targets; ablation arms (each source disabled in turn) are the next runs.
