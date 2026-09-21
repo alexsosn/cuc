@@ -295,6 +295,49 @@ def _default_http_json(
     return decoded
 
 
+@dataclass(frozen=True)
+class ProviderIORecord:
+    """One provider wire exchange: the exact request body sent and the response body.
+
+    HARN-032. Headers (credentials) are never recorded; a failed call carries the
+    exception type only, never its message.
+    """
+
+    operation: str
+    url: str
+    request: Mapping[str, Any]
+    response: Mapping[str, Any] | None
+    error_type: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "operation": self.operation,
+            "url": self.url,
+            "request": dict(self.request),
+            "response": None if self.response is None else dict(self.response),
+            "error_type": self.error_type,
+        }
+
+
+class ProviderIOCapture:
+    """Opt-in, in-memory log of provider wire exchanges for a self-hosted trace store."""
+
+    def __init__(self) -> None:
+        self.records: list[ProviderIORecord] = []
+
+    def record(
+        self,
+        operation: str,
+        url: str,
+        request: Mapping[str, Any],
+        response: Mapping[str, Any] | None,
+        error_type: str | None = None,
+    ) -> None:
+        self.records.append(
+            ProviderIORecord(operation, url, dict(request), None if response is None else dict(response), error_type)
+        )
+
+
 class _EnvironmentCredentialClient:
     provider: str
     execution_kind = ExecutionKind.LIVE_PROVIDER
@@ -305,12 +348,44 @@ class _EnvironmentCredentialClient:
         api_key_env: str,
         http_json: HttpJSON = _default_http_json,
         base_url: str,
+        capture: ProviderIOCapture | None = None,
     ) -> None:
         self._api_key_env = _required_text(api_key_env, "api_key_env")
         if not callable(http_json):
             raise ValueError("http_json must be callable")
-        self._http_json = http_json
         self._base_url = _required_text(base_url, "base_url").rstrip("/")
+        if capture is not None and not isinstance(capture, ProviderIOCapture):
+            raise ValueError("capture must be ProviderIOCapture or None")
+        self.capture = capture
+        self._transport = http_json
+        self._current_operation = "unknown"
+
+    def _http_json(
+        self,
+        url: str,
+        headers: Mapping[str, str],
+        body: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        """Send one request; record the wire exchange when capture is enabled."""
+
+        try:
+            result = self._transport(url, headers, body, timeout_seconds)
+        except BaseException as exc:
+            self._record_exchange(url, body, None, type(exc).__name__)
+            raise
+        self._record_exchange(url, body, result if isinstance(result, Mapping) else None, None)
+        return result
+
+    def _record_exchange(self, url, body, response, error_type) -> None:
+        """Capture bookkeeping never changes what the provider call raises or returns."""
+
+        if self.capture is None:
+            return
+        try:
+            self.capture.record(self._current_operation, url, body, response, error_type)
+        except Exception:
+            pass
 
     def _api_key(self) -> str:
         value = os.environ.get(self._api_key_env)
