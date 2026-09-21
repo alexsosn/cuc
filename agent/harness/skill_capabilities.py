@@ -447,8 +447,6 @@ class SkillCapabilityRegistry:
         entries: list[tuple[str, bytes]] = []
         for candidate in package.rglob("*"):
             relative = candidate.relative_to(package).as_posix()
-            if _is_generated_dropping(candidate, relative):
-                continue
             if candidate.is_symlink():
                 try:
                     resolved = candidate.resolve(strict=True)
@@ -466,6 +464,9 @@ class SkillCapabilityRegistry:
                 entries.append((relative, payload))
                 continue
             if candidate.is_dir():
+                continue
+            if _is_generated_dropping(candidate, relative):
+                # Only real files are ignorable; symlinks were already guarded above.
                 continue
             if not candidate.is_file():
                 raise ValueError(
@@ -494,11 +495,12 @@ _IGNORED_NAMES = frozenset({".DS_Store", "Thumbs.db"})
 
 def _is_generated_dropping(candidate: Path, relative: str) -> bool:
     parts = relative.split("/")
-    if any(part in _IGNORED_DIRS for part in parts):
+    if any(part in _IGNORED_DIRS for part in parts[:-1]):
         return True
     if candidate.name in _IGNORED_NAMES:
         return True
-    return candidate.suffix in _IGNORED_SUFFIXES
+    # Bytecode is only ignorable where the interpreter writes it.
+    return candidate.suffix in _IGNORED_SUFFIXES and "__pycache__" in parts[:-1]
 
 
 def _skill_frontmatter_name(text: str) -> str | None:

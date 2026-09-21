@@ -289,7 +289,18 @@ class SkillCapabilityContractTest(unittest.TestCase):
             cache.mkdir()
             (cache / "helper.cpython-313.pyc").write_bytes(b"\x00bytecode")
             (skill_dir / ".DS_Store").write_bytes(b"\x00")
+            self.assertEqual(registry.provenance("example-skill"), clean)
+
+            # Bytecode outside __pycache__ and content hidden under an ignored name
+            # are still digested, and ignored names cannot smuggle escaping symlinks.
             (skill_dir / "scripts" / "helper.pyc").write_bytes(b"\x00")
+            self.assertNotEqual(registry.provenance("example-skill"), clean)
+            (skill_dir / "scripts" / "helper.pyc").unlink()
+            (skill_dir / ".DS_Store").unlink()
+            (skill_dir / ".DS_Store").symlink_to("/etc/hosts")
+            with self.assertRaises(ValueError):
+                registry.provenance("example-skill")
+            (skill_dir / ".DS_Store").unlink()
             self.assertEqual(registry.provenance("example-skill"), clean)
 
             # Real content changes are still detected.
