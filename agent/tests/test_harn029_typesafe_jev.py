@@ -660,3 +660,32 @@ def test_estimated_clients_reconcile_output_against_budgets_not_the_per_request_
     reservation = exact.reserve("run", 1000)
     with pytest.raises(ProviderPermanentError, match="ceiling"):
         exact.settle(reservation, ProviderResponse(model="m", payload={}, usage=ProviderUsage(1000, 600)))
+
+
+def test_empty_row_fields_become_unresolved_so_harn027_rows_construct(monkeypatch) -> None:
+    from harness.column_state import TokenDecision, ReviewedRow
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    # 561 real automatic rows have an analysis but an empty DULAT/POS/gloss.
+    evidence = [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "auto:1", "p", _row("~n", "-n (I)", "encl. morph.", "")).to_dict()]
+    transport = Transport(probabilities_by_analysis={"~n": 1.0})
+    payload = _client(mod, transport).generate_json(_request(_adjudicate_payload(evidence=evidence)), 5.0).payload
+    rows = tuple(ReviewedRow.from_dict(r) for r in payload["reviewed_rows"])
+    decision = TokenDecision("d", "1003", tuple(payload["analyses"]), tuple(payload["evidence_ids"]), payload["summary"], reviewed_rows=rows)
+    assert decision.reviewed_rows[0].gloss == "?"
+    assert decision.reviewed_rows[0].dulat == "-n (I)"
+
+
+def test_whitelisted_context_values_are_scalars_or_id_lists(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    transport = Transport(probabilities_by_analysis={"ġr(III)/": 1.0})
+    ctx = {"scope": {"tablet": "/Users/x/t", "token_count": 3}, "worklist": {"priority_token_ids": ["/Users/x/p", "1003"]},
+           "evidence": {"enabled_sources": {"path": "/Users/x"}, "absent_sources": ["dulat"]}}
+    _client(mod, transport).generate_json(_request(_adjudicate_payload(skill_context=ctx)), 5.0)
+    state = transport.calls[0][2]["state"]
+    assert "/Users/x" not in json.dumps(state, ensure_ascii=False)
+    assert state["review_context"]["scope"] == {"token_count": 3}
+    assert state["review_context"]["worklist"] == {"priority_token_ids": ["1003"]}
+    assert state["review_context"]["evidence"] == {"absent_sources": ["dulat"]}

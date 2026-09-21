@@ -204,15 +204,17 @@ def extract_candidates(
                         0,
                     )
             continue
-        row = {
-            "morphological_parsing": _text(data.get("morphological_parsing")) or UNRESOLVED,
+        raw_row = {
+            "morphological_parsing": _text(data.get("morphological_parsing")),
             "dulat": _text(data.get("dulat")),
             "pos": _text(data.get("pos")),
             "gloss": _text(data.get("gloss")),
-            "comments": "",
         }
-        if not (row["dulat"] or row["pos"] or row["gloss"]) and row["morphological_parsing"] == UNRESOLVED:
+        if not any(raw_row.values()):
             continue
+        # A curated row has no empty field: what the source left blank is unresolved.
+        row = {key: value or UNRESOLVED for key, value in raw_row.items()}
+        row["comments"] = ""
         if not all(_curated_field_ok(value) for value in row.values()):
             # Control characters or workflow markers can never become curated rows.
             continue
@@ -253,8 +255,20 @@ def _option_description(candidate: Candidate) -> dict[str, object]:
     return description
 
 
+def _context_value_ok(value: object) -> bool:
+    """Whitelisted context values are scalars or lists of ids; never path-like text."""
+
+    if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        return "/" not in value and "\\" not in value
+    if isinstance(value, list):
+        return all(isinstance(item, str) and "/" not in item and "\\" not in item for item in value)
+    return False
+
+
 def _safe_skill_context(skill_context: object) -> dict[str, object]:
-    """Whitelist the review context per key; nothing path-like or evaluative can pass."""
+    """Whitelist the review context per key and value shape; nothing path-like can pass."""
 
     if not isinstance(skill_context, Mapping):
         return {}
@@ -263,7 +277,15 @@ def _safe_skill_context(skill_context: object) -> dict[str, object]:
         value = skill_context.get(key)
         if not isinstance(value, Mapping):
             continue
-        picked = {k: value[k] for k in allowed if k in value}
+        picked = {}
+        for name in allowed:
+            if name not in value:
+                continue
+            item = value[name]
+            if isinstance(item, list):
+                item = [x for x in item if isinstance(x, str) and _context_value_ok(x)]
+            if _context_value_ok(item):
+                picked[name] = item
         if picked:
             safe[key] = picked
     return safe

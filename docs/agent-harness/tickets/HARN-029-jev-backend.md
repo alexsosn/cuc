@@ -148,3 +148,21 @@ the candidates, 27 different readings (largely homonym choices such as
 `ap(I)` vs `ap(II)`), 13 extra alternatives kept, 1 dropped alternative. The
 abstention rate and the presentation of homonym evidence are the first tuning
 targets; ablation arms (each source disabled in turn) are the next runs.
+
+### Delta re-review — 2026-09-21
+
+APPROVE. Two items tracked:
+
+- **Fixed** — candidate rows with an empty DULAT/POS/gloss (561 real automatic
+  rows) would have been rejected by HARN-027 `ReviewedRow` in 028b; empty
+  fields are now `?`, matching the curated convention.
+- **Documented, not changed** — reconcile batching runs below the HARN-022
+  ledger: the N batch calls of one reconcile are one `ProviderJSONRequest`, so
+  the runtime reserves once, records one call artifact, and a transient failure
+  in batch k re-sends batches 1..k-1. With the 150 default that is at most two
+  calls per column (the API accepted 299 questions in one request), so this is
+  a cost bound, not a correctness risk. Moving batching above `_invoke` is the
+  right change if columns ever need more than two batches.
+- Latent: a no-decision reconcile reports the requested model name, which the
+  runtime would reject when an alias is requested; unreachable through the
+  graph (reconcile runs only after a complete initial pass).
