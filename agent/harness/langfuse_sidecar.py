@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from dataclasses import replace
 from typing import Any, Callable, Mapping
 from uuid import NAMESPACE_URL, uuid5
 
@@ -25,7 +26,6 @@ from .telemetry import (
     build_parsing_trace_projection,
     project_parsing_scores,
 )
-
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
@@ -121,9 +121,15 @@ def _emit_failed_operation(
     name: str,
     observation_type: str,
     exc: BaseException,
+    model: str | None = None,
+    usage: dict[str, int] | None = None,
     **metadata: Any,
 ) -> TelemetryOutcome:
-    """Record only safe failure identity; never let telemetry mask the domain error."""
+    """Record only safe failure identity; never let telemetry mask the domain error.
+
+    Billed provider usage (HARN-031) is attached when known: the call was paid for
+    even though the operation then failed.
+    """
 
     try:
         projection = _observation(
@@ -135,6 +141,7 @@ def _emit_failed_operation(
             error_type=type(exc).__name__,
             **metadata,
         )
+        projection = _with_provider_usage(projection, model, usage)
     except Exception as telemetry_exc:
         return _safe_failure(_sidecar_enabled(sidecar), telemetry_exc)
     return _emit_safely(sidecar, "emit_observation", projection)
@@ -285,12 +292,17 @@ class LangfuseSidecar:
         try:
             client = self._client()
             trace_id = self._trace_id(client, projection.run_type, projection.run_id)
-            observation = client.start_observation(
-                name=projection.name,
-                as_type=projection.observation_type,
-                trace_context={"trace_id": trace_id},
-                metadata=_transport_metadata(projection),
-            )
+            kwargs: dict[str, Any] = {
+                "name": projection.name,
+                "as_type": projection.observation_type,
+                "trace_context": {"trace_id": trace_id},
+                "metadata": _transport_metadata(projection),
+            }
+            if projection.model is not None:
+                kwargs["model"] = projection.model
+            if projection.usage is not None:
+                kwargs["usage_details"] = dict(projection.usage)
+            observation = client.start_observation(**kwargs)
             observation.end()
             return TelemetryOutcome(True, True)
         except Exception as exc:  # external optional transport boundary
@@ -333,14 +345,89 @@ class LangfuseSidecar:
             return _safe_failure(True, exc)
 
 
+class _ProviderUsageWindow:
+    """Attribute the HARN-022 call artifacts made during one operation (HARN-031).
+
+    Everything here is telemetry bookkeeping: it never raises, never coerces a
+    malformed count, and a call that cannot be read exactly is left unattributed.
+    Usage is attributed whenever a provider call succeeded, even if the operation
+    then failed validation, because that call was paid for.
+    """
+
+    def __init__(self, provider_calls: Callable[[], Any] | None) -> None:
+        self._source = provider_calls
+        self._start = self._count()
+
+    def _snapshot(self) -> tuple[Any, ...]:
+        if self._source is None:
+            return ()
+        try:
+            return tuple(self._source())
+        except Exception:  # telemetry must never surface a provider bookkeeping error
+            return ()
+
+    def _count(self) -> int:
+        return len(self._snapshot())
+
+    def close(self) -> tuple[dict[str, Any], str | None, dict[str, int] | None]:
+        """Return (metadata, model, usage); never raises."""
+
+        if self._source is None:
+            return {}, None, None
+        try:
+            new_calls = self._snapshot()[self._start :]
+            successful = [c for c in new_calls if getattr(c, "error_type", None) is None]
+            metadata = {
+                "provider_calls": len(new_calls),
+                "provider_retries": max(0, len(new_calls) - 1) if new_calls else 0,
+            }
+            if not successful:
+                return metadata, None, None
+            model = getattr(successful[-1], "model", None)
+            if not isinstance(model, str) or not model.strip():
+                return metadata, None, None
+            usage = {"input": 0, "output": 0}
+            for call in successful:
+                for key, attr in (("input", "input_tokens"), ("output", "output_tokens")):
+                    value = getattr(call, attr, 0)
+                    if value is None:
+                        continue
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        return metadata, None, None
+                    usage[key] += value
+            return metadata, model.strip(), usage
+        except Exception:  # telemetry must never surface a provider bookkeeping error
+            return {}, None, None
+
+
+def _with_provider_usage(projection: ObservationProjection, model: str | None, usage: dict[str, int] | None):
+    """Attach model/usage without letting a projection error escape."""
+
+    try:
+        return replace(projection, model=model, usage=usage)
+    except Exception:
+        return projection
+
+
 def wrap_column_review_adapters(
     adapters: ColumnReviewAdapters,
     sidecar: Any,
+    *,
+    provider_calls: Callable[[], Any] | None = None,
 ) -> ColumnReviewAdapters:
-    """Wrap HARN-004 effects without changing their inputs, results, or exceptions."""
+    """Wrap HARN-004 effects without changing their inputs, results, or exceptions.
+
+    ``provider_calls`` optionally returns the HARN-022 ``ProviderCallArtifact``s made
+    so far (for example ``lambda: runtime.calls``). When given, adjudicate and
+    reconcile observations become ``generation``s carrying the exact model and the
+    token usage of the calls made during that operation, so Langfuse can price them.
+    """
 
     if not isinstance(adapters, ColumnReviewAdapters):
         raise ValueError("adapters must be ColumnReviewAdapters")
+    if provider_calls is not None and not callable(provider_calls):
+        raise ValueError("provider_calls must be callable")
+    provider_type = "generation" if provider_calls is not None else None
 
     def initialize_skill_context(state, operation_id):
         try:
@@ -409,6 +496,7 @@ def wrap_column_review_adapters(
                 None if revisit_request is None else revisit_request.request_id
             ),
         }
+        window = _ProviderUsageWindow(provider_calls)
         try:
             result = adapters.adjudicate(
                 state,
@@ -419,49 +507,64 @@ def wrap_column_review_adapters(
                 revisit_request,
             )
         except Exception as exc:
+            usage_metadata, model, usage = window.close()
             _emit_failed_operation(
                 sidecar,
                 state,
                 operation_id,
                 "cuc.parsing.adjudicate",
-                "agent",
+                provider_type or "agent",
                 exc,
+                model=model,
+                usage=usage,
                 **metadata,
+                **usage_metadata,
             )
             raise
+        usage_metadata, model, usage = window.close()
         projection = _observation(
             state,
             operation_id,
             "cuc.parsing.adjudicate",
-            "agent",
+            provider_type or "agent",
             outcome="success",
             **metadata,
+            **usage_metadata,
         )
+        projection = _with_provider_usage(projection, model, usage)
         _emit_safely(sidecar, "emit_observation", projection)
         return result
 
     def reconcile(state, skill_context, operation_id):
+        window = _ProviderUsageWindow(provider_calls)
         try:
             result = adapters.reconcile(state, skill_context, operation_id)
         except Exception as exc:
+            usage_metadata, model, usage = window.close()
             _emit_failed_operation(
                 sidecar,
                 state,
                 operation_id,
                 "cuc.parsing.reconcile",
-                "span",
+                provider_type or "span",
                 exc,
+                model=model,
+                usage=usage,
+                **usage_metadata,
             )
             raise
+        usage_metadata, model, usage = window.close()
         projection = _observation(
             state,
             operation_id,
             "cuc.parsing.reconcile",
-            "span",
+            provider_type or "span",
             outcome="success",
             finding_count=len(result.findings),
             revisit_request_count=len(result.revisit_requests),
+            **usage_metadata,
         )
+        projection = _with_provider_usage(projection, model, usage)
         _emit_safely(sidecar, "emit_observation", projection)
         return result
 
