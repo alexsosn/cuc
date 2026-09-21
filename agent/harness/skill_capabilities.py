@@ -437,7 +437,11 @@ class SkillCapabilityRegistry:
         )
 
     def _skill_package_digest(self, manifest: SkillCapabilityManifest) -> str:
-        """Digest every file/symlink entry in the canonical skill package deterministically."""
+        """Digest every file/symlink entry in the canonical skill package deterministically.
+
+        Interpreter bytecode caches and editor droppings are not skill content: running
+        a helper script must not move the skill's provenance (HARN-030).
+        """
         package = self._resolve_repo_path(manifest.skill_path, require_file=False)
         digest = sha256()
         entries: list[tuple[str, bytes]] = []
@@ -461,6 +465,9 @@ class SkillCapabilityRegistry:
                 continue
             if candidate.is_dir():
                 continue
+            if _is_generated_dropping(candidate, relative):
+                # Only real files are ignorable; symlinks were already guarded above.
+                continue
             if not candidate.is_file():
                 raise ValueError(
                     f"canonical skill package contains unsupported entry: {relative}"
@@ -479,6 +486,21 @@ class SkillCapabilityRegistry:
             digest.update(payload)
             digest.update(b"\0")
         return digest.hexdigest()
+
+
+_IGNORED_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+_IGNORED_SUFFIXES = (".pyc", ".pyo")
+_IGNORED_NAMES = frozenset({".DS_Store", "Thumbs.db"})
+
+
+def _is_generated_dropping(candidate: Path, relative: str) -> bool:
+    parts = relative.split("/")
+    if any(part in _IGNORED_DIRS for part in parts[:-1]):
+        return True
+    if candidate.name in _IGNORED_NAMES:
+        return True
+    # Bytecode is only ignorable where the interpreter writes it.
+    return candidate.suffix in _IGNORED_SUFFIXES and "__pycache__" in parts[:-1]
 
 
 def _skill_frontmatter_name(text: str) -> str | None:

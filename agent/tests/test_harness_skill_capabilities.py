@@ -247,6 +247,68 @@ class SkillCapabilityContractTest(unittest.TestCase):
                 package_changed.skill_package_sha256,
             )
 
+    def test_provenance_ignores_bytecode_caches_and_editor_droppings(self) -> None:
+        """Executing a skill script writes __pycache__; provenance must not move (HARN-030)."""
+
+        api = self.api()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / ".agents" / "skills" / "example-skill"
+            manifest_dir = root / "agent" / "harness" / "capability_manifests"
+            (skill_dir / "scripts").mkdir(parents=True)
+            manifest_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: example-skill\ndescription: Example capability.\n---\n\n# Example\n",
+                encoding="utf-8",
+            )
+            (skill_dir / "scripts" / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+            payload = {
+                "schema_version": 1,
+                "contract_version": "1.0.0",
+                "canonical_name": "example-skill",
+                "skill_path": ".agents/skills/example-skill",
+                "aliases": [],
+                "work_unit": "tablet",
+                "ordered_stages": ["inspect"],
+                "scope_invariants": ["complete-tablet"],
+                "required_evidence": [],
+                "optional_evidence": [],
+                "authoritative_resources": [],
+                "helper_resources": [".agents/skills/example-skill/scripts/helper.py"],
+                "effect": "read-only",
+                "write_scopes": [],
+                "read_only_scopes": [],
+                "completion_verifiers": ["done"],
+                "escalation_targets": [],
+                "evaluator_requirements": [],
+                "permissions": ["repository-read"],
+            }
+            (manifest_dir / "example-skill.json").write_text(json.dumps(payload), encoding="utf-8")
+            registry = api.SkillCapabilityRegistry(root)
+            clean = registry.provenance("example-skill")
+
+            cache = skill_dir / "scripts" / "__pycache__"
+            cache.mkdir()
+            (cache / "helper.cpython-313.pyc").write_bytes(b"\x00bytecode")
+            (skill_dir / ".DS_Store").write_bytes(b"\x00")
+            self.assertEqual(registry.provenance("example-skill"), clean)
+
+            # Bytecode outside __pycache__ and content hidden under an ignored name
+            # are still digested, and ignored names cannot smuggle escaping symlinks.
+            (skill_dir / "scripts" / "helper.pyc").write_bytes(b"\x00")
+            self.assertNotEqual(registry.provenance("example-skill"), clean)
+            (skill_dir / "scripts" / "helper.pyc").unlink()
+            (skill_dir / ".DS_Store").unlink()
+            (skill_dir / ".DS_Store").symlink_to("/etc/hosts")
+            with self.assertRaises(ValueError):
+                registry.provenance("example-skill")
+            (skill_dir / ".DS_Store").unlink()
+            self.assertEqual(registry.provenance("example-skill"), clean)
+
+            # Real content changes are still detected.
+            (skill_dir / "scripts" / "helper.py").write_text("VALUE = 2\n", encoding="utf-8")
+            self.assertNotEqual(registry.provenance("example-skill"), clean)
+
 
 if __name__ == "__main__":
     unittest.main()
