@@ -215,3 +215,14 @@ findings fixed test-first in the same PR:
   sidecars in the resource directory; the real resources use
   `journal_mode=delete`. `immutable=1` was not adopted because the DULAT
   application may write to its cache while a run reads it.
+
+### Delta re-review — 2026-09-21
+
+APPROVE; both round-2 blockers re-probed closed (URI characters, symlinks, WAL;
+broken adapter aborts after three tokens; unreadable resources absent in the
+hash; build and constructor cannot disagree; real KTU 1.6 I / 1.14 I / 2.12 e2e
+with zero failures and no paths). Remaining LOWs closed in the same PR:
+intermittent failures abort once one source has failed on more than 25% of the
+column (floor of two), and the constructor cross-checks every carried resource
+path against the policy digest. Left as noted: the Burns index is built twice
+per `build` (perf only) and WAL sidecars on a writable directory.

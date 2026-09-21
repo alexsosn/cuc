@@ -630,6 +630,13 @@ class BurnsAdapter:
         return tuple(records)
 
 
+def _safe_digest(path: Path) -> str | None:
+    try:
+        return _policy_digest(path)
+    except Exception:  # noqa: BLE001 - an undigestable resource cannot match the policy
+        return None
+
+
 def _safe_locate(locator: ResourceLocator, kind: str) -> tuple[Path, str] | None:
     try:
         found = locator.locate(kind)
@@ -752,11 +759,15 @@ class EvidenceCollector:
         locator: ResourceLocator,
         adapter_factories: Mapping[str, Callable[[], Any]] | None = None,
         resource_paths: Mapping[str, Path | None] | None = None,
+        max_failure_share: float = 0.25,
     ) -> None:
         if not isinstance(policy, EvidencePolicy):
             raise ValueError("policy must be EvidencePolicy")
         if not isinstance(loaded_column, LoadedColumn):
             raise ValueError("loaded_column must be LoadedColumn")
+        if isinstance(max_failure_share, bool) or not isinstance(max_failure_share, (int, float)) or not 0 < max_failure_share <= 1:
+            raise ValueError("max_failure_share must be in (0, 1]")
+        self.max_failure_share = float(max_failure_share)
         factories = dict(DEFAULT_ADAPTER_FACTORIES)
         factories.update(adapter_factories or {})
         self.policy = policy
@@ -788,6 +799,13 @@ class EvidenceCollector:
                         f"policy claims {source_id} is available but the resource failed "
                         f"the readiness probe ({type(exc).__name__})"
                     ) from None
+            if resource is not None:
+                expected = availability.resource_sha256
+                actual = _safe_digest(resource)
+                if expected != actual:
+                    raise ValueError(
+                        f"resource carried for {source_id} does not match the policy digest"
+                    )
             self._adapters[source_id] = adapter
             self.resource_paths[source_id] = resource
 
@@ -799,6 +817,7 @@ class EvidenceCollector:
         *,
         locator: ResourceLocator,
         adapter_factories: Mapping[str, Callable[[], Any]] | None = None,
+        max_failure_share: float = 0.25,
     ) -> "EvidenceCollector":
         """Locate, probe, then build the policy from what is actually readable."""
 
@@ -829,6 +848,7 @@ class EvidenceCollector:
             locator=locator,
             adapter_factories=adapter_factories,
             resource_paths=readable,
+            max_failure_share=max_failure_share,
         )
 
     def _collect_degrading(
@@ -849,6 +869,16 @@ class EvidenceCollector:
                 raise RuntimeError(
                     f"evidence source {source_id} failed on {failure['consecutive']} consecutive "
                     f"tokens ({error_type}); treating as a defect rather than row-local data"
+                ) from None
+            # Floor of two so tiny columns are governed by the consecutive rule alone.
+            allowed = max(
+                _CONSECUTIVE_FAILURE_LIMIT - 1,
+                self.max_failure_share * len(self.loaded_column.snapshot.tokens),
+            )
+            if failure["count"] > allowed:
+                raise RuntimeError(
+                    f"evidence source {source_id} failed on {failure['count']} tokens, more than "
+                    f"{self.max_failure_share:.0%} of the column ({error_type}); treating as a defect"
                 ) from None
             return (
                 _record(

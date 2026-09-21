@@ -169,8 +169,8 @@ def _token(loaded, token_id: str):
 
 
 def _collector(mod, loaded, enabled, locator):
-    policy = _policy_module().build_evidence_policy(enabled, locator)
-    return mod.EvidenceCollector(policy, loaded, locator=locator), policy
+    collector = mod.EvidenceCollector.build(enabled, loaded, locator=locator)
+    return collector, collector.policy
 
 
 # --- locator --------------------------------------------------------------------------
@@ -682,3 +682,47 @@ def test_corpus_parallels_exclude_the_column_under_review(tmp_path: Path) -> Non
     # Another column-I token's reviewed row must not be evidence for column I.
     b_records = adapter.collect(mod.TokenEvidenceContext(loaded, state, _token(loaded, "1003"), "op-q"), None)
     assert not any(":1002" in r.source_ref for r in b_records)
+
+
+def test_intermittent_failures_abort_once_they_exceed_a_share_of_the_column(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    db = _dulat_search_db(tmp_path / "dulat_search.sqlite")
+
+    class EveryOther(mod.DulatAdapter):
+        calls = 0
+
+        def collect(self, ctx, resource):
+            EveryOther.calls += 1
+            if EveryOther.calls % 2:
+                raise ValueError("flaky")
+            return super().collect(ctx, resource)
+
+    collector = mod.EvidenceCollector.build(
+        ("auto-parsing", "dulat"), loaded, locator=mod.StaticLocator({"dulat_search": (db, "explicit")}),
+        adapter_factories={"dulat": EveryOther}, max_failure_share=0.25,
+    )
+    context = collector.initialize_skill_context(state, "run:init")
+    # Alternating failures never trip the consecutive rule; the share rule (floor 2)
+    # aborts on the third failure of this 3-token column.
+    collector.collect_evidence(state, _token(loaded, "1001"), context, "a")  # fail 1
+    collector.collect_evidence(state, _token(loaded, "1002"), context, "b")  # ok
+    collector.collect_evidence(state, _token(loaded, "1003"), context, "c")  # fail 2
+    collector.collect_evidence(state, _token(loaded, "1001"), context, "d")  # ok
+    with pytest.raises(RuntimeError, match="share|of the column"):
+        collector.collect_evidence(state, _token(loaded, "1002"), context, "e")  # fail 3
+
+
+def test_constructor_cross_checks_carried_paths_against_the_policy_digest(tmp_path: Path) -> None:
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    good = _dulat_search_db(tmp_path / "dulat_search.sqlite")
+    other = _dulat_search_db(tmp_path / "other.sqlite")
+    con = sqlite3.connect(other)
+    con.execute("INSERT INTO dulat_reverse_refs VALUES ('KTU 9.9 I:9', 1, '{}')")
+    con.commit(); con.close()
+    locator = mod.StaticLocator({"dulat_search": (good, "explicit")})
+    policy = mod.build_policy(("auto-parsing", "dulat"), locator)
+    with pytest.raises(ValueError, match="digest"):
+        mod.EvidenceCollector(policy, loaded, locator=locator, resource_paths={"dulat": other})
