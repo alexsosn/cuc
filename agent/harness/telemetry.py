@@ -97,6 +97,10 @@ class ObservationProjection:
     name: str
     observation_type: str
     metadata: Mapping[str, _MetadataValue]
+    # HARN-031: exact model identity and token usage for provider-backed operations,
+    # so the backend can price them. Never prompt or response text.
+    model: str | None = None
+    usage: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_type", TelemetryRunType(self.run_type))
@@ -107,6 +111,26 @@ class ObservationProjection:
             self, "observation_type", _required_text(self.observation_type, "observation_type")
         )
         object.__setattr__(self, "metadata", _metadata(self.metadata))
+        if self.model is not None:
+            object.__setattr__(self, "model", _required_text(self.model, "model"))
+        if self.usage is not None:
+            object.__setattr__(self, "usage", _usage(self.usage))
+
+
+_USAGE_KEYS = ("input", "output")
+
+
+def _usage(value: Mapping[str, Any]) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise ValueError("usage must be a mapping of input/output token counts")
+    usage: dict[str, int] = {}
+    for key, count in value.items():
+        if key not in _USAGE_KEYS:
+            raise ValueError(f"usage keys must be one of {_USAGE_KEYS}")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"usage.{key} must be a non-negative integer")
+        usage[key] = count
+    return usage
 
 
 @dataclass(frozen=True)

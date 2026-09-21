@@ -18,7 +18,6 @@ from harness.column_state import (
 )
 from harness.langgraph_column_review import ColumnReviewAdapters, ReconciliationPlan
 from harness.live_providers import ProviderCallArtifact
-
 from tests.test_harn005_integration import _column_state, _evaluation
 from tests.test_langfuse_sidecar import FakeClient
 
@@ -77,7 +76,7 @@ def _adapters(calls: list[ProviderCallArtifact], *, fail_adjudicate: bool = Fals
 
 def _wrapped(calls, client, **kwargs):
     api = _sidecar_api()
-    sidecar = api.LangfuseSidecar(enabled=True, public_key="pk", secret_key="sk", client_factory=lambda **_: client)
+    sidecar = api.LangfuseSidecar(enabled=True, public_key="pk", secret_key="sk", base_url=None, client_factory=lambda **_: client)
     return api.wrap_column_review_adapters(_adapters(calls, **kwargs), sidecar, provider_calls=lambda: tuple(calls))
 
 
@@ -151,7 +150,7 @@ def test_without_a_provider_calls_source_observations_are_unchanged() -> None:
     api = _sidecar_api()
     calls: list[ProviderCallArtifact] = []
     client = FakeClient()
-    sidecar = api.LangfuseSidecar(enabled=True, public_key="pk", secret_key="sk", client_factory=lambda **_: client)
+    sidecar = api.LangfuseSidecar(enabled=True, public_key="pk", secret_key="sk", base_url=None, client_factory=lambda **_: client)
     wrapped = api.wrap_column_review_adapters(_adapters(calls), sidecar)
     state = _column_state()
     wrapped.adjudicate(state, state.snapshot.tokens[0], (), ("worklist",), "run-1:initial:t1:adjudicate", None)
