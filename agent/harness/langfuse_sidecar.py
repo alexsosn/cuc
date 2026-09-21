@@ -45,6 +45,15 @@ def _flag(value: object, *, default: bool = False) -> bool:
     return default
 
 
+def _is_loopback(base_url: str | None) -> bool:
+    if not isinstance(base_url, str) or not base_url.strip():
+        return False
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(base_url.strip()).hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".localhost")
+
+
 def _safe_failure(enabled: bool, exc: BaseException) -> TelemetryOutcome:
     # Never include exception text: SDK/network messages may echo keys, hosts, payloads,
     # or other values that do not belong in local diagnostics.
@@ -123,6 +132,7 @@ def _emit_failed_operation(
     exc: BaseException,
     model: str | None = None,
     usage: dict[str, int] | None = None,
+    io: tuple[Any, Any] = (None, None),
     **metadata: Any,
 ) -> TelemetryOutcome:
     """Record only safe failure identity; never let telemetry mask the domain error.
@@ -142,6 +152,7 @@ def _emit_failed_operation(
             **metadata,
         )
         projection = _with_provider_usage(projection, model, usage)
+        projection = _with_provider_io(projection, io)
     except Exception as telemetry_exc:
         return _safe_failure(_sidecar_enabled(sidecar), telemetry_exc)
     return _emit_safely(sidecar, "emit_observation", projection)
@@ -204,6 +215,7 @@ class LangfuseSidecar:
         secret_key: str | None,
         base_url: str | None,
         client_factory: Callable[..., Any] | None = None,
+        capture_io: bool = False,
     ) -> None:
         self.enabled = bool(enabled)
         self._public_key = public_key
@@ -211,6 +223,9 @@ class LangfuseSidecar:
         self._base_url = base_url
         self._client_factory = client_factory or _default_client_factory
         self._client_instance: Any | None = None
+        # HARN-032: prompt/response capture is allowed only towards a loopback backend;
+        # the SDK's default host is the cloud, so an unset base URL never qualifies.
+        self.capture_io = bool(capture_io) and _is_loopback(base_url)
 
     @classmethod
     def from_environment(
@@ -232,6 +247,7 @@ class LangfuseSidecar:
             secret_key=source.get("LANGFUSE_SECRET_KEY"),
             base_url=source.get("LANGFUSE_BASE_URL"),
             client_factory=client_factory,
+            capture_io=_flag(source.get("CUC_LANGFUSE_CAPTURE_IO"), default=False),
         )
 
     def _credentials_ready(self) -> bool:
@@ -302,6 +318,11 @@ class LangfuseSidecar:
                 kwargs["model"] = projection.model
             if projection.usage is not None:
                 kwargs["usage_details"] = dict(projection.usage)
+            if self.capture_io:
+                if projection.input is not None:
+                    kwargs["input"] = projection.input
+                if projection.output is not None:
+                    kwargs["output"] = projection.output
             observation = client.start_observation(**kwargs)
             observation.end()
             return TelemetryOutcome(True, True)
@@ -409,11 +430,54 @@ def _with_provider_usage(projection: ObservationProjection, model: str | None, u
         return projection
 
 
+class _ProviderIOWindow:
+    """The wire exchanges (HARN-032 ``ProviderIORecord``) made during one operation."""
+
+    def __init__(self, provider_io: Callable[[], Any] | None) -> None:
+        self._source = provider_io
+        self._start = len(self._snapshot())
+
+    def _snapshot(self) -> tuple[Any, ...]:
+        if self._source is None:
+            return ()
+        try:
+            return tuple(self._source())
+        except Exception:  # telemetry must never surface a bookkeeping error
+            return ()
+
+    def close(self) -> tuple[Any, Any]:
+        """Return (input, output): lists of request bodies and response bodies, or None."""
+
+        if self._source is None:
+            return None, None
+        try:
+            records = self._snapshot()[self._start :]
+            if not records:
+                return None, None
+            inputs = [dict(getattr(r, "request", {}) or {}) for r in records]
+            outputs = [
+                (dict(getattr(r, "response")) if getattr(r, "response", None) is not None
+                 else {"error_type": getattr(r, "error_type", None)})
+                for r in records
+            ]
+            return inputs, outputs
+        except Exception:
+            return None, None
+
+
+def _with_provider_io(projection: ObservationProjection, io: tuple[Any, Any]):
+    try:
+        return replace(projection, input=io[0], output=io[1])
+    except Exception:
+        return projection
+
+
 def wrap_column_review_adapters(
     adapters: ColumnReviewAdapters,
     sidecar: Any,
     *,
     provider_calls: Callable[[], Any] | None = None,
+    provider_io: Callable[[], Any] | None = None,
 ) -> ColumnReviewAdapters:
     """Wrap HARN-004 effects without changing their inputs, results, or exceptions.
 
@@ -427,6 +491,8 @@ def wrap_column_review_adapters(
         raise ValueError("adapters must be ColumnReviewAdapters")
     if provider_calls is not None and not callable(provider_calls):
         raise ValueError("provider_calls must be callable")
+    if provider_io is not None and not callable(provider_io):
+        raise ValueError("provider_io must be callable")
     provider_type = "generation" if provider_calls is not None else None
 
     def initialize_skill_context(state, operation_id):
@@ -497,6 +563,7 @@ def wrap_column_review_adapters(
             ),
         }
         window = _ProviderUsageWindow(provider_calls)
+        io_window = _ProviderIOWindow(provider_io)
         try:
             result = adapters.adjudicate(
                 state,
@@ -517,6 +584,7 @@ def wrap_column_review_adapters(
                 exc,
                 model=model,
                 usage=usage,
+                io=io_window.close(),
                 **metadata,
                 **usage_metadata,
             )
@@ -532,11 +600,13 @@ def wrap_column_review_adapters(
             **usage_metadata,
         )
         projection = _with_provider_usage(projection, model, usage)
+        projection = _with_provider_io(projection, io_window.close())
         _emit_safely(sidecar, "emit_observation", projection)
         return result
 
     def reconcile(state, skill_context, operation_id):
         window = _ProviderUsageWindow(provider_calls)
+        io_window = _ProviderIOWindow(provider_io)
         try:
             result = adapters.reconcile(state, skill_context, operation_id)
         except Exception as exc:
@@ -550,6 +620,7 @@ def wrap_column_review_adapters(
                 exc,
                 model=model,
                 usage=usage,
+                io=io_window.close(),
                 **usage_metadata,
             )
             raise
@@ -565,6 +636,7 @@ def wrap_column_review_adapters(
             **usage_metadata,
         )
         projection = _with_provider_usage(projection, model, usage)
+        projection = _with_provider_io(projection, io_window.close())
         _emit_safely(sidecar, "emit_observation", projection)
         return result
 

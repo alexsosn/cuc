@@ -14,7 +14,7 @@ import pytest
 
 from harness.column_state import CompletionGateResult, EvidenceRecord, TokenDecision
 from harness.langgraph_column_review import ColumnReviewAdapters, ReconciliationPlan
-from harness.live_providers import ProviderCallArtifact, ProviderJSONRequest
+from harness.live_providers import ProviderCallArtifact
 from tests.test_harn005_integration import _column_state, _evaluation
 from tests.test_harn029_typesafe_jev import KEY_ENV, Transport, _adjudicate_payload, _request
 from tests.test_langfuse_sidecar import FakeClient

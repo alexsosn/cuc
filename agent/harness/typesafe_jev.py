@@ -23,6 +23,7 @@ from .live_providers import (
     ExecutionKind,
     HttpJSON,
     LiveProviderBinding,
+    ProviderIOCapture,
     ProviderJSONRequest,
     ProviderPermanentError,
     ProviderResponse,
@@ -334,8 +335,9 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         base_url: str = DEFAULT_BASE_URL,
         decision_policy: JevDecisionPolicy | None = None,
         bytes_per_token: float = 1.5,
+        capture: ProviderIOCapture | None = None,
     ) -> None:
-        super().__init__(api_key_env=api_key_env, http_json=http_json, base_url=base_url)
+        super().__init__(api_key_env=api_key_env, http_json=http_json, base_url=base_url, capture=capture)
         self.decision_policy = decision_policy or JevDecisionPolicy()
         if not isinstance(self.decision_policy, JevDecisionPolicy):
             raise ValueError("decision_policy must be JevDecisionPolicy")
@@ -457,6 +459,7 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         return max(1, math.ceil(len(encoded) / self._bytes_per_token))
 
     def generate_json(self, request: ProviderJSONRequest, timeout_seconds: float) -> ProviderResponse:
+        self._current_operation = request.operation
         if request.operation == "adjudicate":
             body, candidates = self._adjudicate_body(request)
             result = self._http_json(f"{self._base_url}/systemone", self._headers(), body, timeout_seconds)

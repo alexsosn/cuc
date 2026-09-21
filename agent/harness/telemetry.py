@@ -101,6 +101,10 @@ class ObservationProjection:
     # so the backend can price them. Never prompt or response text.
     model: str | None = None
     usage: Mapping[str, int] | None = None
+    # HARN-032: exact provider wire exchange, attached only on explicit opt-in to a
+    # loopback backend (see LangfuseSidecar.capture_io).
+    input: Any = None
+    output: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_type", TelemetryRunType(self.run_type))
