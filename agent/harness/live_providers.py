@@ -7,11 +7,11 @@ policy, and emits redacted execution artifacts.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from hashlib import sha256
-import json
-import os
 from time import monotonic
 from typing import Any, Callable, Mapping, Protocol
 from urllib import error as urllib_error
@@ -34,7 +34,6 @@ from .model_benchmark import (
     SharedBenchmarkAdapters,
     run_benchmark,
 )
-
 
 _AMBIGUOUS_VERSION_MARKERS = frozenset(
     {"latest", "default", "auto", "unknown", "unspecified", "rolling"}
@@ -131,6 +130,10 @@ class ProviderBudgetExceeded(ProviderPermanentError):
 class ExecutionKind(str, Enum):
     LIVE_PROVIDER = "live-provider"
     TEST_DOUBLE = "test-double"
+
+
+# How a client's ``count_input_tokens`` relates to the usage the provider reports.
+_TOKEN_COUNT_KINDS = frozenset({"exact", "estimate"})
 
 
 @dataclass(frozen=True)
@@ -745,12 +748,18 @@ class ProviderTrialArtifact:
     retries: int
     budget_exhausted: bool
     calls: tuple[ProviderCallArtifact, ...] = ()
+    input_token_count_kind: str = "exact"
+
+    def __post_init__(self) -> None:
+        if self.input_token_count_kind not in _TOKEN_COUNT_KINDS:
+            raise ValueError("input_token_count_kind must be 'exact' or 'estimate'")
 
     def to_dict(self) -> dict[str, object]:
         return {
             "backend_id": self.backend_id,
             "run_id": self.run_id,
             "execution_kind": self.execution_kind,
+            "input_token_count_kind": self.input_token_count_kind,
             "provider": self.provider,
             "requested_model": self.requested_model,
             "exact_model_version": self.exact_model_version,
@@ -874,7 +883,46 @@ class _BudgetLedger:
         self,
         reservation: _Reservation,
         response: ProviderResponse,
+        *,
+        estimated: bool = False,
     ) -> None:
+        """Reconcile a reservation with actual usage.
+
+        Clients with an exact token-count endpoint must report the preflight count
+        back exactly. A client that can only estimate (``input_token_count_kind ==
+        "estimate"``, e.g. Jev) has its reservation replaced by the actual usage; if
+        that overruns a budget the call has already been paid for, so the ledger
+        records the spend and then raises ``ProviderBudgetExceeded`` to stop further
+        generation.
+        """
+
+        trial = self._trial(reservation.run_id)
+        p = self.policy
+        if estimated:
+            # Such providers expose no per-request output limit either (Jev answers every
+            # question it is asked): record actual output and enforce the trial and
+            # benchmark output budgets instead of the per-request reservation.
+            delta = response.usage.input_tokens - reservation.input_tokens
+            trial.input_tokens += delta
+            self.total.input_tokens += delta
+            output_delta = response.usage.output_tokens - reservation.output_tokens
+            trial.output_tokens_reserved += output_delta
+            self.total.output_tokens_reserved += output_delta
+            if (
+                trial.input_tokens > p.max_input_tokens_per_trial
+                or self.total.input_tokens > p.max_input_tokens_per_benchmark
+            ):
+                raise ProviderBudgetExceeded(
+                    "input-token budget exceeded by actual usage after an estimated preflight"
+                )
+            if (
+                trial.output_tokens_reserved > p.max_output_tokens_per_trial
+                or self.total.output_tokens_reserved > p.max_output_tokens_per_benchmark
+            ):
+                raise ProviderBudgetExceeded(
+                    "output-token budget exceeded by actual usage after an estimated preflight"
+                )
+            return
         if response.usage.input_tokens != reservation.input_tokens:
             raise ProviderPermanentError(
                 "provider usage input_tokens differs from token-count preflight"
@@ -884,7 +932,6 @@ class _BudgetLedger:
                 "provider exceeded reserved output-token ceiling"
             )
         refund = reservation.output_tokens - response.usage.output_tokens
-        trial = self._trial(reservation.run_id)
         trial.output_tokens_reserved -= refund
         self.total.output_tokens_reserved -= refund
 
@@ -963,6 +1010,15 @@ _SYSTEM_PROMPT = (
 )
 
 
+def _token_count_kind(client: object) -> str:
+    """``exact`` unless the client declares that its preflight count is an estimate."""
+
+    kind = getattr(client, "input_token_count_kind", "exact")
+    if kind not in _TOKEN_COUNT_KINDS:
+        raise ValueError("client input_token_count_kind must be 'exact' or 'estimate'")
+    return kind
+
+
 class _ProviderDecisionRuntime:
     def __init__(
         self,
@@ -979,6 +1035,7 @@ class _ProviderDecisionRuntime:
             self.model_context.get("run_id"),
             "model_context.run_id",
         )
+        self.count_kind = _token_count_kind(binding.client)
         self.calls: list[ProviderCallArtifact] = []
         self.retries = 0
         self.budget_exhausted = False
@@ -1060,7 +1117,15 @@ class _ProviderDecisionRuntime:
                     raise ProviderPermanentError(
                         "provider client returned invalid response type"
                     )
-                self.ledger.settle(reservation, response)
+                try:
+                    self.ledger.settle(
+                        reservation,
+                        response,
+                        estimated=self.count_kind == "estimate",
+                    )
+                except ProviderBudgetExceeded:
+                    self.budget_exhausted = True
+                    raise
                 self.observed_output_tokens += response.usage.output_tokens
                 if response.model != self.binding.exact_model_version:
                     self.calls.append(
@@ -1368,6 +1433,7 @@ class _ProviderDecisionRuntime:
             retries=self.retries,
             budget_exhausted=self.budget_exhausted,
             calls=tuple(self.calls),
+            input_token_count_kind=self.count_kind,
         )
 
 
@@ -1384,11 +1450,13 @@ def _artifact_from_binding(
     retries: int = 0,
     budget_exhausted: bool = False,
     calls: tuple[ProviderCallArtifact, ...] = (),
+    input_token_count_kind: str = "exact",
 ) -> ProviderTrialArtifact:
     return ProviderTrialArtifact(
         backend_id=backend_id,
         run_id=run_id,
         execution_kind=binding.execution_kind.value,
+        input_token_count_kind=input_token_count_kind,
         provider=binding.spec.model_provider,
         requested_model=binding.requested_model,
         exact_model_version=binding.exact_model_version,
