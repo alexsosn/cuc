@@ -167,3 +167,97 @@ def test_only_calls_made_during_the_operation_are_attributed() -> None:
     state = _column_state()
     wrapped.adjudicate(state, state.snapshot.tokens[0], (), ("worklist",), "run-1:initial:t1:adjudicate", None)
     assert client.observation_calls[-1]["usage_details"] == {"input": 1000, "output": 25}
+
+
+# --- review findings (2026-09-21) ---------------------------------------------------------
+
+
+def test_malformed_artifacts_never_surface_and_never_mask_the_domain_result() -> None:
+    """Telemetry bookkeeping errors stay inside the sidecar boundary."""
+
+    class Weird:
+        error_type = None
+        model = "jev-1.13.0"
+        input_tokens = "abc"
+        output_tokens = float("nan")
+
+    api = _sidecar_api()
+    client = FakeClient()
+    sidecar = api.LangfuseSidecar(enabled=True, public_key="pk", secret_key="sk", base_url=None, client_factory=lambda **_: client)
+    calls: list = []
+
+    def adjudicate(state, token, evidence_records, skill_context, operation_id, revisit_request=None):
+        calls.append(Weird())
+        return TokenDecision("d1", token.token_id, ("x",), ("ev1",), "s")
+
+    base = _adapters([])
+    adapters = ColumnReviewAdapters(base.initialize_skill_context, base.collect_evidence, adjudicate, base.reconcile, base.verify_completion, base.evaluate)
+    wrapped = api.wrap_column_review_adapters(adapters, sidecar, provider_calls=lambda: tuple(calls))
+    state = _column_state()
+    result = wrapped.adjudicate(state, state.snapshot.tokens[0], (), ("worklist",), "run-1:initial:t1:adjudicate", None)
+    assert result.decision_id == "d1"
+    obs = client.observation_calls[-1]
+    assert obs["metadata"]["provider_calls"] == 1
+    assert obs.get("usage_details") is None  # unattributable, not coerced
+    assert obs.get("model") is None
+
+    # Domain failure with a malformed artifact: the domain exception is what escapes.
+    def failing(state, token, evidence_records, skill_context, operation_id, revisit_request=None):
+        calls.append(Weird())
+        raise KeyError("domain")
+
+    adapters = ColumnReviewAdapters(base.initialize_skill_context, base.collect_evidence, failing, base.reconcile, base.verify_completion, base.evaluate)
+    wrapped = api.wrap_column_review_adapters(adapters, sidecar, provider_calls=lambda: tuple(calls))
+    with pytest.raises(KeyError, match="domain"):
+        wrapped.adjudicate(state, state.snapshot.tokens[0], (), ("worklist",), "run-1:initial:t1:adjudicate", None)
+
+
+def test_billed_calls_are_priced_even_when_the_operation_then_fails() -> None:
+    """A successful provider call whose result fails validation was still paid for."""
+
+    api = _sidecar_api()
+    client = FakeClient()
+    sidecar = api.LangfuseSidecar(enabled=True, public_key="pk", secret_key="sk", base_url=None, client_factory=lambda **_: client)
+    calls: list[ProviderCallArtifact] = []
+
+    def adjudicate(state, token, evidence_records, skill_context, operation_id, revisit_request=None):
+        calls.append(_artifact("adjudicate", "jev-1.13.0", 1000, 25))
+        raise ValueError("analyses must be a non-empty list")
+
+    base = _adapters([])
+    adapters = ColumnReviewAdapters(base.initialize_skill_context, base.collect_evidence, adjudicate, base.reconcile, base.verify_completion, base.evaluate)
+    wrapped = api.wrap_column_review_adapters(adapters, sidecar, provider_calls=lambda: tuple(calls))
+    state = _column_state()
+    with pytest.raises(ValueError):
+        wrapped.adjudicate(state, state.snapshot.tokens[0], (), ("worklist",), "run-1:initial:t1:adjudicate", None)
+    obs = client.observation_calls[-1]
+    assert obs["metadata"]["outcome"] == "error"
+    assert obs["model"] == "jev-1.13.0"
+    assert obs["usage_details"] == {"input": 1000, "output": 25}
+
+
+def test_coercions_are_strict_and_a_model_without_usage_is_not_emitted() -> None:
+    api = _sidecar_api()
+    client = FakeClient()
+    sidecar = api.LangfuseSidecar(enabled=True, public_key="pk", secret_key="sk", base_url=None, client_factory=lambda **_: client)
+
+    class Floaty:
+        error_type = None
+        model = 123
+        input_tokens = 10.7
+        output_tokens = True
+
+    base = _adapters([])
+    calls_after: list = []
+    state = _column_state()
+
+    def adjudicate2(state, token, evidence_records, skill_context, operation_id, revisit_request=None):
+        calls_after.append(Floaty())
+        return TokenDecision("d1", token.token_id, ("x",), ("ev1",), "s")
+
+    adapters = ColumnReviewAdapters(base.initialize_skill_context, base.collect_evidence, adjudicate2, base.reconcile, base.verify_completion, base.evaluate)
+    wrapped = api.wrap_column_review_adapters(adapters, sidecar, provider_calls=lambda: tuple(calls_after))
+    wrapped.adjudicate(state, state.snapshot.tokens[0], (), ("worklist",), "run-1:initial:t1:adjudicate", None)
+    obs = client.observation_calls[-1]
+    assert obs.get("usage_details") is None and obs.get("model") is None
+    assert obs["metadata"]["provider_calls"] == 1

@@ -121,9 +121,15 @@ def _emit_failed_operation(
     name: str,
     observation_type: str,
     exc: BaseException,
+    model: str | None = None,
+    usage: dict[str, int] | None = None,
     **metadata: Any,
 ) -> TelemetryOutcome:
-    """Record only safe failure identity; never let telemetry mask the domain error."""
+    """Record only safe failure identity; never let telemetry mask the domain error.
+
+    Billed provider usage (HARN-031) is attached when known: the call was paid for
+    even though the operation then failed.
+    """
 
     try:
         projection = _observation(
@@ -135,6 +141,7 @@ def _emit_failed_operation(
             error_type=type(exc).__name__,
             **metadata,
         )
+        projection = _with_provider_usage(projection, model, usage)
     except Exception as telemetry_exc:
         return _safe_failure(_sidecar_enabled(sidecar), telemetry_exc)
     return _emit_safely(sidecar, "emit_observation", projection)
@@ -339,7 +346,13 @@ class LangfuseSidecar:
 
 
 class _ProviderUsageWindow:
-    """Attribute the HARN-022 call artifacts made during one operation (HARN-031)."""
+    """Attribute the HARN-022 call artifacts made during one operation (HARN-031).
+
+    Everything here is telemetry bookkeeping: it never raises, never coerces a
+    malformed count, and a call that cannot be read exactly is left unattributed.
+    Usage is attributed whenever a provider call succeeded, even if the operation
+    then failed validation, because that call was paid for.
+    """
 
     def __init__(self, provider_calls: Callable[[], Any] | None) -> None:
         self._source = provider_calls
@@ -357,24 +370,43 @@ class _ProviderUsageWindow:
         return len(self._snapshot())
 
     def close(self) -> tuple[dict[str, Any], str | None, dict[str, int] | None]:
-        """Return (metadata, model, usage); usage only from successful calls."""
+        """Return (metadata, model, usage); never raises."""
 
         if self._source is None:
             return {}, None, None
-        new_calls = self._snapshot()[self._start :]
-        successful = [c for c in new_calls if getattr(c, "error_type", None) is None]
-        metadata = {
-            "provider_calls": len(new_calls),
-            "provider_retries": max(0, len(new_calls) - 1) if new_calls else 0,
-        }
-        if not successful:
-            return metadata, None, None
-        model = getattr(successful[-1], "model", None)
-        usage = {
-            "input": sum(int(getattr(c, "input_tokens", 0) or 0) for c in successful),
-            "output": sum(int(getattr(c, "output_tokens", 0) or 0) for c in successful),
-        }
-        return metadata, (model if isinstance(model, str) and model else None), usage
+        try:
+            new_calls = self._snapshot()[self._start :]
+            successful = [c for c in new_calls if getattr(c, "error_type", None) is None]
+            metadata = {
+                "provider_calls": len(new_calls),
+                "provider_retries": max(0, len(new_calls) - 1) if new_calls else 0,
+            }
+            if not successful:
+                return metadata, None, None
+            model = getattr(successful[-1], "model", None)
+            if not isinstance(model, str) or not model.strip():
+                return metadata, None, None
+            usage = {"input": 0, "output": 0}
+            for call in successful:
+                for key, attr in (("input", "input_tokens"), ("output", "output_tokens")):
+                    value = getattr(call, attr, 0)
+                    if value is None:
+                        continue
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        return metadata, None, None
+                    usage[key] += value
+            return metadata, model.strip(), usage
+        except Exception:  # telemetry must never surface a provider bookkeeping error
+            return {}, None, None
+
+
+def _with_provider_usage(projection: ObservationProjection, model: str | None, usage: dict[str, int] | None):
+    """Attach model/usage without letting a projection error escape."""
+
+    try:
+        return replace(projection, model=model, usage=usage)
+    except Exception:
+        return projection
 
 
 def wrap_column_review_adapters(
@@ -475,7 +507,7 @@ def wrap_column_review_adapters(
                 revisit_request,
             )
         except Exception as exc:
-            usage_metadata, _, _ = window.close()
+            usage_metadata, model, usage = window.close()
             _emit_failed_operation(
                 sidecar,
                 state,
@@ -483,6 +515,8 @@ def wrap_column_review_adapters(
                 "cuc.parsing.adjudicate",
                 provider_type or "agent",
                 exc,
+                model=model,
+                usage=usage,
                 **metadata,
                 **usage_metadata,
             )
@@ -497,7 +531,7 @@ def wrap_column_review_adapters(
             **metadata,
             **usage_metadata,
         )
-        projection = replace(projection, model=model, usage=usage)
+        projection = _with_provider_usage(projection, model, usage)
         _emit_safely(sidecar, "emit_observation", projection)
         return result
 
@@ -506,7 +540,7 @@ def wrap_column_review_adapters(
         try:
             result = adapters.reconcile(state, skill_context, operation_id)
         except Exception as exc:
-            usage_metadata, _, _ = window.close()
+            usage_metadata, model, usage = window.close()
             _emit_failed_operation(
                 sidecar,
                 state,
@@ -514,6 +548,8 @@ def wrap_column_review_adapters(
                 "cuc.parsing.reconcile",
                 provider_type or "span",
                 exc,
+                model=model,
+                usage=usage,
                 **usage_metadata,
             )
             raise
@@ -528,7 +564,7 @@ def wrap_column_review_adapters(
             revisit_request_count=len(result.revisit_requests),
             **usage_metadata,
         )
-        projection = replace(projection, model=model, usage=usage)
+        projection = _with_provider_usage(projection, model, usage)
         _emit_safely(sidecar, "emit_observation", projection)
         return result
 

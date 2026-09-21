@@ -36,3 +36,23 @@ Traced 3-token slice of KTU 1.6 I: four generations in ClickHouse
 The live benchmark runtime builds its adapters internally; wiring the sidecar
 (and `provider_calls`) into `run_live_benchmark` / the 028b CLI is part of
 028b so whole-column runs are traced and priced without a hand-built graph.
+
+## Adversarial review — 2026-09-21
+
+NEEDS-HUMAN → fixed test-first:
+
+- **MEDIUM** — usage bookkeeping (`close()`, `replace()`) ran outside the
+  telemetry guard, so a malformed artifact could raise after the domain call
+  succeeded or mask a domain exception. The window now never raises: malformed
+  counts leave the call unattributed (no coercion of floats/bools/strings), and
+  attaching model/usage to a projection is guarded.
+- **LOW (decision)** — a successful provider call whose operation then failed
+  validation was billed but not priced. Failed operations now carry the model
+  and usage of the successful calls in their window.
+- **LOW** — a model that is not a non-empty string yields no usage either (never a
+  generation with usage but no model). Nested/overlapping operations would
+  double-attribute under a count-based window; unreachable in the sequential
+  HARN-004 graph, noted.
+- INFO — with a `provider_calls` source every adjudicate/reconcile is a
+  `generation` even with zero calls; nothing in the repository filters on the
+  observation type.
