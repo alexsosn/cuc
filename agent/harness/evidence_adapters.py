@@ -341,7 +341,10 @@ class DulatAdapter:
         except sqlite3.Error:
             return {}
         return {
-            entry_id: (_HTML_RE.sub("", str(lemma or "")).strip(), str(pos or "").strip())
+            entry_id: (
+                _HTML_RE.sub("", str(lemma or "")).strip(),
+                " ".join(dict.fromkeys(str(pos or "").split())),   # the index repeats POS tokens
+            )
             for entry_id, lemma, pos in rows
             if str(lemma or "").strip()
         }

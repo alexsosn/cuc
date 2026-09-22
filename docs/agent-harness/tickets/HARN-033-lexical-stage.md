@@ -200,5 +200,12 @@ two-reading golds. So the zero-call rule holds on a tablet with a legacy review
 and weaker parser coverage; the multi-gold tokens are the next thing to look at
 (the `ambiguous` question is not catching them).
 
+Re-review notes (2026-09-22) left open: `_match_key` also drops optional-letter
+brackets (`ảny(t)` → `any`), which only widens DULAT matching; request bodies are
+bounded except where a line's EUPT entry is large (one 18.7 KB entry on KTU
+1.14 I); a locally resolved token still produces a generation observation with
+no model/usage in Langfuse, while `local_resolutions` is only on the trial
+artifact.
+
 Next: the per-source ablation arms on both columns (each external source
 disabled in turn), then the `ambiguous` calibration on multi-gold tokens.

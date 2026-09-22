@@ -595,3 +595,15 @@ def test_runtime_rejects_any_malformed_structured_rows_as_a_provider_error(monke
     monkeypatch.setattr(runtime, "_invoke", lambda request: response)
     with pytest.raises(PPE, match="structured rows"):
         runtime.adjudicate(state, token, evidence, {"skill": "s"}, "r:initial:1001:adjudicate")
+
+
+def test_scorer_strips_unresolved_rows_from_the_baselines_as_well() -> None:
+    """Re-review note 3: a gold with one resolved row and one `?` row must score the parser like Jev."""
+
+    lex = _lex()
+    gold = {"1": [("lb", "n."), ("?", "?")]}
+    predicted = {"1": [("lb", "n.")]}
+    offered = {"1": [("lb", "n."), ("?", "?")]}
+    score = lex.score_lexical_column(predicted=predicted, gold=gold, offered=offered,
+                                     parser_first={"1": ("lb", "n.")}, parser_all={"1": [("lb", "n."), ("?", "?")]})
+    assert score.exact == 1 and score.parser_first_exact == 1 and score.parser_all_exact == 1 and score.ceiling == 1

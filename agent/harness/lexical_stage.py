@@ -288,8 +288,8 @@ def score_lexical_column(
                 subset += 1
         if parser_first is not None:
             first = parser_first.get(token_id)
-            if first is not None and _readings([first]) == g:
+            if first is not None and _readings([first]) - {_UNRESOLVED_READING} == g:
                 pf += 1
-        if parser_all is not None and _readings(parser_all.get(token_id)) == g:
+        if parser_all is not None and _readings(parser_all.get(token_id)) - {_UNRESOLVED_READING} == g:
             pa += 1
     return LexicalScore(scored, exact, lemma_exact, subset, ab_ok, ab_wrong, pf, pa, ceiling, unresolved)

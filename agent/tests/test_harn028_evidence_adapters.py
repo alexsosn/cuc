@@ -255,7 +255,8 @@ def test_dulat_adapter_carries_the_entry_headword_when_the_search_index_has_it(t
     con.commit()
     con.close()
     indexed = [json.loads(r.summary) for r in mod.DulatAdapter().collect(ctx, db)]
-    assert [(i["headword"], i["headword_pos"]) for i in indexed] == [("ġr", "n. m. n."), ("/y-d-y/", "vb vb")]
+    # The index repeats POS tokens ("vb vb", "n. m. n."); they are deduplicated in order.
+    assert [(i["headword"], i["headword_pos"]) for i in indexed] == [("ġr", "n. m."), ("/y-d-y/", "vb")]
     assert indexed[0]["label"] == "ġr (III)"          # the label is still there for the reviewer
 
 
