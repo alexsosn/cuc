@@ -689,3 +689,31 @@ def test_whitelisted_context_values_are_scalars_or_id_lists(monkeypatch) -> None
     assert state["review_context"]["scope"] == {"token_count": 3}
     assert state["review_context"]["worklist"] == {"priority_token_ids": ["1003"]}
     assert state["review_context"]["evidence"] == {"absent_sources": ["dulat"]}
+
+
+def test_runtime_carries_structured_rows_into_the_token_decision(monkeypatch) -> None:
+    """HARN-027 rows emitted by the provider survive into ColumnRunState (028b wiring)."""
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    transport = Transport(probabilities_by_analysis={"l(I)": 1.0, "ġr(III)/": 1.0})
+    client = _client(mod, transport)
+    spec = BenchmarkBackendSpec("jev", "typesafe", "jev-latest", "jev-1.13.0", SHA0)
+    binding = mod.jev_binding(spec, requested_model="jev-latest", exact_model_version="jev-1.13.0", client=client, exact_version_provenance="docs")
+    case = BenchmarkCase(1, "harn029-rows", _state(), SHA0, SHA0, SHA0, EvaluationTarget("t", GOLD_REF, "gold-provenance", "scorer", "scorer-provenance", SHA0))
+    budget = ProviderBudgetPolicy(16, 32, 20_000, 40_000, 1_000, 2_000, 64, 1, 10.0)
+    result = run_live_benchmark(case, (binding,), shared_adapters=_shared(), execution_policy=ProviderExecutionPolicy(budget=budget, allow_paid_live_execution=True))
+    final = result.benchmark.results[0].final_state
+    decision = final.latest_decision("1003")
+    assert decision.reviewed_rows and decision.reviewed_rows[0].dulat == "x"
+    assert decision.analyses == ("ġr(III)/",)
+    # A provider whose rows contradict its analyses is rejected by the state contract → backend error.
+    class Contradicting(Transport):
+        def __call__(self, url, headers, body, timeout_seconds):
+            result = super().__call__(url, headers, body, timeout_seconds)
+            return result
+
+    monkeypatch.setattr(mod.TypeSafeJevClient, "_adjudicate_payload", lambda self, r, c: {"analyses": ["other/"], "evidence_ids": [c[0].evidence_ids[0]], "summary": "s",
+                                                                                          "reviewed_rows": [{"morphological_parsing": "x/", "dulat": "d", "pos": "n.", "gloss": "g", "comments": ""}]})
+    result = run_live_benchmark(case, (binding,), shared_adapters=_shared(), execution_policy=ProviderExecutionPolicy(budget=budget, allow_paid_live_execution=True))
+    assert result.provider_trials[0].terminal_status != "completed"

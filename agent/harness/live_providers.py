@@ -21,6 +21,7 @@ from .column_state import (
     ColumnRunState,
     CorpusReconciliationFinding,
     ReconciliationScope,
+    ReviewedRow,
     RevisitRequest,
     TokenDecision,
 )
@@ -251,6 +252,14 @@ class ProviderJSONClient(Protocol):
         request: ProviderJSONRequest,
         timeout_seconds: float,
     ) -> ProviderResponse: ...
+
+    # Optional. A client that can answer a request without the provider (a token
+    # with exactly one parser lexeme, a reconcile over no decisions) returns the
+    # ProviderResponse here and the runtime books neither a request nor tokens
+    # for it. ``None`` means "ask the provider". The model must still be the
+    # exact configured version.
+    #
+    # def resolve_locally(self, request: ProviderJSONRequest) -> ProviderResponse | None: ...
 
 
 HttpJSON = Callable[
@@ -824,10 +833,17 @@ class ProviderTrialArtifact:
     budget_exhausted: bool
     calls: tuple[ProviderCallArtifact, ...] = ()
     input_token_count_kind: str = "exact"
+    # Decisions the client resolved without the provider (no request, no tokens).
+    local_resolutions: int = 0
 
     def __post_init__(self) -> None:
         if self.input_token_count_kind not in _TOKEN_COUNT_KINDS:
             raise ValueError("input_token_count_kind must be 'exact' or 'estimate'")
+        object.__setattr__(
+            self,
+            "local_resolutions",
+            _nonnegative_int(self.local_resolutions, "local_resolutions"),
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -849,6 +865,7 @@ class ProviderTrialArtifact:
             "output_tokens_reserved": self.output_tokens_reserved,
             "retries": self.retries,
             "budget_exhausted": self.budget_exhausted,
+            "local_resolutions": self.local_resolutions,
             "calls": [item.to_dict() for item in self.calls],
         }
 
@@ -1115,6 +1132,7 @@ class _ProviderDecisionRuntime:
         self.retries = 0
         self.budget_exhausted = False
         self.observed_output_tokens = 0
+        self.local_resolutions = 0
 
     def _count_input(self, request: ProviderJSONRequest) -> int:
         attempts = 0
@@ -1166,7 +1184,39 @@ class _ProviderDecisionRuntime:
             error_type=error_type,
         )
 
+    def _resolve_locally(
+        self,
+        request: ProviderJSONRequest,
+    ) -> Mapping[str, Any] | None:
+        """A client-side answer: no reservation, no call artifact, no usage."""
+
+        resolver = getattr(self.binding.client, "resolve_locally", None)
+        if not callable(resolver):
+            return None
+        try:
+            response = resolver(request)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderPermanentError(type(exc).__name__) from None
+        if response is None:
+            return None
+        if not isinstance(response, ProviderResponse):
+            raise ProviderPermanentError(
+                "provider client returned invalid local response type"
+            )
+        if response.model != self.binding.exact_model_version:
+            raise ProviderModelIdentityError(
+                "locally resolved response does not carry the configured "
+                "exact model version"
+            )
+        self.local_resolutions += 1
+        return response.payload
+
     def _invoke(self, request: ProviderJSONRequest) -> Mapping[str, Any]:
+        local = self._resolve_locally(request)
+        if local is not None:
+            return local
         counted_input = self._count_input(request)
         attempt = 0
         while True:
@@ -1362,23 +1412,39 @@ class _ProviderDecisionRuntime:
         decision_id = "decision-provider-" + sha256(
             f"{operation_id}:{_canonical_json(response)}".encode("utf-8")
         ).hexdigest()[:24]
-        return TokenDecision(
-            decision_id,
-            token.token_id,
-            analyses,
-            evidence_ids,
-            summary,
-            revisit_of=(
-                None
-                if revisit_request is None or prior is None
-                else prior.decision_id
-            ),
-            revisit_request_id=(
-                None
-                if revisit_request is None
-                else revisit_request.request_id
-            ),
-        )
+        # HARN-027 structured rows, when the provider supplies them; the state contract
+        # rejects rows whose morphology projection contradicts ``analyses``.
+        raw_rows = response.get("reviewed_rows")
+        if raw_rows is not None and not isinstance(raw_rows, list):
+            raise ProviderPermanentError(
+                "provider structured rows are invalid: not a list"
+            )
+        try:
+            rows = tuple(
+                ReviewedRow.from_dict(item) for item in (raw_rows or ())
+            )
+            return TokenDecision(
+                decision_id,
+                token.token_id,
+                analyses,
+                evidence_ids,
+                summary,
+                revisit_of=(
+                    None
+                    if revisit_request is None or prior is None
+                    else prior.decision_id
+                ),
+                revisit_request_id=(
+                    None
+                    if revisit_request is None
+                    else revisit_request.request_id
+                ),
+                reviewed_rows=rows,
+            )
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise ProviderPermanentError(
+                f"provider structured rows are invalid: {type(exc).__name__}"
+            ) from None
 
     def reconcile(
         self,
@@ -1509,6 +1575,7 @@ class _ProviderDecisionRuntime:
             budget_exhausted=self.budget_exhausted,
             calls=tuple(self.calls),
             input_token_count_kind=self.count_kind,
+            local_resolutions=self.local_resolutions,
         )
 
 
@@ -1526,6 +1593,7 @@ def _artifact_from_binding(
     budget_exhausted: bool = False,
     calls: tuple[ProviderCallArtifact, ...] = (),
     input_token_count_kind: str = "exact",
+    local_resolutions: int = 0,
 ) -> ProviderTrialArtifact:
     return ProviderTrialArtifact(
         backend_id=backend_id,
@@ -1547,6 +1615,7 @@ def _artifact_from_binding(
         retries=retries,
         budget_exhausted=budget_exhausted,
         calls=calls,
+        local_resolutions=local_resolutions,
     )
 
 
