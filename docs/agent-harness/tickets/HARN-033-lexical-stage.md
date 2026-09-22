@@ -30,9 +30,9 @@ options; abstention must never win by plurality.
 - **Lemma key**: the DULAT field, whitespace-normalised (`ġr (III)`, `/m-ġ-y/`,
   `-n (IV)`); `?` and empty are "unresolved".
 - **POS class**: the first whitespace token of the POS field (`n.`, `vb`,
-  `prep.`, `DN`, `conj.`, …; `Subordinating`→`subordinating`); for `vb` the
-  stem token is appended when present (`vb G`, `vb Gt`, `vb Š`). Number,
-  gender, case, state and conjugation are not part of stage 1.
+  `prep.`, `DN`, `conj.`, …; `Subordinating`→`subordinating`). The verb stem
+  is form-level (round 2 decision) and, like number, gender, case, state and
+  conjugation, is not part of stage 1.
 - **Lexical reading**: `(lemma key, POS class)`. A token's gold is the set of
   lexical readings over its reviewed rows; the prediction is the set over the
   kept alternatives.
@@ -86,7 +86,7 @@ HARN-005/031/032 environment flags. Stub completion gates until 028b.
 ## TDD gates
 
 1. `pos_class`/`lemma_key` on the real vocabulary (`vb G prefc. 3 m. sg.` →
-   `vb G`; `n. f. sg. cstr. gen.` → `n.`; `?`; `Subordinating functor`);
+   `vb`; `n. f. sg. cstr. gen.` → `n.`; `?`; `Subordinating functor`);
 2. grouping collapses case/gloss variants into one candidate, keeps homonyms
    apart, orders parser rows first, records attestations and glosses;
 3. request body for the lexical stage contains the line and neighbours but not
