@@ -39,6 +39,7 @@ NONE_OF_THESE = "none-of-these"
 UNRESOLVED = "?"
 
 _CANDIDATE_SOURCES = ("auto-parsing", "corpus-parallels", "legacy-review")
+_STAGES = ("full", "lexical")
 _ROW_FIELDS = ("morphological_parsing", "dulat", "pos", "gloss", "comments")
 # Keys of the skill context that may reach the model; evaluation or path-like data never does.
 _SKILL_CONTEXT_KEYS: Mapping[str, tuple[str, ...]] = {
@@ -61,6 +62,19 @@ _AMBIGUOUS_INSTRUCTIONS = (
     "More than one of the candidate readings offered for this token is "
     "defensible in this context, so the curated data should keep several "
     "alternatives rather than one."
+)
+_LEXEME_INSTRUCTIONS = (
+    "You are linking one token of a Ugaritic tablet line to its lexeme. The state "
+    "holds the line (with the neighbouring lines for context), the token under "
+    "review, the dictionary citations and translations that concern it, and the "
+    "lexemes already chosen for the other words of the line. Each option is one "
+    "lexeme with its part of speech, identified by its DULAT lemma and glosses. "
+    "Pick the lexeme the line and the evidence support best. Choose none-of-these "
+    "only when no listed lexeme is defensible."
+)
+_LEXICAL_AMBIGUOUS_INSTRUCTIONS = (
+    "More than one of the listed lexemes is defensible for this token in this "
+    "line, so the curated data should keep several readings rather than one."
 )
 _INCONSISTENT_INSTRUCTIONS = (
     "The reading chosen for this token contradicts the readings chosen for the "
@@ -86,8 +100,13 @@ class JevDecisionPolicy:
     finding_threshold: float = 0.5
     max_candidates: int = 64
     reconcile_batch_size: int = 150
+    # HARN-033: "full" asks for complete curated rows; "lexical" asks only for the
+    # lexeme + POS class over trimmed inputs and inherits the parser's morphology.
+    stage: str = "full"
 
     def __post_init__(self) -> None:
+        if self.stage not in _STAGES:
+            raise ValueError(f"stage must be one of {_STAGES}")
         for field in (
             "alternative_threshold",
             "ambiguous_threshold",
@@ -114,6 +133,7 @@ class JevDecisionPolicy:
             "finding_threshold": self.finding_threshold,
             "max_candidates": self.max_candidates,
             "reconcile_batch_size": self.reconcile_batch_size,
+            "stage": self.stage,
         }
 
 
@@ -344,6 +364,8 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         if isinstance(bytes_per_token, bool) or not isinstance(bytes_per_token, (int, float)) or bytes_per_token <= 0:
             raise ValueError("bytes_per_token must be positive")
         self._bytes_per_token = float(bytes_per_token)
+        # Set by jev_binding: the exact model version to report on zero-call responses.
+        self.declared_exact_model: str | None = None
 
     # --- request construction ------------------------------------------------------------
 
@@ -353,7 +375,9 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
             "Content-Type": "application/json",
         }
 
-    def _adjudicate_body(self, request: ProviderJSONRequest) -> tuple[dict[str, Any], tuple[Candidate, ...]]:
+    def _adjudicate_body(self, request: ProviderJSONRequest) -> tuple[dict[str, Any], tuple[Any, ...]]:
+        if self.decision_policy.stage == "lexical":
+            return self._lexical_body(request)
         payload = request.payload
         evidence = payload.get("evidence")
         if not isinstance(evidence, list):
@@ -390,6 +414,118 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
             "questions": {
                 "reading": {"type": "choice", "instructions": _READING_INSTRUCTIONS, "criteria": criteria},
                 "ambiguous": {"type": "noul", "instructions": _AMBIGUOUS_INSTRUCTIONS},
+            },
+        }
+        return body, candidates
+
+    def _lexical_body(self, request: ProviderJSONRequest) -> tuple[dict[str, Any], tuple[Any, ...]]:
+        """Stage 1 request: the line window, matching evidence, one option per lexeme."""
+
+        from .lexical_stage import group_lexical_candidates, lemma_key, pos_class
+
+        payload = request.payload
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, list):
+            raise ProviderPermanentError("adjudicate payload lacks evidence")
+        candidates = group_lexical_candidates(evidence, max_candidates=self.decision_policy.max_candidates)
+        if not candidates:
+            # Nothing to choose from (the parser left the token unresolved): stage 1 leaves
+            # it unresolved without a call. generate_json handles this before the network.
+            return {"model": request.requested_model, "state": {}, "questions": {}}, ()
+        lemmas = {c.reading.lemma for c in candidates} - {UNRESOLVED}
+        bare = {lemma.split(" (")[0] for lemma in lemmas}
+        token = payload.get("token") if isinstance(payload.get("token"), Mapping) else {}
+        surface = _text(token.get("surface"))
+        line_ref = _text(token.get("line_ref"))
+
+        # Line window from the snapshot: tokens of this line, one line before and after.
+        snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), Mapping) else {}
+        tokens = [t for t in (snapshot.get("tokens") or ()) if isinstance(t, Mapping)]
+        lines: list[str] = []
+        for t in tokens:
+            ref = _text(t.get("line_ref"))
+            if ref and ref not in lines:
+                lines.append(ref)
+        index = lines.index(line_ref) if line_ref in lines else -1
+        def line_text(ref: str | None) -> dict[str, str] | None:
+            if ref is None:
+                return None
+            return {"ref": ref, "text": " ".join(_text(t.get("surface")) for t in tokens if _text(t.get("line_ref")) == ref)}
+        line_tokens = [
+            {"token_id": t.get("token_id"), "surface": t.get("surface")}
+            for t in tokens
+            if _text(t.get("line_ref")) == line_ref
+        ]
+        context_lines = {
+            "before": line_text(lines[index - 1]) if index > 0 else None,
+            "after": line_text(lines[index + 1]) if 0 <= index < len(lines) - 1 else None,
+        }
+
+        # Same-line lexical decisions as context; nothing else from the history.
+        line_ids = {_text(t.get("token_id")) for t in line_tokens}
+        surfaces = {_text(t.get("token_id")): _text(t.get("surface")) for t in tokens}
+        line_decisions = []
+        for decision in payload.get("prior_decisions") or ():
+            if not isinstance(decision, Mapping):
+                continue
+            tid = _text(decision.get("token_id"))
+            rows = decision.get("reviewed_rows") or ()
+            if tid in line_ids and rows and isinstance(rows[0], Mapping):
+                line_decisions.append(
+                    {
+                        "surface": surfaces.get(tid, ""),
+                        "lemma": lemma_key(rows[0].get("dulat")),
+                        "pos": pos_class(rows[0].get("pos")),
+                    }
+                )
+
+        # Evidence: DULAT citations for candidate lemmas, EUPT for the line, Burns for
+        # the surface. Tropper (grammar pages) and unrelated citations are dropped.
+        context_evidence: list[dict[str, object]] = []
+        other_dulat = 0
+        for r in evidence:
+            if not isinstance(r, Mapping):
+                continue
+            source = _text(r.get("source_id"))
+            summary = r.get("summary")
+            if source == "dulat":
+                data = _parse_summary(summary) or {}
+                label = _text(data.get("label"))
+                if label and any(label == lemma or label == b or label.startswith(b + " ") for lemma in lemmas for b in bare):
+                    context_evidence.append({"source": source, "ref": _text(r.get("source_ref")), "content": summary})
+                else:
+                    other_dulat += 1
+            elif source == "eupt":
+                context_evidence.append({"source": source, "ref": _text(r.get("source_ref")), "content": summary})
+            elif source == "burns-cultic-vocabulary":
+                data = _parse_summary(summary) or {}
+                headword = _text(data.get("headword")).rstrip("†*!").strip()
+                if headword and (headword == surface or headword.split(" ")[0] == surface):
+                    context_evidence.append({"source": source, "ref": _text(r.get("source_ref")), "content": summary})
+
+        criteria: dict[str, object] = {c.key: c.option() for c in candidates}
+        criteria[NONE_OF_THESE] = {
+            "what": "No listed lexeme is defensible for this token in this line.",
+            "consequence": "The token stays unresolved and is escalated to hand review.",
+        }
+        task = payload.get("task") if isinstance(payload.get("task"), Mapping) else {}
+        state = {
+            "tablet": task.get("tablet"),
+            "column_name": task.get("column"),
+            "line": {"ref": line_ref, "tokens": line_tokens},
+            "context_lines": context_lines,
+            "token": {"token_id": token.get("token_id"), "surface": surface},
+            "line_decisions": line_decisions,
+            "evidence": context_evidence,
+            "dulat_citations_for_other_words_on_line": other_dulat,
+            "revisit_request": payload.get("revisit_request"),
+        }
+        body = {
+            "model": request.requested_model,
+            "state": state,
+            "questions": {
+                "lexeme": {"type": "choice", "instructions": _LEXEME_INSTRUCTIONS, "criteria": criteria},
+                "ambiguous": {"type": "noul", "instructions": _LEXICAL_AMBIGUOUS_INSTRUCTIONS},
             },
         }
         return body, candidates
@@ -458,10 +594,38 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         encoded = json.dumps(self._body(request), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return max(1, math.ceil(len(encoded) / self._bytes_per_token))
 
+    def _no_call_response(self, request: ProviderJSONRequest, payload: dict[str, Any]) -> ProviderResponse:
+        return ProviderResponse(
+            model=self.declared_exact_model or request.requested_model,
+            payload=payload,
+            usage=ProviderUsage(0, 0),
+            request_id=None,
+        )
+
     def generate_json(self, request: ProviderJSONRequest, timeout_seconds: float) -> ProviderResponse:
         self._current_operation = request.operation
         if request.operation == "adjudicate":
             body, candidates = self._adjudicate_body(request)
+            if not candidates:
+                evidence_ids = [
+                    _text(r.get("evidence_id"))
+                    for r in request.payload.get("evidence") or ()
+                    if isinstance(r, Mapping) and _text(r.get("source_id")) == "auto-parsing"
+                ] or [
+                    _text(r.get("evidence_id")) for r in request.payload.get("evidence") or () if isinstance(r, Mapping)
+                ]
+                if not evidence_ids:
+                    raise ProviderPermanentError("no evidence at all for an unresolved token")
+                return self._no_call_response(request, {
+                    "analyses": [UNRESOLVED],
+                    "evidence_ids": evidence_ids,
+                    "summary": "no candidate lexeme offered by any source; token left unresolved (no provider call)",
+                    "reviewed_rows": [{"morphological_parsing": UNRESOLVED, "dulat": UNRESOLVED, "pos": UNRESOLVED, "gloss": UNRESOLVED,
+                                       "comments": "no candidate lexeme from parser, parallels or legacy review; needs hand review"}],
+                    "jev": {"stage": self.decision_policy.stage, "choice": None, "reading": None, "readings": {}, "probabilities": {},
+                            "abstention_probability": None, "confidence": None, "ambiguous": None, "no_candidates": True,
+                            "alternative_threshold": self.decision_policy.alternative_threshold},
+                })
             result = self._http_json(f"{self._base_url}/systemone", self._headers(), body, timeout_seconds)
             return ProviderResponse(
                 model=_required(result.get("model"), "model"),
@@ -476,12 +640,7 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
 
         body, latest = self._reconcile_body(request)
         if not latest:
-            return ProviderResponse(
-                model=request.requested_model,
-                payload={"findings": []},
-                usage=ProviderUsage(0, 0),
-                request_id=None,
-            )
+            return self._no_call_response(request, {"findings": []})
         questions = body["questions"]
         keys = list(questions)
         size = self.decision_policy.reconcile_batch_size
@@ -515,13 +674,15 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
 
     # --- answer mapping ------------------------------------------------------------------
 
-    def _adjudicate_payload(self, result: Mapping[str, Any], candidates: tuple[Candidate, ...]) -> dict[str, Any]:
+    def _adjudicate_payload(self, result: Mapping[str, Any], candidates: tuple[Any, ...]) -> dict[str, Any]:
+        lexical = self.decision_policy.stage == "lexical"
+        question = "lexeme" if lexical else "reading"
         answers = result.get("answers")
         if not isinstance(answers, Mapping):
             raise ProviderPermanentError("Jev response has no answers")
-        reading = answers.get("reading")
+        reading = answers.get(question)
         if not isinstance(reading, Mapping):
-            raise ProviderPermanentError("Jev response lacks the reading answer")
+            raise ProviderPermanentError(f"Jev response lacks the {question} answer")
         by_key = {c.key: c for c in candidates}
         valid_keys = set(by_key) | {NONE_OF_THESE}
         choice = _text(reading.get("choice"))
@@ -559,6 +720,17 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         threshold = policy.alternative_threshold
         if ambiguous is not None and ambiguous >= policy.ambiguous_noul_cutoff:
             threshold = policy.ambiguous_threshold
+
+        # Abstention must not win by plurality: when the readings together outweigh
+        # none-of-these, the best reading is chosen and the abstention share recorded.
+        abstention = probabilities.get(NONE_OF_THESE, 0.0)
+        if choice == NONE_OF_THESE and abstention <= 0.5:
+            readings_only = {k: v for k, v in probabilities.items() if k != NONE_OF_THESE}
+            if readings_only:
+                choice = max(readings_only, key=lambda k: (readings_only[k], -int(k.rsplit("-", 1)[-1] or 0)))
+
+        if lexical:
+            return self._lexical_payload(choice, probabilities, confidence_value, ambiguous, threshold, candidates)
 
         if choice == NONE_OF_THESE:
             all_evidence = tuple(dict.fromkeys(eid for c in candidates for eid in c.evidence_ids))
@@ -614,15 +786,66 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
             "jev": self._jev_block(choice, probabilities, confidence_value, ambiguous, threshold),
         }
 
-    @staticmethod
-    def _jev_block(choice, probabilities, confidence, ambiguous, threshold) -> dict[str, object]:
+    def _jev_block(self, choice, probabilities, confidence, ambiguous, threshold) -> dict[str, object]:
         return {
+            "stage": self.decision_policy.stage,
             "choice": choice,
             "probabilities": dict(sorted(probabilities.items())),
+            "abstention_probability": probabilities.get(NONE_OF_THESE, 0.0),
             "confidence": confidence,
             "ambiguous": ambiguous,
             "alternative_threshold": threshold,
         }
+
+    def _lexical_payload(self, choice, probabilities, confidence, ambiguous, threshold, candidates) -> dict[str, Any]:
+        by_key = {c.key: c for c in candidates}
+        block = self._jev_block(choice, probabilities, confidence, ambiguous, threshold)
+        block["readings"] = {c.key: c.reading.to_dict() for c in candidates}
+        if choice == NONE_OF_THESE:
+            all_evidence = tuple(dict.fromkeys(eid for c in candidates for eid in c.evidence_ids))
+            if not all_evidence:
+                raise ProviderPermanentError("no candidate evidence available for an unresolved decision")
+            block["reading"] = None
+            return {
+                "analyses": [UNRESOLVED],
+                "evidence_ids": list(all_evidence),
+                "summary": (
+                    f"Jev (lexical stage) chose none-of-these (p={probabilities.get(NONE_OF_THESE, 0.0):.2f}, "
+                    f"confidence={confidence}); token left unresolved for hand review"
+                ),
+                "reviewed_rows": [
+                    {"morphological_parsing": UNRESOLVED, "dulat": UNRESOLVED, "pos": UNRESOLVED, "gloss": UNRESOLVED,
+                     "comments": "no candidate lexeme accepted by Jev; needs hand review"}
+                ],
+                "jev": block,
+            }
+        kept = [choice] + sorted(
+            (k for k, p in probabilities.items() if k != choice and k != NONE_OF_THESE and p >= threshold),
+            key=lambda k: (-probabilities[k], k),
+        )
+        rows: list[dict[str, str]] = []
+        analyses: list[str] = []
+        evidence_ids: list[str] = []
+        for key in kept:
+            candidate = by_key[key]
+            # The parser's rows for this lexeme carry stages 2–4 unchanged; parallel rows
+            # are used only when the parser offered no row for the chosen lexeme.
+            chosen_rows = candidate.rows[: candidate.parser_row_count] if candidate.parser_row_count else candidate.rows
+            for row in chosen_rows:
+                rows.append(dict(row))
+                if row["morphological_parsing"] not in analyses:
+                    analyses.append(row["morphological_parsing"])
+            for eid in candidate.evidence_ids:
+                if eid not in evidence_ids:
+                    evidence_ids.append(eid)
+        block["reading"] = by_key[choice].reading.to_dict()
+        chosen = by_key[choice].reading
+        summary = (
+            f"Jev (lexical stage) chose {chosen.lemma} [{chosen.pos_class}] "
+            f"(p={probabilities.get(choice, 0.0):.2f}, confidence={confidence}); "
+            f"kept {len(kept)} reading(s) at threshold {threshold:.2f}; ambiguous={ambiguous}"
+        )
+        return {"analyses": analyses, "evidence_ids": evidence_ids, "summary": summary, "reviewed_rows": rows, "jev": block}
 
     def _reconcile_payload(self, result: Mapping[str, Any], latest: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
         answers = result.get("answers")
@@ -684,16 +907,18 @@ def jev_binding(
     exact_model_version: str,
     client: TypeSafeJevClient,
     exact_version_provenance: str,
+    execution_kind: ExecutionKind = ExecutionKind.LIVE_PROVIDER,
 ) -> LiveProviderBinding:
     """Bind a Jev client as a HARN-016/022 backend arm."""
 
     if not isinstance(client, TypeSafeJevClient):
         raise ValueError("client must be TypeSafeJevClient")
+    client.declared_exact_model = exact_model_version
     return LiveProviderBinding(
         spec=spec,
         requested_model=requested_model,
         exact_model_version=exact_model_version,
         exact_version_provenance=exact_version_provenance,
         client=client,
-        execution_kind=ExecutionKind.LIVE_PROVIDER,
+        execution_kind=execution_kind,
     )

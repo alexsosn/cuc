@@ -9,7 +9,14 @@ import pytest
 
 from harness.column_state import ColumnSnapshot, ColumnToken, EvidenceRecord
 from harness.live_providers import ProviderPermanentError
-from tests.test_harn029_typesafe_jev import KEY_ENV, Transport, _adjudicate_payload, _request, _row, _state
+from tests.test_harn029_typesafe_jev import (
+    KEY_ENV,
+    Transport,
+    _adjudicate_payload,
+    _request,
+    _row,
+    _state,
+)
 
 
 def _lex():
@@ -108,6 +115,29 @@ def test_grouping_limits_and_unresolved_parser_rows() -> None:
 # --- trimmed request ----------------------------------------------------------------------
 
 
+class LexTransport(Transport):
+    """Answers by lemma key instead of analysis."""
+
+    def __init__(self, *, p_by_lemma, ambiguous=0.05, confidence=0.8, model="jev-1.13.0"):
+        super().__init__(probabilities_by_analysis={}, ambiguous=ambiguous, confidence=confidence, model=model)
+        self.p_by_lemma = p_by_lemma
+
+    def __call__(self, url, headers, body, timeout_seconds):
+        self.calls.append((url, dict(headers), json.loads(json.dumps(body))))
+        answers = {}
+        for name, q in body["questions"].items():
+            if q["type"] == "choice":
+                probs = {k: (self.p_by_lemma.get(v.get("lemma"), 0.0) if isinstance(v, dict) and "lemma" in v else self.p_by_lemma.get("none-of-these", 0.0)) for k, v in q["criteria"].items()}
+                total = sum(probs.values()) or 1.0
+                probs = {k: p / total for k, p in probs.items()}
+                answers[name] = {"type": "choice", "choice": max(probs, key=probs.get), "probabilities": probs, "confidence": self.confidence}
+            else:
+                answers[name] = {"type": "noul", "noul": self.ambiguous}
+        return {"model": self.model, "answers": answers, "usage": {"input_tokens": 50, "output_tokens": 0}}
+
+
+
+
 def _lexical_client(mod, transport):
     return mod.TypeSafeJevClient(api_key_env=KEY_ENV, http_json=transport, decision_policy=mod.JevDecisionPolicy(stage="lexical"))
 
@@ -136,7 +166,7 @@ def test_lexical_request_is_trimmed_to_the_line_window_and_matching_evidence(mon
         {"decision_id": "d2", "token_id": "2", "analyses": ["l(I)"], "evidence_ids": ["x"], "summary": "s", "revisit_of": None, "revisit_request_id": None,
          "reviewed_rows": [{"morphological_parsing": "l(I)", "dulat": "l (I)", "pos": "prep.", "gloss": "to", "comments": ""}]},
     ]
-    transport = Transport(probabilities_by_analysis={"lb/": 1.0})
+    transport = LexTransport(p_by_lemma={"lb": 1.0})
     _lexical_client(mod, transport).generate_json(_request(_column_payload(_evidence(), prior=prior)), 5.0)
     body = transport.calls[0][2]
     state = body["state"]
@@ -168,7 +198,7 @@ def test_lexical_request_is_trimmed_to_the_line_window_and_matching_evidence(mon
 def test_lexical_request_at_column_edges_has_partial_window(monkeypatch) -> None:
     mod = _jev()
     monkeypatch.setenv(KEY_ENV, "sk-test")
-    transport = Transport(probabilities_by_analysis={"lb/": 1.0})
+    transport = LexTransport(p_by_lemma={"w": 1.0})
     ev = [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row("w", "w", "conj.", "and")).to_dict()]
     _lexical_client(mod, transport).generate_json(_request(_column_payload(ev, token_index=0)), 5.0)
     state = transport.calls[0][2]["state"]
@@ -176,27 +206,6 @@ def test_lexical_request_at_column_edges_has_partial_window(monkeypatch) -> None
 
 
 # --- answer mapping -----------------------------------------------------------------------
-
-
-class LexTransport(Transport):
-    """Answers by lemma key instead of analysis."""
-
-    def __init__(self, *, p_by_lemma, ambiguous=0.05, confidence=0.8, model="jev-1.13.0"):
-        super().__init__(probabilities_by_analysis={}, ambiguous=ambiguous, confidence=confidence, model=model)
-        self.p_by_lemma = p_by_lemma
-
-    def __call__(self, url, headers, body, timeout_seconds):
-        self.calls.append((url, dict(headers), json.loads(json.dumps(body))))
-        answers = {}
-        for name, q in body["questions"].items():
-            if q["type"] == "choice":
-                probs = {k: (self.p_by_lemma.get(v.get("lemma"), 0.0) if isinstance(v, dict) and "lemma" in v else self.p_by_lemma.get("none-of-these", 0.0)) for k, v in q["criteria"].items()}
-                total = sum(probs.values()) or 1.0
-                probs = {k: p / total for k, p in probs.items()}
-                answers[name] = {"type": "choice", "choice": max(probs, key=probs.get), "probabilities": probs, "confidence": self.confidence}
-            else:
-                answers[name] = {"type": "noul", "noul": self.ambiguous}
-        return {"model": self.model, "answers": answers, "usage": {"input_tokens": 50, "output_tokens": 0}}
 
 
 def test_chosen_reading_yields_the_parsers_rows_for_that_lexeme(monkeypatch) -> None:
@@ -273,3 +282,28 @@ def test_lexical_scorer_reports_exactness_abstentions_and_baselines() -> None:
     d = score.to_dict()
     assert d["exact_rate"] == 0.25 and d["ceiling_rate"] == 0.75
     assert lex.gold_lexical_readings([("lb/", "lb", "n. m. sg. abs. gen.", "heart")]) == (lex.LexicalReading("lb", "n."),)
+
+
+def test_token_without_any_lexeme_is_left_unresolved_without_a_call(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    transport = LexTransport(p_by_lemma={})
+    client = _lexical_client(mod, transport)
+    client.declared_exact_model = "jev-1.13.0"
+    ev = [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row("?", "?", "?", "?")).to_dict(),
+          EvidenceRecord("op:dulat:1", "dulat", "d", "p", "{}").to_dict()]
+    response = client.generate_json(_request(_column_payload(ev)), 5.0)
+    assert transport.calls == []
+    assert response.model == "jev-1.13.0" and response.usage.input_tokens == 0
+    assert response.payload["analyses"] == ["?"]
+    assert response.payload["evidence_ids"] == ["op:auto-parsing:1"]
+    assert response.payload["jev"]["reading"] is None and response.payload["jev"]["no_candidates"] is True
+
+
+def test_binding_declares_the_exact_model_to_the_client(monkeypatch) -> None:
+    mod = _jev()
+    from harness.model_benchmark import BenchmarkBackendSpec
+    client = _lexical_client(mod, LexTransport(p_by_lemma={}))
+    mod.jev_binding(BenchmarkBackendSpec("j", "typesafe", "jev-latest", "jev-1.13.0", "0" * 64), requested_model="jev-latest",
+                    exact_model_version="jev-1.13.0", client=client, exact_version_provenance="docs")
+    assert client.declared_exact_model == "jev-1.13.0"

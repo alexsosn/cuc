@@ -21,6 +21,7 @@ from .column_state import (
     ColumnRunState,
     CorpusReconciliationFinding,
     ReconciliationScope,
+    ReviewedRow,
     RevisitRequest,
     TokenDecision,
 )
@@ -1362,23 +1363,36 @@ class _ProviderDecisionRuntime:
         decision_id = "decision-provider-" + sha256(
             f"{operation_id}:{_canonical_json(response)}".encode("utf-8")
         ).hexdigest()[:24]
-        return TokenDecision(
-            decision_id,
-            token.token_id,
-            analyses,
-            evidence_ids,
-            summary,
-            revisit_of=(
-                None
-                if revisit_request is None or prior is None
-                else prior.decision_id
-            ),
-            revisit_request_id=(
-                None
-                if revisit_request is None
-                else revisit_request.request_id
-            ),
-        )
+        # HARN-027 structured rows, when the provider supplies them; the state contract
+        # rejects rows whose morphology projection contradicts ``analyses``.
+        raw_rows = response.get("reviewed_rows")
+        try:
+            rows = tuple(
+                ReviewedRow.from_dict(item)
+                for item in (raw_rows if isinstance(raw_rows, list) else ())
+            )
+            return TokenDecision(
+                decision_id,
+                token.token_id,
+                analyses,
+                evidence_ids,
+                summary,
+                revisit_of=(
+                    None
+                    if revisit_request is None or prior is None
+                    else prior.decision_id
+                ),
+                revisit_request_id=(
+                    None
+                    if revisit_request is None
+                    else revisit_request.request_id
+                ),
+                reviewed_rows=rows,
+            )
+        except ValueError as exc:
+            raise ProviderPermanentError(
+                f"provider structured rows are invalid: {type(exc).__name__}"
+            ) from None
 
     def reconcile(
         self,
