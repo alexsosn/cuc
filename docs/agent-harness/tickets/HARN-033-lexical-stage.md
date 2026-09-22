@@ -1,0 +1,105 @@
+# HARN-033 — Stage 1 only: lexical linking + POS with Jev
+
+Decided 2026-09-22. The parsing decision is split into stages with minimal
+inputs: (1) lexical linking + POS category, (2) form linking + morphological
+features, (3) gloss, (4) morphological encoding. Stage 1 is valuable on its own
+and is what the automatic parser is weakest at, so the Jev pipeline and its
+evaluation are narrowed to it.
+
+## Research — 2026-09-22
+
+Profile of the first full-stage Jev run on KTU 1.6 I (299 tokens):
+
+- a request averaged 28.7 KB (≈18.5k tokens): whole-column token list 61%,
+  prior-decision history 25%, candidate options 5%, DULAT 1.5%, Burns 2.1%,
+  EUPT 0.9%, Tropper 0.5%, instructions 2.7%;
+- 59% of DULAT citations sent per token concern other words on the same line
+  (the reverse index is line-keyed); Burns rows are line-level too;
+- of 27 `none-of-these` abstentions, 11 were correct (gold not offered; the
+  parser had no reading in 7), and 13 of the remaining 16 were a plurality
+  artefact: the gold reading was offered as 2–5 near-identical options
+  differing only in case or gloss wording, the probability mass split across
+  them, and `none-of-these` won with p as low as 0.22.
+
+Conclusions: for the lexical decision the column listing, the history and the
+grammar pointers carry nothing; case/gloss variants must not be separate
+options; abstention must never win by plurality.
+
+## Definitions
+
+- **Lemma key**: the DULAT field, whitespace-normalised (`ġr (III)`, `/m-ġ-y/`,
+  `-n (IV)`); `?` and empty are "unresolved".
+- **POS class**: the first whitespace token of the POS field (`n.`, `vb`,
+  `prep.`, `DN`, `conj.`, …; `Subordinating`→`subordinating`); for `vb` the
+  stem token is appended when present (`vb G`, `vb Gt`, `vb Š`). Number,
+  gender, case, state and conjugation are not part of stage 1.
+- **Lexical reading**: `(lemma key, POS class)`. A token's gold is the set of
+  lexical readings over its reviewed rows; the prediction is the set over the
+  kept alternatives.
+
+## Plan
+
+### `harness.lexical_stage`
+
+- `pos_class(pos_field)`, `lemma_key(dulat_field)`, `LexicalReading`.
+- `group_lexical_candidates(evidence, max_candidates)`: candidate-bearing
+  evidence (auto-parsing rows, corpus-parallel readings, legacy analyses)
+  grouped by lexical reading; each candidate keeps its rows (parser rows first),
+  sources, attestation count, up to three distinct glosses as identification
+  aid, and the evidence ids behind it. Legacy analyses carry the lemma from the
+  analysis string and POS `?`.
+- `gold_lexical_readings(rows)`, `score_lexical_column(...)` → exact-set,
+  lemma-only exact, abstentions split into correct (gold not offered) and
+  wrong, plus parser baselines (first alternative; all alternatives) and the
+  ceiling (gold reading among the offered candidates).
+
+### Jev client, stage `lexical`
+
+`JevDecisionPolicy(stage="lexical")`:
+
+- **state**: the token; the line's tokens (surfaces) and the neighbouring line
+  on each side; DULAT citations at the line whose label matches a candidate
+  lemma (others summarised as a count); EUPT vocalisation/translation for the
+  line; Burns rows only when the headword matches the surface; same-line prior
+  lexical decisions (surface → lemma) as context. No column listing, no
+  history, no Tropper.
+- **questions**: `lexeme` (choice over lexical candidates + `none-of-these`)
+  and `ambiguous` (noul).
+- **answer**: chosen candidate → `analyses` = the parser's morphology strings
+  for that reading (parallel rows only when the parser has none),
+  `reviewed_rows` = those rows; alternatives above threshold as further
+  readings; `none-of-these` only when p(none) > 0.5 (abstention cannot win by
+  plurality — applied to the full stage too); the `jev` block records the
+  stage, the chosen reading and the per-reading probabilities.
+- reconcile: unchanged (one noul per token, batched), phrased for the lexeme.
+
+### Runner script
+
+`agent/scripts/jev_lexical_stage.py --tablet "KTU 1.6" --column I
+[--evidence dulat,eupt,...] [--dry-run]`: loads the column, builds the
+collector for the requested policy, runs the HARN-022 live runtime with the
+lexical-stage client, scores against the reviewed gold with the lexical
+scorer, and writes a metrics-only report (JSON + markdown) under
+`agent/reports/jev-lexical/` (ignored). Tracing and I/O capture follow the
+HARN-005/031/032 environment flags. Stub completion gates until 028b.
+
+## TDD gates
+
+1. `pos_class`/`lemma_key` on the real vocabulary (`vb G prefc. 3 m. sg.` →
+   `vb G`; `n. f. sg. cstr. gen.` → `n.`; `?`; `Subordinating functor`);
+2. grouping collapses case/gloss variants into one candidate, keeps homonyms
+   apart, orders parser rows first, records attestations and glosses;
+3. request body for the lexical stage contains the line and neighbours but not
+   the column listing, no history beyond the same line, no Tropper, only
+   matching DULAT/Burns; size bounded;
+4. answer mapping: chosen reading → parser rows; abstention needs p(none) > 0.5
+   (`gm` case: p(none)=0.22 with five variants → reading chosen); alternatives;
+   legacy-only reading; forward-compatible payload;
+5. scorer: exact, lemma-only, correct vs wrong abstention, baselines, ceiling,
+   on a small fixture with a multi-row gold token;
+6. script: dry run with the test-double transport writes a report with no
+   resource text.
+
+## Non-goals
+
+Stages 2–4; changing the HARN-018 state contract; the 028b gates/CLI.
