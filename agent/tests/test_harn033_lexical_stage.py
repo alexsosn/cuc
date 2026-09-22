@@ -37,9 +37,9 @@ def _jev():
     "pos,expected",
     [
         ("n. f. sg. cstr. gen.", "n."),
-        ("vb G prefc. 3 m. sg.", "vb G"),
-        ("vb Gt suffc. 3 m. sg. + encl. -m", "vb Gt"),
-        ("vb Špass", "vb Špass"),
+        ("vb G prefc. 3 m. sg.", "vb"),
+        ("vb Gt suffc. 3 m. sg. + encl. -m", "vb"),
+        ("vb Špass", "vb"),
         ("vb", "vb"),
         ("DN m. sg. abs. gen.", "DN"),
         ("Subordinating functor", "subordinating"),
@@ -90,7 +90,8 @@ def test_grouping_collapses_case_and_gloss_variants_and_keeps_homonyms_apart() -
     lex = _lex()
     cands = lex.group_lexical_candidates(_evidence(), max_candidates=64)
     readings = [(c.reading.lemma, c.reading.pos_class) for c in cands]
-    assert readings == [("lb", "n."), ("/l-b-b/", "vb G"), ("lb (II)", "n."), ("lb (III)", "?")]
+    assert readings == [("lb", "n."), ("/l-b-b/", "vb"), ("lb (II)", "n."), ("lb (III)", "?")]
+    assert cands[0].forms == ("lb/",) and cands[1].forms == ("!l!b[",)
     lb = cands[0]
     assert [r["morphological_parsing"] for r in lb.rows] == ["lb/", "lb/", "lb/"]      # parser rows first, then parallel
     assert lb.rows[0]["pos"] == "n. m. sg. abs. gen." and lb.rows[2]["pos"] == "n. m. sg. cstr. nom."
@@ -135,6 +136,18 @@ class LexTransport(Transport):
                 answers[name] = {"type": "noul", "noul": self.ambiguous}
         return {"model": self.model, "answers": answers, "usage": {"input_tokens": 50, "output_tokens": 0}}
 
+
+
+
+class NoulTransport(LexTransport):
+    def __init__(self, *, fits: float, **kw):
+        super().__init__(p_by_lemma={}, **kw)
+        self.fits = fits
+
+    def __call__(self, url, headers, body, timeout_seconds):
+        self.calls.append((url, dict(headers), json.loads(json.dumps(body))))
+        answers = {name: {"type": "noul", "noul": self.fits if name == "lexeme_fits" else self.ambiguous} for name in body["questions"]}
+        return {"model": self.model, "answers": answers, "usage": {"input_tokens": 40, "output_tokens": 0}}
 
 
 
@@ -191,16 +204,19 @@ def test_lexical_request_is_trimmed_to_the_line_window_and_matching_evidence(mon
     assert sorted(k for k in crit if k != "none-of-these") == ["reading-1", "reading-2", "reading-3", "reading-4"]
     assert crit["reading-1"]["lemma"] == "lb" and crit["reading-1"]["pos"] == "n." and crit["reading-1"]["glosses"] == ["heart", "heart, mind"]
     assert crit["reading-1"]["reviewed_attestations_elsewhere"] == 7 and crit["reading-1"]["parser_alternatives"] == 2
-    assert "morphological_parsing" not in json.dumps(crit)   # stage 1 does not show encodings
+    assert crit["reading-1"]["forms"] == ["lb/"]             # how the surface maps onto the lemma
+    assert "aleph" in body["questions"]["lexeme"]["instructions"].lower()
     assert len(json.dumps(body, ensure_ascii=False).encode()) < 6000
 
 
 def test_lexical_request_at_column_edges_has_partial_window(monkeypatch) -> None:
     mod = _jev()
     monkeypatch.setenv(KEY_ENV, "sk-test")
-    transport = LexTransport(p_by_lemma={"w": 1.0})
+    transport = NoulTransport(fits=0.9)
     ev = [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row("w", "w", "conj.", "and")).to_dict()]
-    _lexical_client(mod, transport).generate_json(_request(_column_payload(ev, token_index=0)), 5.0)
+    client = mod.TypeSafeJevClient(api_key_env=KEY_ENV, http_json=transport,
+                                   decision_policy=mod.JevDecisionPolicy(stage="lexical", verify_single_candidate=True))
+    client.generate_json(_request(_column_payload(ev, token_index=0)), 5.0)
     state = transport.calls[0][2]["state"]
     assert state["context_lines"]["before"] is None and state["context_lines"]["after"]["ref"] == "I:5"
 
@@ -244,13 +260,17 @@ def test_full_stage_also_refuses_plurality_abstention(monkeypatch) -> None:
     assert payload["analyses"][0] != "?"
 
 
-def test_alternative_lexemes_kept_above_threshold_and_parallel_only_lexeme_uses_parallel_rows(monkeypatch) -> None:
+def test_alternative_lexemes_kept_only_when_jev_reports_ambiguity(monkeypatch) -> None:
     mod = _jev()
     monkeypatch.setenv(KEY_ENV, "sk-test")
-    transport = LexTransport(p_by_lemma={"lb": 0.55, "lb (II)": 0.45})
+    # Same distribution; without an ambiguity signal only the top lexeme is kept.
+    transport = LexTransport(p_by_lemma={"lb": 0.55, "lb (II)": 0.45}, ambiguous=0.1)
+    payload = _lexical_client(mod, transport).generate_json(_request(_column_payload(_evidence())), 5.0).payload
+    assert payload["analyses"] == ["lb/"]
+    transport = LexTransport(p_by_lemma={"lb": 0.55, "lb (II)": 0.45}, ambiguous=0.8)
     payload = _lexical_client(mod, transport).generate_json(_request(_column_payload(_evidence())), 5.0).payload
     assert payload["analyses"] == ["lb/", "lb(II)/"]
-    assert payload["reviewed_rows"][-1]["gloss"] == "lion"
+    assert payload["reviewed_rows"][-1]["gloss"] == "lion"      # parallel-only lexeme uses the parallel row
 
 
 # --- scorer -------------------------------------------------------------------------------
@@ -270,8 +290,8 @@ def test_lexical_scorer_reports_exactness_abstentions_and_baselines() -> None:
         "3": [("?", "?")],                        # abstained; gold not offered → correct abstention
         "4": [("?", "?")],                        # abstained; gold offered → wrong abstention
     }
-    offered = {"1": [("lb", "n."), ("/l-b-b/", "vb G")], "2": [("šnm", "DN"), ("šnt (I)", "n.")], "3": [("/n-d-d/", "vb G")], "4": [("qn", "n.")]}
-    parser_first = {"1": ("lb", "n."), "2": ("šnm", "DN"), "3": ("/n-d-d/", "vb G"), "4": ("qn", "n.")}
+    offered = {"1": [("lb", "n."), ("/l-b-b/", "vb")], "2": [("šnm", "DN"), ("šnt (I)", "n.")], "3": [("/n-d-d/", "vb")], "4": [("qn", "n.")]}
+    parser_first = {"1": ("lb", "n."), "2": ("šnm", "DN"), "3": ("/n-d-d/", "vb"), "4": ("qn", "n.")}
     parser_all = {k: v for k, v in offered.items()}
     score = lex.score_lexical_column(predicted=predicted, gold=gold, offered=offered, parser_first=parser_first, parser_all=parser_all)
     assert score.tokens == 4
@@ -307,3 +327,58 @@ def test_binding_declares_the_exact_model_to_the_client(monkeypatch) -> None:
     mod.jev_binding(BenchmarkBackendSpec("j", "typesafe", "jev-latest", "jev-1.13.0", "0" * 64), requested_model="jev-latest",
                     exact_model_version="jev-1.13.0", client=client, exact_version_provenance="docs")
     assert client.declared_exact_model == "jev-1.13.0"
+
+
+
+# --- round 2: single-candidate tokens and confidence-gated abstention ---------------------------
+
+
+def _single_evidence():
+    return [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row("aps/+h", "ảps", "n. m. sg. cstr. nom.", "extremity")).to_dict(),
+            EvidenceRecord("op:dulat:1", "dulat", "d", "p", json.dumps({"entry_id": 1, "label": "ảps", "sense_labels": ["1) extremity"]})).to_dict()]
+
+
+def test_single_candidate_token_is_accepted_without_a_call_by_default(monkeypatch) -> None:
+    """The parser's only lexeme is right ~98% of the time; a veto question is noise."""
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    transport = NoulTransport(fits=0.2)
+    client = _lexical_client(mod, transport)
+    client.declared_exact_model = "jev-1.13.0"
+    response = client.generate_json(_request(_column_payload(_single_evidence())), 5.0)
+    assert transport.calls == []
+    assert response.model == "jev-1.13.0" and response.usage.input_tokens == 0
+    payload = response.payload
+    assert payload["analyses"] == ["aps/+h"] and payload["reviewed_rows"][0]["dulat"] == "ảps"
+    assert payload["jev"]["question"] == "single-candidate-accepted"
+    assert payload["jev"]["reading"] == {"lemma": "ảps", "pos": "n."}
+
+
+def test_verify_singles_asks_a_noul_and_records_it_as_review_priority_only(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    transport = NoulTransport(fits=0.2)
+    client = mod.TypeSafeJevClient(api_key_env=KEY_ENV, http_json=transport,
+                                   decision_policy=mod.JevDecisionPolicy(stage="lexical", verify_single_candidate=True))
+    payload = client.generate_json(_request(_column_payload(_single_evidence())), 5.0).payload
+    body = transport.calls[0][2]
+    assert list(body["questions"]) == ["lexeme_fits"] and body["state"]["candidate"]["forms"] == ["aps/+h"]
+    # Still accepted: the fit is a worklist signal, never a decision.
+    assert payload["analyses"] == ["aps/+h"]
+    assert payload["jev"]["question"] == "lexeme_fits" and payload["jev"]["fits"] == 0.2
+    assert payload["jev"]["review_priority"] == pytest.approx(0.8)
+    assert "review priority" in payload["summary"]
+
+
+def test_multi_candidate_abstention_needs_confidence(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    # p(none)=0.6 but confidence 0.1: "no opinion", so the best reading is taken and flagged.
+    transport = LexTransport(p_by_lemma={"none-of-these": 0.6, "lb": 0.3, "/l-b-b/": 0.1}, confidence=0.1)
+    payload = _lexical_client(mod, transport).generate_json(_request(_column_payload(_evidence())), 5.0).payload
+    assert payload["analyses"] == ["lb/"]
+    assert payload["jev"]["abstention_probability"] == pytest.approx(0.6) and payload["jev"]["low_confidence"] is True
+    transport = LexTransport(p_by_lemma={"none-of-these": 0.6, "lb": 0.3, "/l-b-b/": 0.1}, confidence=0.7)
+    payload = _lexical_client(mod, transport).generate_json(_request(_column_payload(_evidence())), 5.0).payload
+    assert payload["analyses"] == ["?"]

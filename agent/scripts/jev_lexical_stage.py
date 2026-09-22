@@ -111,6 +111,7 @@ def main() -> int:
     parser.add_argument("--exact-model", default="jev-1.13.0")
     parser.add_argument("--max-input-tokens", type=int, default=6_000_000)
     parser.add_argument("--dry-run", action="store_true", help="test double instead of Jev; no network, no cost")
+    parser.add_argument("--verify-singles", action="store_true", help="also ask Jev whether a single candidate fits (review priority only)")
     parser.add_argument("--reports", default=str(HERE.parent / "reports" / "jev-lexical"))
     args = parser.parse_args()
 
@@ -127,7 +128,7 @@ def main() -> int:
 
     sidecar = LangfuseSidecar.from_environment()
     capture = ProviderIOCapture() if sidecar.capture_io else None
-    policy = JevDecisionPolicy(stage="lexical")
+    policy = JevDecisionPolicy(stage="lexical", verify_single_candidate=args.verify_singles)
     if args.dry_run:
         client = TypeSafeJevClient(api_key_env="TYPESAFE_API_KEY_UNUSED", http_json=_DryRunTransport(), decision_policy=policy, capture=capture)
         client.execution_kind = ExecutionKind.TEST_DOUBLE

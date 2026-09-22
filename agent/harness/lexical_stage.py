@@ -30,14 +30,15 @@ def _text(value: object) -> str:
 
 
 def pos_class(pos_field: object) -> str:
-    """``n. f. sg. cstr. gen.`` → ``n.``; ``vb G prefc. 3 m. sg.`` → ``vb G``; empty → ``?``."""
+    """``n. f. sg. cstr. gen.`` → ``n.``; ``vb G prefc. 3 m. sg.`` → ``vb``; empty → ``?``.
+
+    The verb stem is form-level (stage 2) and is not part of the lexical POS class.
+    """
 
     tokens = _text(pos_field).split(" ")
     head = tokens[0] if tokens and tokens[0] else UNRESOLVED
     if head == "Subordinating":
         head = "subordinating"
-    if head == "vb" and len(tokens) > 1 and tokens[1] in _VERB_STEMS:
-        return f"vb {tokens[1]}"
     return head
 
 
@@ -68,10 +69,24 @@ class LexicalCandidate:
     glosses: tuple[str, ...]
     evidence_ids: tuple[str, ...]
 
+    @property
+    def forms(self) -> tuple[str, ...]:
+        """Distinct parser segmentations linking the surface to the lemma (≤ 3)."""
+
+        seen: list[str] = []
+        for row in self.rows[: self.parser_row_count] or self.rows:
+            form = row.get("morphological_parsing", "")
+            if form and form != UNRESOLVED and form not in seen:
+                seen.append(form)
+            if len(seen) == 3:
+                break
+        return tuple(seen)
+
     def option(self) -> dict[str, object]:
         description: dict[str, object] = {
             "lemma": self.reading.lemma,
             "pos": self.reading.pos_class,
+            "forms": list(self.forms),
             "glosses": list(self.glosses),
             "from": list(self.sources),
         }

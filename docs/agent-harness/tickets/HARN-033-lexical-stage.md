@@ -103,3 +103,45 @@ HARN-005/031/032 environment flags. Stub completion gates until 028b.
 ## Non-goals
 
 Stages 2–4; changing the HARN-018 state contract; the 028b gates/CLI.
+
+## Results — 2026-09-22, KTU 1.6 column I (299 tokens, all sources, jev-1.13.0)
+
+Lexical exactness = predicted set of (lemma, POS class) equals the gold set;
+an abstention counts as correct only when no gold reading was offered.
+
+| arm | exact | lemma-only | wrong abstentions | input tokens |
+|---|---|---|---|---|
+| parser, all alternatives | 73.9% | | | |
+| parser, first alternative | 79.6% | | | |
+| full-stage Jev (HARN-029, for comparison, morphology-set metric) | 77.3% | | 16 | 5.3M |
+| stage 1 round 1: trimmed inputs, one option per lexeme + none | 72.2% | 80.9% | 29 | 427k |
+| stage 1 round 2: + parser forms in options, aleph note, Noul for single candidates, abstention needs confidence ≥ 0.5 | 75.3% | 80.9% | 28 | 419k |
+| stage 1 round 3: + single candidates accepted without a call, alternatives only when Jev reports ambiguity | **87.3%** | **90.3%** | **0** | 252k |
+| ceiling (gold among offered) | 94.3% | | | |
+
+What the rounds taught:
+
+- **Single-candidate tokens (171/299)**: the parser's only lexeme is right in
+  168 (98.2%). A "this lexeme or none" choice put 0.51–0.94 on none for `b`,
+  `ảrṣ`, `hdm`; a yes/no Noul was calibrated but useless at this base rate (28
+  false vetoes at p < 0.5 against 2 true misses at 0.07 and 0.23). The parser's
+  reading is accepted; `--verify-singles` records the fit as a review-priority
+  signal only, in line with the skill's rule that worklists prioritise attention
+  and never decide.
+- **Multi-candidate tokens (119/299)**: Jev 79.0% exact vs parser-first 56.3%,
+  ceiling 95.0%. This is where stage 1 earns its keep.
+- **Alternatives**: keeping every lexeme above the probability threshold cost
+  nine exact matches and gained none (one token in the column has two gold
+  lexical readings). Alternatives are kept only when the `ambiguous` question
+  answers yes.
+- **Forms**: `apsh`→`ảps`, `ṣpˤn`→`ṣpn`, `psltm`→`pslt (I)` were rejected until
+  the option showed the parser's segmentation (`aps/+h`) and the instructions
+  explained the aleph diacritics; the form is stage-1 evidence, the features are
+  not.
+- Remaining misses are real lexical/POS decisions (`ỉl` DN vs n., `ym (II)` DN
+  vs n., `l` homonyms, `ảḥd` adj. vs num.) and 9 tokens with no candidate at
+  all (parser unresolved), which no closed-choice backend can fix; those feed
+  the parser-improvement loop (HARN-017).
+
+Next: the per-source ablation arms on this column (each external source
+disabled in turn), then a second column to check the numbers hold.

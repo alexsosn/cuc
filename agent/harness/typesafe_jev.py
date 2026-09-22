@@ -68,9 +68,19 @@ _LEXEME_INSTRUCTIONS = (
     "holds the line (with the neighbouring lines for context), the token under "
     "review, the dictionary citations and translations that concern it, and the "
     "lexemes already chosen for the other words of the line. Each option is one "
-    "lexeme with its part of speech, identified by its DULAT lemma and glosses. "
-    "Pick the lexeme the line and the evidence support best. Choose none-of-these "
-    "only when no listed lexeme is defensible."
+    "lexeme with its part of speech, identified by its DULAT lemma, its glosses and "
+    "the parser's forms, which show how the written surface maps onto the lemma "
+    "(prefixes, suffixes and endings are marked with /, +, ~, [ and similar signs). "
+    "The DULAT lemma writes aleph vowels as ả, ỉ, ủ where the tablet surface writes "
+    "plain a, i, u; that difference is not a mismatch. Pick the lexeme the line "
+    "and the evidence support best. Choose none-of-these only when no listed "
+    "lexeme is defensible."
+)
+_LEXEME_FITS_INSTRUCTIONS = (
+    "The candidate lexeme is the right lexical link for this token in this line: "
+    "the surface maps onto the lemma through the given form, and the meaning and "
+    "part of speech suit the line and the evidence. The DULAT lemma writes aleph "
+    "vowels as ả, ỉ, ủ where the surface writes a, i, u; that is not a mismatch."
 )
 _LEXICAL_AMBIGUOUS_INSTRUCTIONS = (
     "More than one of the listed lexemes is defensible for this token in this "
@@ -103,6 +113,16 @@ class JevDecisionPolicy:
     # HARN-033: "full" asks for complete curated rows; "lexical" asks only for the
     # lexeme + POS class over trimmed inputs and inherits the parser's morphology.
     stage: str = "full"
+    # Abstention needs both a majority for none-of-these and this much confidence;
+    # below it the answer is "no opinion" and the best reading is kept, flagged.
+    abstention_confidence: float = 0.5
+    # A single candidate is accepted as the parser gave it (right ~98% of the time on
+    # KTU 1.6 I); with verify_single_candidate a yes/no question is asked and recorded
+    # as a review-priority signal only.
+    verify_single_candidate: bool = False
+    # In the lexical stage alternatives are kept only when the ambiguity question
+    # says the token is ambiguous; otherwise the top lexeme alone.
+    lexical_alternatives_need_ambiguity: bool = True
 
     def __post_init__(self) -> None:
         if self.stage not in _STAGES:
@@ -113,8 +133,11 @@ class JevDecisionPolicy:
             "ambiguous_noul_cutoff",
             "revisit_threshold",
             "finding_threshold",
+            "abstention_confidence",
         ):
             object.__setattr__(self, field, _positive_fraction(getattr(self, field), field))
+        if not isinstance(self.verify_single_candidate, bool) or not isinstance(self.lexical_alternatives_need_ambiguity, bool):
+            raise ValueError("verify_single_candidate and lexical_alternatives_need_ambiguity must be booleans")
         if self.ambiguous_threshold > self.alternative_threshold:
             raise ValueError("ambiguous_threshold must not exceed alternative_threshold")
         if self.finding_threshold > self.revisit_threshold:
@@ -134,6 +157,9 @@ class JevDecisionPolicy:
             "max_candidates": self.max_candidates,
             "reconcile_batch_size": self.reconcile_batch_size,
             "stage": self.stage,
+            "abstention_confidence": self.abstention_confidence,
+            "verify_single_candidate": self.verify_single_candidate,
+            "lexical_alternatives_need_ambiguity": self.lexical_alternatives_need_ambiguity,
         }
 
 
@@ -503,11 +529,6 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
                 if headword and (headword == surface or headword.split(" ")[0] == surface):
                     context_evidence.append({"source": source, "ref": _text(r.get("source_ref")), "content": summary})
 
-        criteria: dict[str, object] = {c.key: c.option() for c in candidates}
-        criteria[NONE_OF_THESE] = {
-            "what": "No listed lexeme is defensible for this token in this line.",
-            "consequence": "The token stays unresolved and is escalated to hand review.",
-        }
         task = payload.get("task") if isinstance(payload.get("task"), Mapping) else {}
         state = {
             "tablet": task.get("tablet"),
@@ -520,14 +541,26 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
             "dulat_citations_for_other_words_on_line": other_dulat,
             "revisit_request": payload.get("revisit_request"),
         }
-        body = {
-            "model": request.requested_model,
-            "state": state,
-            "questions": {
+        if len(candidates) == 1:
+            # A choice between one lexeme and "none" is miscalibrated, and even a yes/no
+            # veto proved noise against the parser's 98% on unambiguous tokens. The
+            # single candidate is accepted; optionally a fit question is asked and kept
+            # as a review-priority signal.
+            state["candidate"] = candidates[0].option()
+            if not self.decision_policy.verify_single_candidate:
+                return {"model": request.requested_model, "state": state, "questions": {}}, candidates
+            questions = {"lexeme_fits": {"type": "noul", "instructions": _LEXEME_FITS_INSTRUCTIONS}}
+        else:
+            criteria: dict[str, object] = {c.key: c.option() for c in candidates}
+            criteria[NONE_OF_THESE] = {
+                "what": "No listed lexeme is defensible for this token in this line.",
+                "consequence": "The token stays unresolved and is escalated to hand review.",
+            }
+            questions = {
                 "lexeme": {"type": "choice", "instructions": _LEXEME_INSTRUCTIONS, "criteria": criteria},
                 "ambiguous": {"type": "noul", "instructions": _LEXICAL_AMBIGUOUS_INSTRUCTIONS},
-            },
-        }
+            }
+        body = {"model": request.requested_model, "state": state, "questions": questions}
         return body, candidates
 
     def _reconcile_body(self, request: ProviderJSONRequest) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
@@ -606,6 +639,8 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         self._current_operation = request.operation
         if request.operation == "adjudicate":
             body, candidates = self._adjudicate_body(request)
+            if candidates and not body.get("questions"):
+                return self._no_call_response(request, self._accept_single(candidates[0]))
             if not candidates:
                 evidence_ids = [
                     _text(r.get("evidence_id"))
@@ -680,6 +715,8 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         answers = result.get("answers")
         if not isinstance(answers, Mapping):
             raise ProviderPermanentError("Jev response has no answers")
+        if lexical and len(candidates) == 1:
+            return self._lexical_fit_payload(answers, candidates[0])
         reading = answers.get(question)
         if not isinstance(reading, Mapping):
             raise ProviderPermanentError(f"Jev response lacks the {question} answer")
@@ -724,10 +761,12 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
         # Abstention must not win by plurality: when the readings together outweigh
         # none-of-these, the best reading is chosen and the abstention share recorded.
         abstention = probabilities.get(NONE_OF_THESE, 0.0)
-        if choice == NONE_OF_THESE and abstention <= 0.5:
+        low_confidence = confidence_value is not None and confidence_value < policy.abstention_confidence
+        if choice == NONE_OF_THESE and (abstention <= 0.5 or low_confidence):
             readings_only = {k: v for k, v in probabilities.items() if k != NONE_OF_THESE}
             if readings_only:
                 choice = max(readings_only, key=lambda k: (readings_only[k], -int(k.rsplit("-", 1)[-1] or 0)))
+        self._low_confidence = low_confidence
 
         if lexical:
             return self._lexical_payload(choice, probabilities, confidence_value, ambiguous, threshold, candidates)
@@ -789,13 +828,44 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
     def _jev_block(self, choice, probabilities, confidence, ambiguous, threshold) -> dict[str, object]:
         return {
             "stage": self.decision_policy.stage,
+            "question": "lexeme" if self.decision_policy.stage == "lexical" else "reading",
             "choice": choice,
             "probabilities": dict(sorted(probabilities.items())),
             "abstention_probability": probabilities.get(NONE_OF_THESE, 0.0),
             "confidence": confidence,
+            "low_confidence": bool(getattr(self, "_low_confidence", False)),
             "ambiguous": ambiguous,
             "alternative_threshold": threshold,
         }
+
+    def _accept_single(self, candidate: Any, fits: float | None = None) -> dict[str, Any]:
+        rows = [dict(r) for r in (candidate.rows[: candidate.parser_row_count] if candidate.parser_row_count else candidate.rows)]
+        analyses = list(dict.fromkeys(r["morphological_parsing"] for r in rows))
+        block: dict[str, Any] = {
+            "stage": self.decision_policy.stage,
+            "question": "single-candidate-accepted" if fits is None else "lexeme_fits",
+            "reading": candidate.reading.to_dict(),
+            "readings": {candidate.key: candidate.reading.to_dict()},
+        }
+        summary = (
+            f"lexical stage: only candidate {candidate.reading.lemma} [{candidate.reading.pos_class}] "
+            "accepted as the parser gave it"
+        )
+        if fits is not None:
+            block["fits"] = fits
+            block["review_priority"] = 1.0 - fits
+            summary += f"; Jev fit p={fits:.2f} (review priority {1.0 - fits:.2f})"
+        return {"analyses": analyses, "evidence_ids": list(candidate.evidence_ids), "summary": summary, "reviewed_rows": rows, "jev": block}
+
+    def _lexical_fit_payload(self, answers: Mapping[str, Any], candidate: Any) -> dict[str, Any]:
+        answer = answers.get("lexeme_fits")
+        if not isinstance(answer, Mapping):
+            raise ProviderPermanentError("Jev response lacks the lexeme_fits answer")
+        try:
+            fits = _positive_fraction(answer.get("noul"), "lexeme_fits")
+        except ValueError as exc:
+            raise ProviderPermanentError(str(exc)) from None
+        return self._accept_single(candidate, fits)
 
     def _lexical_payload(self, choice, probabilities, confidence, ambiguous, threshold, candidates) -> dict[str, Any]:
         by_key = {c.key: c for c in candidates}
@@ -819,10 +889,15 @@ class TypeSafeJevClient(_EnvironmentCredentialClient):
                 ],
                 "jev": block,
             }
-        kept = [choice] + sorted(
-            (k for k, p in probabilities.items() if k != choice and k != NONE_OF_THESE and p >= threshold),
-            key=lambda k: (-probabilities[k], k),
-        )
+        policy = self.decision_policy
+        ambiguous_enough = ambiguous is not None and ambiguous >= policy.ambiguous_noul_cutoff
+        if policy.lexical_alternatives_need_ambiguity and not ambiguous_enough:
+            kept = [choice]
+        else:
+            kept = [choice] + sorted(
+                (k for k, p in probabilities.items() if k != choice and k != NONE_OF_THESE and p >= threshold),
+                key=lambda k: (-probabilities[k], k),
+            )
         rows: list[dict[str, str]] = []
         analyses: list[str] = []
         evidence_ids: list[str] = []
