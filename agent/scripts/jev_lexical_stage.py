@@ -178,7 +178,8 @@ def main() -> int:
     status = output.get("terminal_status")
     flush = sidecar.flush()
     artifact = runtime.artifact("jev-lexical", str(status))
-    print(f"terminal={status} requests={artifact.request_count} input_tokens={artifact.input_tokens} output_tokens={artifact.output_tokens} "
+    print(f"terminal={status} requests={artifact.request_count} local_resolutions={artifact.local_resolutions} "
+          f"input_tokens={artifact.input_tokens} output_tokens={artifact.output_tokens} "
           f"retries={artifact.retries} budget_exhausted={artifact.budget_exhausted} tracing={'delivered' if flush.delivered else 'off'}")
 
     # --- score -------------------------------------------------------------------------
@@ -206,7 +207,8 @@ def main() -> int:
                           "offered": [r.to_dict() for r in offered[tok.token_id]], "summary": jev})
     score = score_lexical_column(predicted=predicted, gold=gold, offered=offered, parser_first=parser_first, parser_all=parser_all)
     d = score.to_dict()
-    print(f"lexical exact {d['exact']}/{d['tokens']} ({d['exact_rate']:.1%}) | lemma-only {d['lemma_exact_rate']:.1%} | "
+    print(f"lexical exact {d['exact']}/{d['tokens']} ({d['exact_rate']:.1%}; {d['gold_unresolved']} gold-unresolved excluded) | "
+          f"lemma-only {d['lemma_exact_rate']:.1%} | "
           f"abstained correct/wrong {d['abstained_correct']}/{d['abstained_wrong']} | parser first {d['parser_first_rate']:.1%} | "
           f"parser all {d['parser_all_rate']:.1%} | ceiling {d['ceiling_rate']:.1%}")
 
@@ -216,8 +218,9 @@ def main() -> int:
         "run_id": run_id, "tablet": args.tablet, "column": args.column, "tf_version": args.tf, "stage": "lexical",
         "model": {"requested": args.model, "exact": args.exact_model, "execution_kind": kind.value},
         "evidence_policy": collector.policy.to_dict(), "evidence_policy_sha256": collector.policy.sha256,
-        "terminal_status": status, "provider": {"requests": artifact.request_count, "input_tokens": artifact.input_tokens,
-                                                 "output_tokens": artifact.output_tokens, "retries": artifact.retries},
+        "terminal_status": status, "provider": {"requests": artifact.request_count, "local_resolutions": artifact.local_resolutions,
+                                                 "input_tokens": artifact.input_tokens, "output_tokens": artifact.output_tokens,
+                                                 "retries": artifact.retries},
         "adapter_failures": collector.adapter_failures, "score": d, "started": started.isoformat(),
         "seconds": round(time.time() - progress["t0"], 1),
     }

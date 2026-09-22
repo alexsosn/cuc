@@ -227,6 +227,38 @@ def test_dulat_adapter_returns_cited_entries_for_the_token_line(tmp_path: Path) 
     assert none == ()
 
 
+def test_dulat_adapter_carries_the_entry_headword_when_the_search_index_has_it(tmp_path: Path) -> None:
+    """HARN-033 review M2: the citation label is a phrase; the headword is what a lemma matches.
+
+    The real ``dulat_search.sqlite`` holds an ``entries_fts`` index keyed by entry_id with the
+    headword lemma and POS. When present it is carried on the summary; when absent the
+    summary keeps its previous shape (fixtures without the index still work).
+    """
+
+    mod = _adapters()
+    loaded = _loaded(_repo(tmp_path))
+    state = ColumnRunState.initial(loaded.task, loaded.snapshot)
+    db = _dulat_search_db(tmp_path / "dulat_search.sqlite")
+    ctx = mod.TokenEvidenceContext(loaded, state, _token(loaded, "1003"), "op-2")
+    plain = [json.loads(r.summary) for r in mod.DulatAdapter().collect(ctx, db)]
+    assert all("headword" not in item for item in plain)
+
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE VIRTUAL TABLE entries_fts USING fts5(entry_id UNINDEXED, lemma, content, forms, translations, "
+        "attestations, attestation_translations, pos, page, text, tokenize='trigram')"
+    )
+    con.executemany(
+        "INSERT INTO entries_fts(entry_id, lemma, pos) VALUES (?, ?, ?)",
+        [(37, "ġr", "n. m. n."), (4756, "/y-d-y/", "vb vb")],
+    )
+    con.commit()
+    con.close()
+    indexed = [json.loads(r.summary) for r in mod.DulatAdapter().collect(ctx, db)]
+    assert [(i["headword"], i["headword_pos"]) for i in indexed] == [("ġr", "n. m. n."), ("/y-d-y/", "vb vb")]
+    assert indexed[0]["label"] == "ġr (III)"          # the label is still there for the reviewer
+
+
 def test_eupt_adapter_returns_only_line_level_eupt_modules(tmp_path: Path) -> None:
     mod = _adapters()
     loaded = _loaded(_repo(tmp_path))

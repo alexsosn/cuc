@@ -293,6 +293,7 @@ class DulatAdapter:
                 "order by entry_id",
                 (ctx.dulat_ref,),
             ).fetchall()
+            headwords = self._headwords(con, [row[1] for row in rows])
         finally:
             con.close()
         provenance = f"dulat_search:{_digest_marker(ctx, self.source_id)}"
@@ -303,21 +304,47 @@ class DulatAdapter:
             except (TypeError, ValueError):
                 data = {}
             label = _HTML_RE.sub("", str(data.get("label") or "")).strip()
-            summary = json.dumps(
-                {
-                    "entry_id": entry_id,
-                    "label": label,
-                    "sense_labels": list(data.get("sense_labels") or []),
-                    "reference_translations": list(data.get("reference_translations") or []),
-                    "stem_names": list(data.get("stem_names") or []),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
+            item: dict[str, object] = {
+                "entry_id": entry_id,
+                "label": label,
+                "sense_labels": list(data.get("sense_labels") or []),
+                "reference_translations": list(data.get("reference_translations") or []),
+                "stem_names": list(data.get("stem_names") or []),
+            }
+            if entry_id in headwords:
+                # The label is the cited phrase; the headword is the entry's lemma, which is
+                # what a candidate lexeme can be matched against (HARN-033 review M2).
+                item["headword"], item["headword_pos"] = headwords[entry_id]
+            summary = json.dumps(item, ensure_ascii=False, sort_keys=True)
             records.append(
                 _record(ctx, self.source_id, index, f"dulat_search:{norm_ref}:entry-{entry_id}", provenance, summary)
             )
         return tuple(records)
+
+
+    @staticmethod
+    def _headwords(con: sqlite3.Connection, entry_ids: list[object]) -> dict[object, tuple[str, str]]:
+        """Entry headword and POS from the search index when the resource ships one.
+
+        ``entries_fts`` is the DULAT app's FTS5 index (entry_id UNINDEXED, lemma, …, pos).
+        A resource without it still yields citations, only without headwords.
+        """
+
+        if not entry_ids:
+            return {}
+        try:
+            placeholders = ",".join("?" for _ in entry_ids)
+            rows = con.execute(
+                f"select entry_id, lemma, pos from entries_fts where entry_id in ({placeholders})",
+                list(entry_ids),
+            ).fetchall()
+        except sqlite3.Error:
+            return {}
+        return {
+            entry_id: (_HTML_RE.sub("", str(lemma or "")).strip(), str(pos or "").strip())
+            for entry_id, lemma, pos in rows
+            if str(lemma or "").strip()
+        }
 
 
 class EuptAdapter:

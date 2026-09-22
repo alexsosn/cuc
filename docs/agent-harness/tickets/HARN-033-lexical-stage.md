@@ -36,6 +36,15 @@ options; abstention must never win by plurality.
 - **Lexical reading**: `(lemma key, POS class)`. A token's gold is the set of
   lexical readings over its reviewed rows; the prediction is the set over the
   kept alternatives.
+- **Candidates** come from the parser's rows and from reviewed parallels. The
+  legacy expert review holds surface-spelled analyses with no DULAT link and no
+  POS (`krt`, `il (I)`, `xxxx`): they reach the model as context and never form
+  an option (review H1/H2 — as options they duplicated the parser's lexeme under
+  another spelling, could never be exact, and a damaged string became a curated
+  row without a call).
+- **Gold-unresolved tokens** (the reviewer left `?`) carry no reading to be
+  right or wrong about: they are counted separately and excluded from every
+  rate, for the prediction and the baselines alike (review M1).
 
 ## Plan
 
@@ -43,11 +52,11 @@ options; abstention must never win by plurality.
 
 - `pos_class(pos_field)`, `lemma_key(dulat_field)`, `LexicalReading`.
 - `group_lexical_candidates(evidence, max_candidates)`: candidate-bearing
-  evidence (auto-parsing rows, corpus-parallel readings, legacy analyses)
-  grouped by lexical reading; each candidate keeps its rows (parser rows first),
-  sources, attestation count, up to three distinct glosses as identification
-  aid, and the evidence ids behind it. Legacy analyses carry the lemma from the
-  analysis string and POS `?`.
+  evidence (auto-parsing rows, corpus-parallel readings) grouped by lexical
+  reading; each candidate keeps its rows (parser rows first), sources,
+  attestation count, up to three distinct glosses as identification aid, and
+  the evidence ids behind it. Rows resolving neither lemma nor POS never form a
+  candidate.
 - `gold_lexical_readings(rows)`, `score_lexical_column(...)` → exact-set,
   lemma-only exact, abstentions split into correct (gold not offered) and
   wrong, plus parser baselines (first alternative; all alternatives) and the
@@ -58,20 +67,35 @@ options; abstention must never win by plurality.
 `JevDecisionPolicy(stage="lexical")`:
 
 - **state**: the token; the line's tokens (surfaces) and the neighbouring line
-  on each side; DULAT citations at the line whose label matches a candidate
-  lemma (others summarised as a count); EUPT vocalisation/translation for the
-  line; Burns rows only when the headword matches the surface; same-line prior
-  lexical decisions (surface → lemma) as context. No column listing, no
-  history, no Tropper.
+  on each side; DULAT citations at the line whose entry *headword* matches a
+  candidate lemma (others summarised as a count — the citation label is the
+  cited phrase, not the headword; the adapter now carries `headword` and
+  `headword_pos` from the search index's `entries_fts`, review M2); EUPT
+  vocalisation/translation for the line; Burns rows whose headword matches the
+  surface after aleph/ayin normalisation and without `(DN)`-style qualifiers
+  (review M3); legacy analyses of the surface; same-line prior lexical
+  decisions (surface → lemma) as context. No column listing, no history, no
+  Tropper.
 - **questions**: `lexeme` (choice over lexical candidates + `none-of-these`)
   and `ambiguous` (noul).
 - **answer**: chosen candidate → `analyses` = the parser's morphology strings
   for that reading (parallel rows only when the parser has none),
-  `reviewed_rows` = those rows; alternatives above threshold as further
-  readings; `none-of-these` only when p(none) > 0.5 (abstention cannot win by
-  plurality — applied to the full stage too); the `jev` block records the
-  stage, the chosen reading and the per-reading probabilities.
-- reconcile: unchanged (one noul per token, batched), phrased for the lexeme.
+  `reviewed_rows` = those rows; alternatives kept only when the `ambiguous`
+  question answers yes; `none-of-these` only when p(none) > 0.5 *and* the
+  reported confidence is ≥ 0.5 (an absent confidence blocks abstention too,
+  review L1; abstention cannot win by plurality — applied to the full stage
+  too); the `jev` block records the stage, the chosen reading and the
+  per-reading probabilities.
+- **single candidate**: accepted without a call only when the parser offered
+  it (`parser_row_count > 0`, the 98% base rate below); a parallel-only single
+  is asked as a choice against `none-of-these`.
+- **zero-call answers** go through `TypeSafeJevClient.resolve_locally`; the
+  HARN-022 runtime consults that hook before reserving budget, so no request,
+  tokens or call artifact are booked for them, and the trial artifact reports
+  them as `local_resolutions` (review M4).
+- reconcile: one noul per token, batched; in the lexical stage each decision is
+  shown as its `(lemma, POS class)` and the question is phrased for the lexeme,
+  so case/number differences cannot raise a finding (review L3).
 
 ### Runner script
 
@@ -94,7 +118,7 @@ HARN-005/031/032 environment flags. Stub completion gates until 028b.
    matching DULAT/Burns; size bounded;
 4. answer mapping: chosen reading → parser rows; abstention needs p(none) > 0.5
    (`gm` case: p(none)=0.22 with five variants → reading chosen); alternatives;
-   legacy-only reading; forward-compatible payload;
+   legacy analyses as context only; forward-compatible payload;
 5. scorer: exact, lemma-only, correct vs wrong abstention, baselines, ceiling,
    on a small fixture with a multi-row gold token;
 6. script: dry run with the test-double transport writes a report with no
@@ -116,8 +140,14 @@ an abstention counts as correct only when no gold reading was offered.
 | full-stage Jev (HARN-029, for comparison, morphology-set metric) | 77.3% | | 16 | 5.3M |
 | stage 1 round 1: trimmed inputs, one option per lexeme + none | 72.2% | 80.9% | 29 | 427k |
 | stage 1 round 2: + parser forms in options, aleph note, Noul for single candidates, abstention needs confidence ≥ 0.5 | 75.3% | 80.9% | 28 | 419k |
-| stage 1 round 3: + single candidates accepted without a call, alternatives only when Jev reports ambiguity | **87.3%** | **90.3%** | **0** | 252k |
-| ceiling (gold among offered) | 94.3% | | | |
+| stage 1 round 3: + single candidates accepted without a call, alternatives only when Jev reports ambiguity | 87.3% | 90.3% | 0 | 252k |
+| stage 1 round 4 (review fixes: DULAT by headword, Burns normalised, legacy as context, gold-`?` excluded) | **89.2%** | **92.2%** | **0** | 265k |
+| ceiling (gold among offered) | 94.3% → 95.3% (round 4 denominator) | | | |
+
+Rounds 1–3 are over 299 tokens; round 4 and its baselines are over the 296
+tokens whose gold is resolved (parser-first 79.4%, parser-all 73.6%). Round 4
+made 120 provider requests and 180 local resolutions; the earlier rounds
+reported 300 requests because the runtime booked the zero-call answers.
 
 What the rounds taught:
 
@@ -129,7 +159,7 @@ What the rounds taught:
   signal only, in line with the skill's rule that worklists prioritise attention
   and never decide.
 - **Multi-candidate tokens (119/299)**: Jev 79.0% exact vs parser-first 56.3%,
-  ceiling 95.0%. This is where stage 1 earns its keep.
+  ceiling 95.0% (round 4: 80.7%, 96/119). This is where stage 1 earns its keep.
 - **Alternatives**: keeping every lexeme above the probability threshold cost
   nine exact matches and gained none (one token in the column has two gold
   lexical readings). Alternatives are kept only when the `ambiguous` question
@@ -143,5 +173,32 @@ What the rounds taught:
   all (parser unresolved), which no closed-choice backend can fix; those feed
   the parser-improvement loop (HARN-017).
 
-Next: the per-source ablation arms on this column (each external source
-disabled in turn), then a second column to check the numbers hold.
+Gold quirks the scorer counts as misses, left as they are (review L5): two
+reviewed rows whose POS starts with the stem (`G impv. m. sg.`, `G inf. abs.` →
+class `G`), three with POS `→`, one empty POS, and composite rows (`km | ḫmšt`,
+`a | b`) where `pos_class` takes the first POS. They belong to the reviewed-data
+normalisation noted in HARN-028.
+
+## Second column — 2026-09-22, KTU 1.14 column I (155 tokens, 138 with resolved gold, all sources incl. legacy review)
+
+| arm | exact | lemma-only | wrong abstentions | requests | input tokens |
+|---|---|---|---|---|---|
+| parser, first alternative | 83.3% | | | | |
+| parser, all alternatives | 84.1% | | | | |
+| stage 1 round 4 | 83.3% | 87.0% | 0 | 37 (+119 local) | 142k |
+| ceiling | 92.0% | | | | |
+
+Here Jev equals the parser: on the 35 multi-candidate tokens both score 23. Of
+the 12 misses, five are tokens where the reviewer kept two lexical readings
+(`ỉl` DN and n., `nhr`, `ḥtkh` ×2, `yʕn`) and `ambiguous` did not fire; three
+are POS-class granularity in the parser's rows (`prep./conj./adv.` vs `prep.`,
+`conj./interr.` vs `conj.`); three are gold that no candidate can reach (`a kt`
+reviewed as one word `ảt`, `k` reviewed as `km | ḫmšt`); one is a genuine
+lexical miss (`lm` interr. for `l` prep.). Single candidates: the parser is
+right in 92/98 (93.9%; 1.6 I: 98.2%), and three of the six misses are again
+two-reading golds. So the zero-call rule holds on a tablet with a legacy review
+and weaker parser coverage; the multi-gold tokens are the next thing to look at
+(the `ambiguous` question is not catching them).
+
+Next: the per-source ablation arms on both columns (each external source
+disabled in turn), then the `ambiguous` calibration on multi-gold tokens.

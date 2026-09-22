@@ -2,27 +2,27 @@
 
 Definitions (see the ticket): a *lexical reading* is ``(lemma key, POS class)``.
 The lemma key is the DULAT field (``ġr (III)``, ``/m-ġ-y/``); the POS class is
-the first token of the POS field plus the verb stem (``n.``, ``vb G``, ``DN``).
-Number, gender, case, state, conjugation, gloss wording and encoding are later
-stages and are inherited from the parser rows of the chosen lexeme.
+the first token of the POS field (``n.``, ``vb``, ``DN``). The verb stem, number,
+gender, case, state, conjugation, gloss wording and encoding are later stages and
+are inherited from the parser rows of the chosen lexeme.
+
+Candidates come from the parser and from reviewed parallels only. The legacy
+expert review supplies surface-spelled analyses without a DULAT link or a POS;
+they reach the model as context but never form an option (they could not be
+exact and would only duplicate the parser's lexeme under another spelling).
 """
 
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .live_providers import ProviderPermanentError
 
 UNRESOLVED = "?"
-_CANDIDATE_SOURCES = ("auto-parsing", "corpus-parallels", "legacy-review")
-_VERB_STEMS = frozenset(
-    {"G", "D", "Š", "N", "L", "Gt", "Št", "Dt", "tD", "Gpass", "Dpass", "Špass", "R", "Rt", "Lt", "Np"}
-)
+_CANDIDATE_SOURCES = ("auto-parsing", "corpus-parallels")
 _SEED_MARKER = "SEEDED from auto-parse"
-_HOMONYM_RE = re.compile(r"^(.*?)\s*\(([IVX]+)\)\s*$")
 
 
 def _text(value: object) -> str:
@@ -103,22 +103,15 @@ def _field_ok(value: str) -> bool:
     return _SEED_MARKER not in value
 
 
-def _lemma_from_analysis(analysis: str) -> str:
-    """``lb(III)/`` → ``lb (III)``; ``ġr(I)/`` → ``ġr (I)``; else the bare head."""
-
-    head = re.split(r"[/\[\]~+=:]", analysis, maxsplit=1)[0].strip()
-    match = re.match(r"^(.*?)\(([IVX]+)\)$", head)
-    if match:
-        return f"{match.group(1).strip()} ({match.group(2)})"
-    return head or UNRESOLVED
-
-
 def group_lexical_candidates(
     evidence: list[Mapping[str, Any]],
     *,
     max_candidates: int,
 ) -> tuple[LexicalCandidate, ...]:
-    """Group candidate-bearing evidence by lexical reading; parser rows first within a group."""
+    """Group candidate-bearing evidence by lexical reading; parser rows first within a group.
+
+    Rows that resolve neither lemma nor POS never form a candidate.
+    """
 
     groups: dict[LexicalReading, dict[str, Any]] = {}
     order: list[LexicalReading] = []
@@ -151,23 +144,6 @@ def group_lexical_candidates(
         except json.JSONDecodeError:
             data = None
         if not isinstance(data, Mapping):
-            continue
-        if source == "legacy-review":
-            analyses = data.get("analyses")
-            if not isinstance(analyses, list):
-                continue
-            for analysis in analyses:
-                analysis = _text(analysis)
-                if not analysis or not _field_ok(analysis):
-                    continue
-                row = {
-                    "morphological_parsing": analysis,
-                    "dulat": _lemma_from_analysis(analysis),
-                    "pos": UNRESOLVED,
-                    "gloss": UNRESOLVED,
-                    "comments": "analysis from the legacy expert review; DULAT/POS/gloss not resolved",
-                }
-                add(LexicalReading(row["dulat"], UNRESOLVED), row, source, evidence_id, 0)
             continue
         raw = {
             "morphological_parsing": _text(data.get("morphological_parsing")),
@@ -232,6 +208,9 @@ def _readings(value: Any) -> set[LexicalReading]:
     return out
 
 
+_UNRESOLVED_READING = LexicalReading(UNRESOLVED, UNRESOLVED)
+
+
 @dataclass(frozen=True)
 class LexicalScore:
     tokens: int
@@ -243,11 +222,13 @@ class LexicalScore:
     parser_first_exact: int
     parser_all_exact: int
     ceiling: int
+    gold_unresolved: int = 0
 
     def to_dict(self) -> dict[str, object]:
         n = self.tokens or 1
         return {
             "tokens": self.tokens,
+            "gold_unresolved": self.gold_unresolved,
             "exact": self.exact,
             "exact_rate": self.exact / n,
             "lemma_exact": self.lemma_exact,
@@ -275,17 +256,24 @@ def score_lexical_column(
     """Score stage-1 predictions per token against the reviewed gold.
 
     A prediction of ``?`` is an abstention: correct when no gold reading was among
-    the offered candidates, wrong otherwise.
+    the offered candidates, wrong otherwise. Tokens whose gold is itself unresolved
+    (the reviewer left ``?``) carry no reading to be right or wrong about: they are
+    counted in ``gold_unresolved`` and excluded from every rate, for the prediction
+    and the baselines alike.
     """
 
-    exact = lemma_exact = subset = ab_ok = ab_wrong = pf = pa = ceiling = 0
+    exact = lemma_exact = subset = ab_ok = ab_wrong = pf = pa = ceiling = unresolved = scored = 0
     for token_id, gold_value in gold.items():
-        g = _readings(gold_value)
+        g = _readings(gold_value) - {_UNRESOLVED_READING}
+        if not g:
+            unresolved += 1
+            continue
+        scored += 1
         p = _readings(predicted.get(token_id))
-        o = _readings(offered.get(token_id))
+        o = _readings(offered.get(token_id)) - {_UNRESOLVED_READING}
         if g & o:
             ceiling += 1
-        abstained = p == {LexicalReading(UNRESOLVED, UNRESOLVED)} or not p
+        abstained = p == {_UNRESOLVED_READING} or not p
         if abstained:
             if g & o:
                 ab_wrong += 1
@@ -304,4 +292,4 @@ def score_lexical_column(
                 pf += 1
         if parser_all is not None and _readings(parser_all.get(token_id)) == g:
             pa += 1
-    return LexicalScore(len(gold), exact, lemma_exact, subset, ab_ok, ab_wrong, pf, pa, ceiling)
+    return LexicalScore(scored, exact, lemma_exact, subset, ab_ok, ab_wrong, pf, pa, ceiling, unresolved)

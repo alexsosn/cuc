@@ -90,7 +90,9 @@ def test_grouping_collapses_case_and_gloss_variants_and_keeps_homonyms_apart() -
     lex = _lex()
     cands = lex.group_lexical_candidates(_evidence(), max_candidates=64)
     readings = [(c.reading.lemma, c.reading.pos_class) for c in cands]
-    assert readings == [("lb", "n."), ("/l-b-b/", "vb"), ("lb (II)", "n."), ("lb (III)", "?")]
+    # Legacy analyses (surface-spelled, POS unknown) are context for the model, never a
+    # candidate: they cannot be exact and would duplicate the parser's lexeme (review H2).
+    assert readings == [("lb", "n."), ("/l-b-b/", "vb"), ("lb (II)", "n.")]
     assert cands[0].forms == ("lb/",) and cands[1].forms == ("!l!b[",)
     lb = cands[0]
     assert [r["morphological_parsing"] for r in lb.rows] == ["lb/", "lb/", "lb/"]      # parser rows first, then parallel
@@ -99,8 +101,6 @@ def test_grouping_collapses_case_and_gloss_variants_and_keeps_homonyms_apart() -
     assert lb.glosses == ("heart", "heart, mind")
     assert lb.sources == ("auto-parsing", "corpus-parallels")
     assert set(lb.evidence_ids) == {"op:auto-parsing:1", "op:auto-parsing:2", "op:corpus-parallels:1"}
-    legacy = cands[3]
-    assert legacy.rows[0]["dulat"] == "lb (III)" and legacy.rows[0]["pos"] == "?"
 
 
 def test_grouping_limits_and_unresolved_parser_rows() -> None:
@@ -201,7 +201,9 @@ def test_lexical_request_is_trimmed_to_the_line_window_and_matching_evidence(mon
     assert any(e["source"] == "eupt" for e in state["evidence"])
     # options: one per lexical reading, with glosses as identification aid
     crit = body["questions"]["lexeme"]["criteria"]
-    assert sorted(k for k in crit if k != "none-of-these") == ["reading-1", "reading-2", "reading-3", "reading-4"]
+    assert sorted(k for k in crit if k != "none-of-these") == ["reading-1", "reading-2", "reading-3"]
+    # the legacy analysis is context, not an option (review H2)
+    assert [e for e in state["evidence"] if e["source"] == "legacy-review"][0]["content"].endswith("lb(III)/")
     assert crit["reading-1"]["lemma"] == "lb" and crit["reading-1"]["pos"] == "n." and crit["reading-1"]["glosses"] == ["heart", "heart, mind"]
     assert crit["reading-1"]["reviewed_attestations_elsewhere"] == 7 and crit["reading-1"]["parser_alternatives"] == 2
     assert crit["reading-1"]["forms"] == ["lb/"]             # how the surface maps onto the lemma
@@ -382,3 +384,214 @@ def test_multi_candidate_abstention_needs_confidence(monkeypatch) -> None:
     transport = LexTransport(p_by_lemma={"none-of-these": 0.6, "lb": 0.3, "/l-b-b/": 0.1}, confidence=0.7)
     payload = _lexical_client(mod, transport).generate_json(_request(_column_payload(_evidence())), 5.0).payload
     assert payload["analyses"] == ["?"]
+
+
+# --- review findings (2026-09-22) --------------------------------------------------------------
+
+
+def _parser_single(analysis="aps/+h", dulat="ảps", pos="n. m. sg. cstr. nom.", gloss="extremity"):
+    return EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row(analysis, dulat, pos, gloss)).to_dict()
+
+
+def _legacy(*analyses):
+    return EvidenceRecord("op:legacy-review:1", "legacy-review", "lr:1", "p", json.dumps({"surface": "krt", "analyses": list(analyses)})).to_dict()
+
+
+def test_legacy_only_token_is_not_a_candidate_and_never_accepted_silently(monkeypatch) -> None:
+    """H1/H2: a damaged legacy string (`xxxx`, `]š]lyṭ[/`) must not become a curated row."""
+
+    mod, lex = _jev(), _lex()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    ev = [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row("?", "?", "?", "?")).to_dict(), _legacy("xxxx", "]š]lyṭ[/")]
+    assert lex.group_lexical_candidates(ev, max_candidates=64) == ()
+    transport = NoulTransport(fits=0.9)
+    client = _lexical_client(mod, transport)
+    client.declared_exact_model = "jev-1.13.0"
+    payload = client.generate_json(_request(_column_payload(ev)), 5.0).payload
+    assert transport.calls == []
+    assert payload["analyses"] == ["?"] and payload["jev"]["no_candidates"] is True
+    assert "xxxx" not in json.dumps(payload)
+
+
+def test_legacy_analyses_reach_the_model_as_context_not_as_options(monkeypatch) -> None:
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    ev = [r for r in _evidence() if r["source_id"] != "legacy-review"] + [_legacy("krt/", "!k!rt[")]
+    transport = LexTransport(p_by_lemma={"lb": 0.9, "/l-b-b/": 0.05, "lb (II)": 0.05})
+    _lexical_client(mod, transport).generate_json(_request(_column_payload(ev)), 5.0)
+    body = transport.calls[0][2]
+    criteria = body["questions"]["lexeme"]["criteria"]
+    assert [c["lemma"] for k, c in criteria.items() if k != "none-of-these"] == ["lb", "/l-b-b/", "lb (II)"]
+    legacy = [e for e in body["state"]["evidence"] if e["source"] == "legacy-review"]
+    assert len(legacy) == 1 and "krt/" in legacy[0]["content"] and "!k!rt[" in legacy[0]["content"]
+
+
+def test_single_candidate_without_a_parser_row_is_asked_not_accepted(monkeypatch) -> None:
+    """The zero-call rule rests on the parser's 98% on singles; a parallel-only single is not that."""
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    ev = [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row("?", "?", "?", "?")).to_dict(),
+          EvidenceRecord("op:corpus-parallels:1", "corpus-parallels", "cp:1", "p",
+                         json.dumps({"morphological_parsing": "krt/", "dulat": "krt", "pos": "PN", "gloss": "Kirta", "attestations": 4, "examples": []})).to_dict()]
+    transport = LexTransport(p_by_lemma={"krt": 0.8, "none-of-these": 0.2}, confidence=0.9)
+    client = _lexical_client(mod, transport)
+    client.declared_exact_model = "jev-1.13.0"
+    payload = client.generate_json(_request(_column_payload(ev)), 5.0).payload
+    assert len(transport.calls) == 1
+    body = transport.calls[0][2]
+    assert set(body["questions"]) == {"lexeme", "ambiguous"} and "candidate" not in body["state"]
+    assert set(body["questions"]["lexeme"]["criteria"]) == {"reading-1", "none-of-these"}
+    assert payload["jev"]["question"] == "lexeme" and payload["reviewed_rows"][0]["dulat"] == "krt"
+    # And a confident "none" on such a token is honoured.
+    transport = LexTransport(p_by_lemma={"krt": 0.2, "none-of-these": 0.8}, confidence=0.9)
+    client = _lexical_client(mod, transport)
+    client.declared_exact_model = "jev-1.13.0"
+    assert client.generate_json(_request(_column_payload(ev)), 5.0).payload["analyses"] == ["?"]
+
+
+def test_zero_call_decisions_are_not_booked_as_requests_by_the_runtime(monkeypatch) -> None:
+    """M4: a locally resolved token reserves no budget and leaves no phantom call artifact."""
+
+    from harness.column_state import CompletionGateResult, EvidenceRecord as ER
+    from harness.model_benchmark import BenchmarkBackendSpec, BenchmarkCase, EvaluationTarget, SharedBenchmarkAdapters
+    from harness.parsing_evaluation import EfficiencyMetrics, ParsingEvaluationRecord, measure_column_behavior
+    from harness.live_providers import ProviderBudgetPolicy, ProviderExecutionPolicy, run_live_benchmark
+    from tests.test_harn029_typesafe_jev import GOLD_REF, SHA0, _state
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    transport = NoulTransport(fits=0.9)          # answers reconcile nouls; adjudicate must not call it
+    client = _lexical_client(mod, transport)
+    spec = BenchmarkBackendSpec("jev", "typesafe", "jev-latest", "jev-1.13.0", SHA0)
+    binding = mod.jev_binding(spec, requested_model="jev-latest", exact_model_version="jev-1.13.0", client=client, exact_version_provenance="docs")
+
+    def initialize(state, operation_id):
+        return {"skill": "review-automatic-parsing"}
+
+    def evidence(state, token, skill_context, operation_id):
+        return (ER(f"{operation_id}:auto-parsing:1", "auto-parsing", f"auto:{token.token_id}", "auto-parsing:0.2.8", _row("l(I)", "l (I)", "prep.", "to")),)
+
+    def gate(state, gate_id, skill_context, operation_id):
+        return CompletionGateResult(gate_id, True, state.decision_revision, (f"gate:{gate_id}",), "passed")
+
+    def evaluate(state, skill_context, operation_id, identity, target):
+        return ParsingEvaluationRecord(1, identity, target, state.decision_revision, measure_column_behavior(state), (), (), EfficiencyMetrics(), (f"evaluation:{identity.run_id}",))
+
+    shared = SharedBenchmarkAdapters(initialize, evidence, gate, evaluate)
+    case = BenchmarkCase(1, "harn033-m4", _state(), SHA0, SHA0, SHA0, EvaluationTarget("t", GOLD_REF, "gold-provenance", "scorer", "scorer-provenance", SHA0))
+    # Budget for exactly one generation request: the reconcile. Two zero-call adjudications must fit.
+    budget = ProviderBudgetPolicy(1, 1, 20_000, 40_000, 1_000, 2_000, 64, 1, 10.0)
+    result = run_live_benchmark(case, (binding,), shared_adapters=shared, execution_policy=ProviderExecutionPolicy(budget=budget, allow_paid_live_execution=True))
+    trial = result.provider_trials[0]
+    assert trial.terminal_status == "completed", trial
+    assert len(transport.calls) == 1 and trial.request_count == 1
+    assert [c.operation for c in trial.calls] == ["reconcile"]
+    assert trial.local_resolutions == 2 and trial.to_dict()["local_resolutions"] == 2
+
+
+def test_abstention_without_a_reported_confidence_is_not_honoured(monkeypatch) -> None:
+    """L1: the ticket's rule is majority AND confidence ≥ 0.5; an absent confidence is not ≥ 0.5."""
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    transport = LexTransport(p_by_lemma={"none-of-these": 0.6, "lb": 0.3, "/l-b-b/": 0.1}, confidence=None)
+    payload = _lexical_client(mod, transport).generate_json(_request(_column_payload(_evidence())), 5.0).payload
+    assert payload["analyses"] == ["lb/"]
+    assert payload["jev"]["confidence"] is None and payload["jev"]["low_confidence"] is True
+
+
+def test_dulat_citations_are_selected_by_headword_with_aleph_and_homonym_normalisation(monkeypatch) -> None:
+    """M2: the citation label is a phrase; the entry headword is what a candidate lemma matches."""
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    ev = [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row("aps/+h", "ảps", "n. m. sg. cstr. nom.", "extremity")).to_dict(),
+          EvidenceRecord("op:auto-parsing:2", "auto-parsing", "b", "p", _row("!ʕ!ly[", "/ʕ-l-y/ (I)", "vb G prefc. 3 m. sg.", "to go up")).to_dict(),
+          EvidenceRecord("op:dulat:1", "dulat", "d1", "p", json.dumps({"entry_id": 1, "headword": "aps", "headword_pos": "n. m.", "label": "l aps tbl ym", "sense_labels": ["1) extremity"]})).to_dict(),
+          EvidenceRecord("op:dulat:2", "dulat", "d2", "p", json.dumps({"entry_id": 2, "headword": "/ʕ-l-y/", "headword_pos": "vb", "label": "tʕl b ḥrn", "sense_labels": ["1) to go up"]})).to_dict(),
+          EvidenceRecord("op:dulat:3", "dulat", "d3", "p", json.dumps({"entry_id": 3, "headword": "ym", "headword_pos": "n. m.", "label": "ym ym", "sense_labels": ["1) day"]})).to_dict(),
+          EvidenceRecord("op:dulat:4", "dulat", "d4", "p", json.dumps({"entry_id": 4, "label": "ảps", "sense_labels": ["1) extremity (label-only summary)"]})).to_dict()]
+    transport = LexTransport(p_by_lemma={"ảps": 0.9, "/ʕ-l-y/ (I)": 0.1})
+    _lexical_client(mod, transport).generate_json(_request(_column_payload(ev)), 5.0)
+    state = transport.calls[0][2]["state"]
+    dulat = [e["ref"] for e in state["evidence"] if e["source"] == "dulat"]
+    assert dulat == ["d1", "d2", "d4"]
+    assert state["dulat_citations_for_other_words_on_line"] == 1
+
+
+def test_burns_headword_match_normalises_the_surface_and_ignores_qualifiers(monkeypatch) -> None:
+    """M3: `bˤl` (surface) must meet `bʿl (DN)` (Burns) — the DN evidence the misses needed."""
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    snapshot_surface = "bˤl"
+    ev = [EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row("bʕl/", "bʕl", "n. m. sg. abs. nom.", "lord")).to_dict(),
+          EvidenceRecord("op:auto-parsing:2", "auto-parsing", "b", "p", _row("bʕl(II)/", "bʕl (II)", "DN nom.", "Baal")).to_dict(),
+          EvidenceRecord("op:burns-cultic-vocabulary:1", "burns-cultic-vocabulary", "b1", "p", json.dumps({"headword": "bʿl (DN)", "category": "DN"})).to_dict(),
+          EvidenceRecord("op:burns-cultic-vocabulary:2", "burns-cultic-vocabulary", "b2", "p", json.dumps({"headword": "ṣpn (GN)", "category": "GN"})).to_dict()]
+    payload = _column_payload(ev)
+    payload["token"]["surface"] = snapshot_surface
+    transport = LexTransport(p_by_lemma={"bʕl": 0.4, "bʕl (II)": 0.6})
+    _lexical_client(mod, transport).generate_json(_request(payload), 5.0)
+    burns = [e["ref"] for e in transport.calls[0][2]["state"]["evidence"] if e["source"] == "burns-cultic-vocabulary"]
+    assert burns == ["b1"]
+
+
+def test_scorer_excludes_tokens_whose_gold_is_unresolved(monkeypatch) -> None:
+    """M1: a gold `?` is not a reading; counting it for the parser but not for Jev put the ceiling below a baseline."""
+
+    lex = _lex()
+    gold = {"1": [("lb", "n.")], "2": [("?", "?")], "3": [("", "")]}
+    predicted = {"1": [("lb", "n.")], "2": [("?", "?")], "3": [("x", "n.")]}
+    offered = {"1": [("lb", "n.")], "2": [], "3": [("x", "n.")]}
+    parser_first = {"1": ("lb", "n."), "2": ("?", "?"), "3": ("?", "?")}
+    score = lex.score_lexical_column(predicted=predicted, gold=gold, offered=offered, parser_first=parser_first, parser_all=offered)
+    assert score.tokens == 1 and score.gold_unresolved == 2
+    assert score.exact == 1 and score.parser_first_exact == 1 and score.ceiling == 1
+    assert score.abstained_correct == 0 and score.abstained_wrong == 0
+    d = score.to_dict()
+    assert d["tokens"] == 1 and d["gold_unresolved"] == 2 and d["exact_rate"] == 1.0 and d["ceiling_rate"] == 1.0
+
+
+def test_lexical_reconcile_is_phrased_for_the_lexeme(monkeypatch) -> None:
+    """L3: stage 1 does not decide case; the consistency question compares lexemes, not morphology strings."""
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    from tests.test_harn029_typesafe_jev import _reconcile_payload
+    payload = _reconcile_payload()
+    for d in payload["decisions"]:
+        d["reviewed_rows"] = [{"morphological_parsing": d["analyses"][0], "dulat": "l (I)", "pos": "prep. + sfx.", "gloss": "to", "comments": ""}]
+    transport = NoulTransport(fits=0.1)
+    _lexical_client(mod, transport).generate_json(_request(payload, operation="reconcile"), 5.0)
+    body = transport.calls[0][2]
+    for decision in body["state"]["decisions"]:
+        assert decision["reading"] == {"lemma": "l (I)", "pos": "prep."} and "analyses" not in decision
+    question = next(iter(body["questions"].values()))
+    assert "lexeme" in question["instructions"]["question"] and "reading" not in question["instructions"]["question"]
+
+
+@pytest.mark.parametrize("rows", ["notalist", [{"morphological_parsing": "x/"}], [{"morphological_parsing": "x/", "dulat": 1, "pos": "n.", "gloss": "g", "comments": ""}]])
+def test_runtime_rejects_any_malformed_structured_rows_as_a_provider_error(monkeypatch, rows) -> None:
+    """L2: a wrong type or a missing field is a provider contract violation, not a crash or a silent drop."""
+
+    from harness.live_providers import (ProviderBudgetPolicy, ProviderExecutionPolicy, ProviderPermanentError as PPE,
+                                        _BudgetLedger, _ProviderDecisionRuntime)
+    from harness.model_benchmark import BenchmarkBackendSpec
+    from tests.test_harn029_typesafe_jev import SHA0, _state
+
+    mod = _jev()
+    monkeypatch.setenv(KEY_ENV, "sk-test")
+    client = _lexical_client(mod, LexTransport(p_by_lemma={}))
+    spec = BenchmarkBackendSpec("jev", "typesafe", "jev-latest", "jev-1.13.0", SHA0)
+    binding = mod.jev_binding(spec, requested_model="jev-latest", exact_model_version="jev-1.13.0", client=client, exact_version_provenance="docs")
+    budget = ProviderBudgetPolicy(16, 32, 20_000, 40_000, 1_000, 2_000, 64, 1, 10.0)
+    runtime = _ProviderDecisionRuntime(binding, {"run_id": "r"}, ProviderExecutionPolicy(budget=budget, allow_paid_live_execution=True), _BudgetLedger(budget))
+    state = _state()
+    token = state.snapshot.tokens[0]
+    evidence = (EvidenceRecord("op:auto-parsing:1", "auto-parsing", "a", "p", _row("x/", "x", "n.", "g")),)
+    response = {"analyses": ["x/"], "evidence_ids": ["op:auto-parsing:1"], "summary": "s", "reviewed_rows": rows}
+    monkeypatch.setattr(runtime, "_invoke", lambda request: response)
+    with pytest.raises(PPE, match="structured rows"):
+        runtime.adjudicate(state, token, evidence, {"skill": "s"}, "r:initial:1001:adjudicate")
