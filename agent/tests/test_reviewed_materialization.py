@@ -385,3 +385,76 @@ def test_materializer_is_deterministic_and_has_no_write_or_network_api() -> None
     )
     for forbidden in forbidden_executable_patterns:
         assert forbidden not in source
+
+
+def _precompletion_candidate_state() -> cs.ColumnRunState:
+    state = _state(complete=False, close_reconciliation=False)
+    return cs.apply_column_event(state, cs.ReconciliationClosed("candidate-close-reconciliation"))
+
+
+def test_candidate_materializer_renders_after_reconciliation_before_completion() -> None:
+    materializer = _load_materializer()
+    state = _precompletion_candidate_state()
+
+    assert state.completion is None
+    assert state.gate_results == ()
+    assert materializer.materialize_candidate_column(_source_text(), state) == _expected_text()
+
+
+def test_candidate_and_completed_materializers_share_identical_rendering() -> None:
+    materializer = _load_materializer()
+    candidate = materializer.materialize_candidate_column(
+        _source_text(), _precompletion_candidate_state()
+    )
+    completed = materializer.materialize_completed_column(_source_text(), _state())
+    assert candidate == completed
+
+
+def test_candidate_materializer_still_requires_full_traversal_and_closed_reconciliation() -> None:
+    materializer = _load_materializer()
+    state = _precompletion_candidate_state()
+    partial = replace(state, cursor=cs.TokenCursor(2))
+    with pytest.raises(ValueError, match="traversal|every|snapshot|complete"):
+        materializer.materialize_candidate_column(_source_text(), partial)
+
+    open_reconciliation = _state(complete=False, close_reconciliation=False)
+    with pytest.raises(ValueError, match="reconciliation|closed"):
+        materializer.materialize_candidate_column(_source_text(), open_reconciliation)
+
+
+def test_candidate_materializer_supports_columnless_line_markers() -> None:
+    materializer = _load_materializer()
+    task = replace(_task(), tablet="KTU 2.10", column="-")
+    snapshot = cs.ColumnSnapshot(
+        "snapshot-2.10",
+        "reviewed/KTU 2.10.tsv",
+        "fixture-provenance",
+        (cs.ColumnToken("c1", 1, "4", "ab"),),
+    )
+    state = cs.ColumnRunState.initial(task, snapshot)
+    evidence = cs.EvidenceRecord("e-c1", "fixture", "fixture:c1", "prov", "evidence")
+    state = cs.apply_column_event(state, cs.EvidenceRecorded("record-c1", evidence))
+    state = cs.apply_column_event(
+        state,
+        cs.TokenReviewed(
+            "review-c1",
+            _decision("c1", (_row("ab/", "ab", "n.", "AB"),)),
+        ),
+    )
+    state = cs.apply_column_event(state, cs.ReconciliationClosed("close-columnless"))
+    source = (
+        HEADER
+        + "# KTU 2.10 4\t\t\t\t\t\t\t\n"
+        + "c1\tab\t[a b]\tOLD\told\tn.\told\t## SEEDED from auto-parse; not yet hand-reviewed.\n"
+    )
+    expected = (
+        HEADER
+        + "# KTU 2.10 4\t\t\t\t\t\t\t\n"
+        + "c1\tab\t[a b]\tab/\tab\tn.\tAB\t\n"
+    )
+
+    assert materializer.materialize_candidate_column(source, state) == expected
+
+    wrong = source.replace("# KTU 2.10 4", "# KTU 2.10 5")
+    with pytest.raises(ValueError, match="line|marker|snapshot|identity"):
+        materializer.materialize_candidate_column(wrong, state)
