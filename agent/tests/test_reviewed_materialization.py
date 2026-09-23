@@ -412,8 +412,21 @@ def test_candidate_and_completed_materializers_share_identical_rendering() -> No
 
 def test_candidate_materializer_still_requires_full_traversal_and_closed_reconciliation() -> None:
     materializer = _load_materializer()
-    state = _precompletion_candidate_state()
-    partial = replace(state, cursor=cs.TokenCursor(2))
+    partial = cs.ColumnRunState.initial(_task(), _snapshot())
+    for token_id in ("t1", "t2"):
+        evidence = cs.EvidenceRecord(
+            f"evidence-{token_id}", "fixture", f"fixture:{token_id}", "prov", "evidence"
+        )
+        partial = cs.apply_column_event(
+            partial, cs.EvidenceRecorded(f"partial-record-{token_id}", evidence)
+        )
+        partial = cs.apply_column_event(
+            partial,
+            cs.TokenReviewed(
+                f"partial-review-{token_id}",
+                _decision(token_id, _default_rows()[token_id]),
+            ),
+        )
     with pytest.raises(ValueError, match="traversal|every|snapshot|complete"):
         materializer.materialize_candidate_column(_source_text(), partial)
 
@@ -432,7 +445,7 @@ def test_candidate_materializer_supports_columnless_line_markers() -> None:
         (cs.ColumnToken("c1", 1, "4", "ab"),),
     )
     state = cs.ColumnRunState.initial(task, snapshot)
-    evidence = cs.EvidenceRecord("e-c1", "fixture", "fixture:c1", "prov", "evidence")
+    evidence = cs.EvidenceRecord("evidence-c1", "fixture", "fixture:c1", "prov", "evidence")
     state = cs.apply_column_event(state, cs.EvidenceRecorded("record-c1", evidence))
     state = cs.apply_column_event(
         state,
