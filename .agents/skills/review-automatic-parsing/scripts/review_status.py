@@ -69,32 +69,37 @@ def is_broken(surface: str, sign_span: str = "") -> bool:
     return not surface or "x" in surface or bool(re.search(r"[\[\]<>{}]", sign_span))
 
 
+def read_rows_text(text: str):
+    """Yield (column, row, idx) from reviewed TSV text."""
+    if not isinstance(text, str):
+        raise ValueError("reviewed TSV text must be a string")
+    reader = csv.reader(text.splitlines(), delimiter="\t")
+    header = next(reader, None)
+    idx = REVIEWED_IDX if header and "sign span" in header else AUTO_IDX
+    column = None
+    for row in reader:
+        if not row:
+            continue
+        marker = HEADER_RE.match(row[0])
+        if marker:
+            column = marker.group(2) or "-"
+            continue
+        if not row[0].strip().isdigit():
+            continue
+        yield column, row, idx
+
+
 def read_rows(path: Path):
     """Yield (column, row, idx) for data rows, tracking the current column."""
-    with path.open(encoding="utf-8") as fh:
-        reader = csv.reader(fh, delimiter="\t")
-        header = next(reader, None)
-        idx = REVIEWED_IDX if header and "sign span" in header else AUTO_IDX
-        column = None
-        for row in reader:
-            if not row:
-                continue
-            marker = HEADER_RE.match(row[0])
-            if marker:
-                column = marker.group(2) or "-"
-                continue
-            if not row[0].strip().isdigit():
-                continue
-            yield column, row, idx
+    yield from read_rows_text(path.read_text(encoding="utf-8"))
 
 
-def scan(path: Path):
-    """Return {column: Counter} plus the outstanding rows keyed by column."""
+def _scan_rows(rows):
     stats: dict[str, Counter] = defaultdict(Counter)
     outstanding: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
     ids_seen: dict[str, Counter] = defaultdict(Counter)
 
-    for column, row, idx in read_rows(path):
+    for column, row, idx in rows:
         tid = field(row, idx, "id")
         surface = field(row, idx, "surface")
         sign_span = field(row, idx, "sign_span")
@@ -110,7 +115,6 @@ def scan(path: Path):
             stat["alt_rows"] += 1
 
         if SEED_MARK in comment:
-            # Not reviewed yet, so the `?` audit below does not apply to it.
             stat["seeded"] += 1
             outstanding[column].append((tid, surface, "seeded"))
             continue
@@ -126,6 +130,15 @@ def scan(path: Path):
 
     return stats, outstanding
 
+
+def scan_text(text: str):
+    """Return review-status counters for in-memory TSV using CLI-identical semantics."""
+    return _scan_rows(read_rows_text(text))
+
+
+def scan(path: Path):
+    """Return review-status counters for a file using the shared text scanner."""
+    return scan_text(path.read_text(encoding="utf-8"))
 
 def print_table(name: str, stats: dict[str, Counter]) -> bool:
     print(name)
