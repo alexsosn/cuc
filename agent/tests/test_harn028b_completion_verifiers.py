@@ -72,7 +72,7 @@ def _loaded(tmp_path: Path, *, baseline_morph: str = "a/") -> LoadedColumn:
     reviewed = (
         HEADER
         + MARKER
-        + f"1001\ta\t[a ]\t{baseline_morph}\ta\tn.\tA\tclean baseline\n"
+        + f"1001\ta\ta\t{baseline_morph}\ta\tn.\tA\tclean baseline\n"
     )
     return LoadedColumn(
         task=_task(),
