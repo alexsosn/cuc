@@ -133,6 +133,11 @@ class FeedbackDisposition(str, Enum):
     NEEDS_REVIEW = "needs-review"
 
 
+class EvaluationTargetKind(str, Enum):
+    GOLD = "gold"
+    NO_GOLD = "no-gold"
+
+
 @dataclass(frozen=True)
 class ParsingWorkloadRef:
     corpus: str
@@ -286,15 +291,39 @@ def compare_run_identities(
 @dataclass(frozen=True)
 class EvaluationTarget:
     target_id: str
-    reviewed_ref: str
-    reviewed_provenance: str
+    reviewed_ref: str | None
+    reviewed_provenance: str | None
     scorer_id: str
     scorer_provenance: str
     feedback_protocol_sha256: str
+    kind: EvaluationTargetKind = EvaluationTargetKind.GOLD
 
     def __post_init__(self) -> None:
-        for field in ("target_id", "reviewed_ref", "reviewed_provenance", "scorer_id", "scorer_provenance"):
-            object.__setattr__(self, field, _required_text(getattr(self, field), field))
+        kind = _enum(self.kind, EvaluationTargetKind, "kind")
+        object.__setattr__(self, "target_id", _required_text(self.target_id, "target_id"))
+        object.__setattr__(self, "scorer_id", _required_text(self.scorer_id, "scorer_id"))
+        object.__setattr__(
+            self,
+            "scorer_provenance",
+            _required_text(self.scorer_provenance, "scorer_provenance"),
+        )
+        reviewed_ref = _optional_text(self.reviewed_ref, "reviewed_ref")
+        reviewed_provenance = _optional_text(
+            self.reviewed_provenance,
+            "reviewed_provenance",
+        )
+        if kind is EvaluationTargetKind.GOLD:
+            if reviewed_ref is None or reviewed_provenance is None:
+                raise ValueError(
+                    "gold evaluation target requires reviewed_ref and reviewed_provenance"
+                )
+        elif reviewed_ref is not None or reviewed_provenance is not None:
+            raise ValueError(
+                "no-gold evaluation target cannot carry reviewed_ref or reviewed_provenance"
+            )
+        object.__setattr__(self, "reviewed_ref", reviewed_ref)
+        object.__setattr__(self, "reviewed_provenance", reviewed_provenance)
+        object.__setattr__(self, "kind", kind)
         object.__setattr__(
             self,
             "feedback_protocol_sha256",
@@ -309,14 +338,20 @@ class EvaluationTarget:
             "scorer_id": self.scorer_id,
             "scorer_provenance": self.scorer_provenance,
             "feedback_protocol_sha256": self.feedback_protocol_sha256,
+            "kind": self.kind.value,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "EvaluationTarget":
         p = _mapping(payload, "EvaluationTarget payload")
         return cls(
-            p["target_id"], p["reviewed_ref"], p["reviewed_provenance"], p["scorer_id"],
-            p["scorer_provenance"], p["feedback_protocol_sha256"],
+            p["target_id"],
+            p.get("reviewed_ref"),
+            p.get("reviewed_provenance"),
+            p["scorer_id"],
+            p["scorer_provenance"],
+            p["feedback_protocol_sha256"],
+            EvaluationTargetKind(p.get("kind", EvaluationTargetKind.GOLD.value)),
         )
 
 
@@ -669,6 +704,7 @@ _TARGET_FIELDS = (
     "scorer_id",
     "scorer_provenance",
     "feedback_protocol_sha256",
+    "kind",
 )
 
 

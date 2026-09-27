@@ -61,15 +61,19 @@ def _split_line_ending(line: str) -> tuple[str, str]:
     return line, ""
 
 
-def _validate_completed_state(state: ColumnRunState) -> None:
+def _validate_candidate_state(state: ColumnRunState) -> None:
     if not isinstance(state, ColumnRunState):
-        raise ValueError("completed_state must be ColumnRunState")
+        raise ValueError("candidate_state must be ColumnRunState")
     if not state.initial_pass_complete:
         raise ValueError("materialization requires completed traversal of every snapshot token")
     if state.unresolved_revisits:
         raise ValueError("materialization requires every revisit to be resolved")
     if not state.reconciliation_closed:
         raise ValueError("materialization requires closed reconciliation")
+
+
+def _validate_completed_state(state: ColumnRunState) -> None:
+    _validate_candidate_state(state)
 
     current_gate_results = {
         result.gate_id: result
@@ -151,14 +155,23 @@ def _validate_source_column_coverage(
 ) -> None:
     """Require the seeded source target column to equal the complete snapshot token set."""
 
-    prefix = f"{state.task.tablet} {state.task.column}:"
+    def in_target_work_unit(context: str | None) -> bool:
+        if context is None:
+            return False
+        if state.task.column == "-":
+            prefix = f"{state.task.tablet} "
+            if not context.startswith(prefix):
+                return False
+            return context[len(prefix):].isdigit()
+        return context.startswith(f"{state.task.tablet} {state.task.column}:")
+
     source_ids: list[str] = []
     seen: set[str] = set()
     for row in source_rows:
         if row.token_id.startswith(_LINE_MARKER_PREFIX):
             continue
         context = line_contexts.get(row.index)
-        if context is None or not context.startswith(prefix):
+        if not in_target_work_unit(context):
             continue
         if row.token_id not in seen:
             source_ids.append(row.token_id)
@@ -252,21 +265,13 @@ def _render_block(block: _TargetBlock) -> tuple[str, ...]:
     return tuple(rendered)
 
 
-def materialize_completed_column(
+def _render_materialized_column(
     reviewed_tsv_text: str,
-    completed_state: ColumnRunState,
+    state: ColumnRunState,
 ) -> str:
-    """Return a deterministic reviewed-TSV draft for one completed column.
-
-    Existing immutable token identity fields come from the already-seeded source TSV;
-    all scholarly mutable fields come exclusively from the latest structured decisions.
-    Rows outside the snapshot are returned unchanged.
-    """
-
-    _validate_completed_state(completed_state)
-    decisions = _latest_structured_decisions(completed_state)
+    decisions = _latest_structured_decisions(state)
     raw_lines, source_rows = _parse_source_lines(reviewed_tsv_text)
-    blocks = _build_target_blocks(source_rows, completed_state, decisions)
+    blocks = _build_target_blocks(source_rows, state, decisions)
 
     replacement_at = {block.first_index: _render_block(block) for block in blocks}
     skipped_indexes = {
@@ -286,3 +291,32 @@ def materialize_completed_column(
             continue
         output.append(line)
     return "".join(output)
+
+
+def materialize_candidate_column(
+    reviewed_tsv_text: str,
+    candidate_state: ColumnRunState,
+) -> str:
+    """Render the exact candidate TSV inspected by pre-completion gates.
+
+    Scholarly traversal and reconciliation must already be complete, but gate
+    results and ColumnCompletion are intentionally not required yet.
+    """
+
+    _validate_candidate_state(candidate_state)
+    return _render_materialized_column(reviewed_tsv_text, candidate_state)
+
+
+def materialize_completed_column(
+    reviewed_tsv_text: str,
+    completed_state: ColumnRunState,
+) -> str:
+    """Return a deterministic reviewed-TSV draft for one completed column.
+
+    Existing immutable token identity fields come from the already-seeded source TSV;
+    all scholarly mutable fields come exclusively from the latest structured decisions.
+    Rows outside the snapshot are returned unchanged.
+    """
+
+    _validate_completed_state(completed_state)
+    return _render_materialized_column(reviewed_tsv_text, completed_state)

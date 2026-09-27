@@ -226,3 +226,160 @@ intermittent failures abort once one source has failed on more than 25% of the
 column (floor of two), and the constructor cross-checks every carried resource
 path against the policy digest. Left as noted: the Burns index is built twice
 per `build` (perf only) and WAL sidecars on a writable directory.
+
+## Research — 028b, 2026-09-23
+
+### Delta since 028a
+
+028a is merged. HARN-029/030/031/032/033 subsequently added the Jev live
+backend, provenance hardening, provider usage/I/O telemetry, and a lexical
+stage. 028b must compose those APIs rather than create another provider
+runtime or evidence path.
+
+The ten malformed reviewed work units found during 028a are split to #80
+(DATA-001). The production loader remains fail-closed; 028b will not pad,
+repair, or infer missing scholarly values.
+
+### Pre-completion materialization knot
+
+The graph executes the three completion verifiers before `ColumnCompleted`, but
+HARN-027's public `materialize_completed_column` deliberately refuses any state
+without `completion`. Therefore `review-status-clean` and the lint-delta gate
+cannot honestly inspect the candidate TSV unless the materializer exposes one
+canonical pre-completion rendering boundary.
+
+Decision: refactor HARN-027 internally so one pure renderer owns TSV replacement.
+Expose `materialize_candidate_column(reviewed_text, state)` for a state that has
+completed initial traversal, resolved all revisits, closed reconciliation, and
+has structured reviewed rows for every snapshot token. It does *not* require
+gate results or `ColumnCompletion`. `materialize_completed_column` remains the
+persistence API and wraps the same renderer after its existing completion
+checks. There must not be two rendering implementations.
+
+Columnless work units use marker prefix `f"{tablet} "` instead of
+`f"{tablet} {column}:"`; the source marker must still match each token's exact
+`line_ref`.
+
+### Completion-verifier composition
+
+Create `harness.completion_verifiers` with a host object bound to the
+`LoadedColumn` and an ignored local run directory.
+
+- `report-token-count`: latest decisions must cover exactly every snapshot token;
+  evidence records exact expected/observed counts.
+- `review-status-clean`: render the candidate draft, evaluate the same seeded /
+  undocumented-`?` semantics as `review_status.py`, and require the *target work
+  unit* to be clean. The script's scanning logic is refactored into a reusable
+  text/path helper so CLI and harness share one implementation.
+- `lint-error-delta-no-regression`: write baseline and candidate only under the
+  ignored local run directory, run the real `agent.linter.lint.lint_file`
+  structural/no-DB path on each, and require candidate error count <= baseline
+  error count. No external DULAT/UDB resource is required for this gate.
+  Provenance records the linter module plus the candidate/baseline SHA-256s,
+  never candidate text.
+
+The verifier returns only `CompletionGateResult`; candidate resource text or
+reviewed TSV content never enters committed reports.
+
+### Gold-less evaluation
+
+Keep `ParsingEvaluationRecord.target` as one stable class for compatibility.
+Extend `EvaluationTarget` with a `kind` (`gold` / `no-gold`) and make
+`reviewed_ref` / `reviewed_provenance` optional only for `no-gold`. Existing
+payloads default to `gold`.
+
+A no-gold target still names the behaviour evaluator and feedback protocol but
+contains no reviewed-data reference. Comparability includes `target.kind`, so
+gold-backed and no-gold records are never comparable even if every run identity
+field matches. No-gold evaluation contains behaviour + efficiency only; it must
+not run the reviewed morphology scorer.
+
+### Output/write boundary
+
+Dry-run output is an ignored local artifact only. Real fork output is a single
+HARN-023 `UPDATE_CONTENTS` request for `reviewed/<tablet>.tsv`; the request
+payload carries the materialized full file and exact expected source digest/branch
+metadata needed by the trusted adapter. The runner itself has no GitHub client,
+raw endpoint, or second repository mutation path. `auto_parsing/**` is never a
+write target.
+
+The public write helper therefore returns/executes a declared
+`GitHubEffectRequest` through an injected `GitHubEffectGateway` + journal. It
+does not implement GitHub HTTP.
+
+### CLI boundary
+
+`python -m harness.run_column` is composition only: parse args, load the column,
+build evidence policy/collector, select the existing provider binding, invoke
+the existing graph, persist state/artifacts under an ignored local run
+directory, evaluate, and either emit a dry-run draft or pass the fork-local
+write request to a trusted host.
+
+Paid/live execution still requires the existing
+`ProviderExecutionPolicy.allow_paid_live_execution`; the CLI must not weaken it.
+A test-double execution path is first-class for end-to-end tests.
+
+## Plan — 028b
+
+### Gate B1 — candidate renderer + completion verifiers
+
+RED first:
+1. candidate materialization works before `ColumnCompleted` but only after full
+   traversal + closed reconciliation + structured decisions;
+2. completed and candidate renderers are byte-identical for the same decisions;
+3. columnless markers render correctly and a mismatched line marker fails closed;
+4. `review-status-clean` fails on a seeded row and an undocumented unresolved
+   row, passes on a clean target work unit, and ignores dirt in another column;
+5. lint delta fails on a synthetic +1 structural/error issue and passes when
+   candidate errors are equal/fewer than baseline;
+6. token-count gate fails on missing/latest decision coverage;
+7. verifier evidence/provenance contains hashes/counts/command identifiers but
+   no candidate TSV text.
+
+Implement only after an exact RED run.
+
+### Gate B2 — explicit no-gold evaluation
+
+RED first:
+1. legacy/gold `EvaluationTarget` JSON remains compatible;
+2. no-gold target round-trips with no reviewed reference;
+3. invalid gold/no-gold field combinations fail closed;
+4. otherwise-identical gold/no-gold records compare non-comparable on
+   `target.kind`;
+5. no-gold evaluation factory emits behaviour/efficiency only and never invokes
+   the reviewed morphology scorer.
+
+Implement only after B1 GREEN and exact B2 RED.
+
+### Gate B3 — controlled output + CLI composition
+
+RED first:
+1. dry run writes only inside the configured ignored run directory and leaves
+   `reviewed/**` / `auto_parsing/**` unchanged;
+2. real output creates exactly one declared HARN-023 `UPDATE_CONTENTS` request
+   for the target reviewed file; no raw GitHub adapter is reachable from model
+   ports;
+3. stale reviewed source digest / wrong path / wrong repository / wrong branch
+   fails closed before provider mutation;
+4. live provider execution without `allow_paid_live_execution` is refused;
+5. a test-double provider completes the KTU 1.6 fixture end to end through
+   loader → evidence → graph → gates → evaluation → dry-run draft;
+6. terminal run metadata contains ids/hashes/metrics only and no resource or
+   prompt text.
+
+Implement only after B2 GREEN and exact B3 RED.
+
+## Review rubric — 028b
+
+Reject the PR if any path can:
+- materialize a partial/skipped column;
+- pass completion gates against text other than the exact candidate that will
+  be persisted;
+- leak reviewed gold into a no-gold model/evaluation path;
+- write `reviewed/**` except through the one HARN-023 `UPDATE_CONTENTS` request,
+  or write `auto_parsing/**` at all;
+- perform a paid call without the existing explicit execution flag;
+- silently repair the malformed reviewed data tracked in #80;
+- emit resource/prompt/candidate text into committed metrics or run summaries.
+
+Every review blocker receives a failing regression before its fix.
