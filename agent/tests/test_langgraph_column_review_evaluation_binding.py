@@ -155,3 +155,22 @@ def test_evaluation_workload_must_match_completed_column_state() -> None:
             runtime.initial_graph_input(_state()),
             config={"configurable": {"thread_id": "wrong-eval-workload"}},
         )
+
+
+def test_invalid_completed_evaluation_is_checkpointed_before_binding_validation() -> None:
+    calls: list[str] = []
+
+    def wrong_snapshot(record: ParsingEvaluationRecord) -> ParsingEvaluationRecord:
+        calls.append("evaluate")
+        workload = replace(record.identity.workload, snapshot_id="another-snapshot")
+        return replace(record, identity=replace(record.identity, workload=workload))
+
+    graph = _graph(wrong_snapshot)
+    config = {"configurable": {"thread_id": "invalid-eval-resume"}}
+
+    with pytest.raises(ValueError, match="evaluation.*workload|workload.*evaluation"):
+        graph.invoke(runtime.initial_graph_input(_state()), config=config)
+    with pytest.raises(ValueError, match="evaluation.*workload|workload.*evaluation"):
+        graph.invoke(None, config=config)
+
+    assert calls == ["evaluate"]
