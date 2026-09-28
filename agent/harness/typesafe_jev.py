@@ -57,12 +57,20 @@ _READING_INSTRUCTIONS = (
     "parsing, DULAT lexeme, part of speech and gloss. Pick the reading that the "
     "line, the clause and the evidence support best. Prefer readings attested "
     "for this surface elsewhere in the corpus only when the context agrees. "
+    "EUPT vocalisation evidence may include per-word form, lemma, homonym and "
+    "morphology. Match its word to the token by the line and consonantal lemma, "
+    "allowing for vocalisation and spelling differences. A slash-separated "
+    "morphology such as 'GN / Subst.' explicitly leaves analyses open; do not "
+    "treat that source as settling between corresponding listed candidates. "
     "Choose none-of-these only when no listed reading is defensible."
 )
 _AMBIGUOUS_INSTRUCTIONS = (
     "More than one of the candidate readings offered for this token is "
     "defensible in this context, so the curated data should keep several "
-    "alternatives rather than one."
+    "alternatives rather than one. EUPT per-word morphology that explicitly "
+    "lists slash-separated alternatives (for example 'GN / Subst.') is direct "
+    "evidence of unresolved analysis: when those alternatives correspond to "
+    "offered readings and context does not decide between them, answer yes."
 )
 _LEXEME_INSTRUCTIONS = (
     "You are linking one token of a Ugaritic tablet line to its lexeme. The state "
@@ -75,7 +83,11 @@ _LEXEME_INSTRUCTIONS = (
     "The DULAT lemma writes aleph vowels as ả, ỉ, ủ where the tablet surface writes "
     "plain a, i, u; that difference is not a mismatch. Pick the lexeme the line "
     "and the evidence support best. Choose none-of-these only when no listed "
-    "lexeme is defensible."
+    "lexeme is defensible. EUPT vocalisation evidence may include per-word "
+    "form, lemma, homonym and morphology. Match its word to this token by line "
+    "and consonantal lemma, allowing for vocalisation and spelling differences. "
+    "Slash-separated morphology such as 'GN / Subst.' explicitly leaves the "
+    "corresponding lexical analyses open; do not treat it as choosing just one."
 )
 _LEXEME_FITS_INSTRUCTIONS = (
     "The candidate lexeme is the right lexical link for this token in this line: "
@@ -85,7 +97,11 @@ _LEXEME_FITS_INSTRUCTIONS = (
 )
 _LEXICAL_AMBIGUOUS_INSTRUCTIONS = (
     "More than one of the listed lexemes is defensible for this token in this "
-    "line, so the curated data should keep several readings rather than one."
+    "line, so the curated data should keep several readings rather than one. "
+    "EUPT per-word morphology that explicitly lists slash-separated alternatives "
+    "(for example 'GN / Subst.') is direct evidence of unresolved analysis: when "
+    "those alternatives correspond to listed lexemes and context does not decide "
+    "between them, answer yes."
 )
 _LEXICAL_INCONSISTENT_INSTRUCTIONS = (
     "The lexeme chosen for this token contradicts the lexemes chosen for the "

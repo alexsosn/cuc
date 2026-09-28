@@ -361,9 +361,11 @@ class EuptAdapter:
         if con is None:
             return ()
         try:
+            columns = {row[1] for row in con.execute("pragma table_info(module_records)")}
+            data_json_column = "data_json" if "data_json" in columns else "NULL"
             placeholders = ",".join("?" * len(_EUPT_MODULES))
             rows = con.execute(
-                "select module_id, content_text from module_records "
+                "select module_id, content_text, " + data_json_column + " from module_records "
                 f"where ref_norm=? and module_id in ({placeholders}) order by id",
                 (ctx.modules_ref, *_EUPT_MODULES),
             ).fetchall()
@@ -371,10 +373,48 @@ class EuptAdapter:
             con.close()
         provenance = f"modules_cache:{_digest_marker(ctx, self.source_id)}"
         return tuple(
-            _record(ctx, self.source_id, index, f"eupt:{module_id}:{ctx.modules_ref}", provenance, text or "")
-            for index, (module_id, text) in enumerate(rows, start=1)
+            _record(
+                ctx,
+                self.source_id,
+                index,
+                f"eupt:{module_id}:{ctx.modules_ref}",
+                provenance,
+                _eupt_summary(module_id, text or "", data_json),
+            )
+            for index, (module_id, text, data_json) in enumerate(rows, start=1)
             if (text or "").strip()
         )
+
+
+def _eupt_summary(module_id: str, text: str, data_json: object) -> str:
+    """Preserve EUPT's per-word annotations for vocalisation evidence.
+
+    Translation and commentary remain plain text. Vocalisation data includes a
+    structured word list (form, lemma, homonym and morphology) that can link a
+    transliterated token to the lexical ambiguity EUPT records for that word.
+    """
+
+    if module_id != "EUPT_vocalisation":
+        return text
+    try:
+        payload = json.loads(data_json) if isinstance(data_json, str) else data_json
+    except (TypeError, json.JSONDecodeError):
+        return text
+    if not isinstance(payload, Mapping):
+        return text
+    raw_words = payload.get("words")
+    if not isinstance(raw_words, list):
+        return text
+    words = [
+        {
+            key: str(word.get(key) or "").strip()
+            for key in ("form", "lemma", "homonym", "morph")
+            if isinstance(word, Mapping) and str(word.get(key) or "").strip()
+        }
+        for word in raw_words
+        if isinstance(word, Mapping)
+    ]
+    return json.dumps({"text": text, "words": words}, ensure_ascii=False, sort_keys=True)
 
 
 class TropperAdapter:
@@ -983,4 +1023,3 @@ class EvidenceCollector:
         if not any(item.source_id == AUTO_PARSING for item in records):
             raise ValueError("auto-parsing evidence must be present for every token visit")
         return tuple(records)
-

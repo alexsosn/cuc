@@ -46,7 +46,7 @@ explicit path → `CUC_*` env var → sibling checkout. Never committed.
 |---|---|---|
 | `auto-parsing` | repository | rows for the token in the pinned auto file |
 | `dulat` | `dulat_search.sqlite` `dulat_reverse_refs(norm_ref, entry_id, payload)` | `norm_ref = "KTU 1.6 I:2"`; payload JSON has `label`, `sense_labels`, `reference_translations` |
-| `eupt` | `modules_cache.sqlite` `module_records(module_id, ref_norm, content_text)` | `module_id in (EUPT_vocalisation, EUPT_translation, EUPT_commentary)`, `ref_norm = "KTU 1.6 I:2"` (columnless texts are normalised as column I) |
+| `eupt` | `modules_cache.sqlite` `module_records(module_id, ref_norm, content_text, data_json)` | `module_id in (EUPT_vocalisation, EUPT_translation, EUPT_commentary)`, `ref_norm = "KTU 1.6 I:2"` (columnless texts are normalised as column I); vocalisation evidence also passes the whitelisted per-word `form`, `lemma`, `homonym`, and `morph` fields from `data_json.words` |
 | `tropper` | `<ocr>/…ocr.index.sqlite` `ktu(tablet, column, line, pages, verified, …)` | pages that cite the line; pointer evidence only |
 | `legacy-review` | `reviewed/KTU <n>.txt` (+ `reviewed/orig/`) | `legacy_align.load` aligned by `(column, line)` then surface |
 | `corpus-parallels` | `reviewed/*.tsv` in the repository | other reviewed tokens with the same normalised surface |

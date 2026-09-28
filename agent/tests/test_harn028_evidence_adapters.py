@@ -87,7 +87,16 @@ def _modules_db(path: Path) -> Path:
         "INSERT INTO module_records (module_id, record_id, ref_display, ref_norm, "
         "content_text, content_html, file_path, data_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            ("EUPT_vocalisation", "r1", "KTU 9.9 I:2", "KTU 9.9 I:2", "ġôra bi ˀabni", "", "", "{}"),
+            (
+                "EUPT_vocalisation", "r1", "KTU 9.9 I:2", "KTU 9.9 I:2", "ġôra bi ˀabni", "", "",
+                json.dumps({
+                    "words": [
+                        {"form": "ġôra", "lemma": "ġr", "homonym": "III", "morph": "Nom.m.Sg."},
+                        {"form": "bi", "lemma": "b", "homonym": "I", "morph": "Präp."},
+                    ],
+                    "private_path": "/not-for-provider",
+                }),
+            ),
             ("EUPT_translation", "r2", "KTU 9.9 I:2", "KTU 9.9 I:2", "(Ihre) Haut zerkratzte sie", "", "", "{}"),
             ("CUC", "r3", "KTU 9.9 I:2", "KTU 9.9 I:2", "ġr . b abn", "", "", "{}"),
             ("UNP", "doc", "KTU 9.9", "KTU 9.9", "whole tablet translation", "", "", "{}"),
@@ -271,6 +280,14 @@ def test_eupt_adapter_returns_only_line_level_eupt_modules(tmp_path: Path) -> No
     modules = [r.source_ref.split(":")[1] for r in records]
     assert modules == ["EUPT_vocalisation", "EUPT_translation"]
     assert "ġôra" in records[0].summary
+    vocalisation = json.loads(records[0].summary)
+    assert vocalisation["text"] == "ġôra bi ˀabni"
+    assert vocalisation["words"] == [
+        {"form": "ġôra", "lemma": "ġr", "homonym": "III", "morph": "Nom.m.Sg."},
+        {"form": "bi", "lemma": "b", "homonym": "I", "morph": "Präp."},
+    ]
+    assert "private_path" not in records[0].summary
+    assert records[1].summary == "(Ihre) Haut zerkratzte sie"
     # CUC text and whole-tablet translations are not EUPT evidence.
     assert not any("UNP" in r.source_ref or ":CUC:" in r.source_ref for r in records)
 

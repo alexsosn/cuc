@@ -60,6 +60,7 @@ from harness.parsing_evaluation import (  # noqa: E402
     measure_column_behavior,
 )
 from harness.typesafe_jev import JevDecisionPolicy, TypeSafeJevClient, jev_binding  # noqa: E402
+from harness.telemetry import ScoreProjection, TelemetryRunType  # noqa: E402
 
 SHA0 = "0" * 64
 
@@ -176,11 +177,7 @@ def main() -> int:
     output = graph.invoke(initial_graph_input(state), config={"configurable": {"thread_id": run_id}})
     final: ColumnRunState = output["column_state"]
     status = output.get("terminal_status")
-    flush = sidecar.flush()
     artifact = runtime.artifact("jev-lexical", str(status))
-    print(f"terminal={status} requests={artifact.request_count} local_resolutions={artifact.local_resolutions} "
-          f"input_tokens={artifact.input_tokens} output_tokens={artifact.output_tokens} "
-          f"retries={artifact.retries} budget_exhausted={artifact.budget_exhausted} tracing={'delivered' if flush.delivered else 'off'}")
 
     # --- score -------------------------------------------------------------------------
     gold_rows = _gold_rows(repo_root, args.tablet, args.column)
@@ -207,6 +204,39 @@ def main() -> int:
                           "offered": [r.to_dict() for r in offered[tok.token_id]], "summary": jev})
     score = score_lexical_column(predicted=predicted, gold=gold, offered=offered, parser_first=parser_first, parser_all=parser_all)
     d = score.to_dict()
+    # HARN-033: lexical metrics are computed after the shared parsing graph. Export
+    # these stage-specific scores against the same deterministic run trace so they
+    # can be compared in Langfuse with provider usage and parsing observations.
+    for name, value in (
+        ("lexical.exact_accuracy", d["exact_rate"]),
+        ("lexical.lemma_accuracy", d["lemma_exact_rate"]),
+        ("lexical.parser_first_accuracy", d["parser_first_rate"]),
+        ("lexical.parser_all_accuracy", d["parser_all_rate"]),
+        ("lexical.ceiling_accuracy", d["ceiling_rate"]),
+    ):
+        sidecar.emit_score(
+            ScoreProjection(
+                TelemetryRunType.PARSING,
+                run_id,
+                name,
+                value,
+                "NUMERIC",
+                {
+                    "source": "jev_lexical_stage",
+                    "scope": "column",
+                    "deterministic": True,
+                    "tablet": args.tablet,
+                    "column": args.column,
+                    "exact": d["exact"],
+                    "tokens": d["tokens"],
+                    "gold_unresolved": d["gold_unresolved"],
+                },
+            )
+        )
+    flush = sidecar.flush()
+    print(f"terminal={status} requests={artifact.request_count} local_resolutions={artifact.local_resolutions} "
+          f"input_tokens={artifact.input_tokens} output_tokens={artifact.output_tokens} "
+          f"retries={artifact.retries} budget_exhausted={artifact.budget_exhausted} tracing={'delivered' if flush.delivered else 'off'}")
     print(f"lexical exact {d['exact']}/{d['tokens']} ({d['exact_rate']:.1%}; {d['gold_unresolved']} gold-unresolved excluded) | "
           f"lemma-only {d['lemma_exact_rate']:.1%} | "
           f"abstained correct/wrong {d['abstained_correct']}/{d['abstained_wrong']} | parser first {d['parser_first_rate']:.1%} | "

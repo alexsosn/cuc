@@ -210,6 +210,42 @@ def test_adjudicate_request_targets_systemone_with_bearer_and_closed_candidates(
     assert "sk-test" not in json.dumps(body)
 
 
+def test_lexical_prompt_receives_eupt_word_level_alternatives() -> None:
+    mod = _jev()
+    payload = _adjudicate_payload()
+    payload["evidence"].append(
+        EvidenceRecord(
+            "op:eupt:vocalisation",
+            "eupt",
+            "eupt:EUPT_vocalisation:KTU 9.9 I:2",
+            "modules_cache:abc",
+            json.dumps({
+                "text": "ġôra bi ˀabni",
+                "words": [
+                    {"form": "ġôra", "lemma": "ġr", "homonym": "III", "morph": "GN / Subst. *.m.Sg."},
+                    {"form": "bi", "lemma": "b", "homonym": "I", "morph": "Präp."},
+                ],
+            }, ensure_ascii=False),
+        ).to_dict()
+    )
+    client = _client(
+        mod,
+        Transport(probabilities_by_analysis={}),
+        decision_policy=mod.JevDecisionPolicy(stage="lexical"),
+    )
+    body, _ = client._lexical_body(_request(payload))
+
+    eupt = next(e for e in body["state"]["evidence"] if e["source"] == "eupt" and "vocalisation" in e["ref"])
+    assert json.loads(eupt["content"])["words"][0] == {
+        "form": "ġôra", "lemma": "ġr", "homonym": "III", "morph": "GN / Subst. *.m.Sg."
+    }
+    lexical_instructions = body["questions"]["lexeme"]["instructions"]
+    ambiguity_instructions = body["questions"]["ambiguous"]["instructions"]
+    assert "Match its word to this token by line and consonantal lemma" in lexical_instructions
+    assert "do not treat it as choosing just one" in lexical_instructions
+    assert "those alternatives correspond to listed lexemes" in ambiguity_instructions
+
+
 def test_state_never_carries_gold_or_paths(monkeypatch) -> None:
     mod = _jev()
     monkeypatch.setenv(KEY_ENV, "sk-test")

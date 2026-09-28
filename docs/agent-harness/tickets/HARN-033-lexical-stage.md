@@ -71,8 +71,10 @@ options; abstention must never win by plurality.
   candidate lemma (others summarised as a count — the citation label is the
   cited phrase, not the headword; the adapter now carries `headword` and
   `headword_pos` from the search index's `entries_fts`, review M2); EUPT
-  vocalisation/translation for the line; Burns rows whose headword matches the
-  surface after aleph/ayin normalisation and without `(DN)`-style qualifiers
+  vocalisation/translation for the line (vocalisation records include per-word
+  `form`, `lemma`, `homonym`, and `morph` fields from `data_json.words`); Burns
+  rows whose headword matches the surface after aleph/ayin normalisation and
+  without `(DN)`-style qualifiers
   (review M3); legacy analyses of the surface; same-line prior lexical
   decisions (surface → lemma) as context. No column listing, no history, no
   Tropper.
@@ -85,7 +87,9 @@ options; abstention must never win by plurality.
   reported confidence is ≥ 0.5 (an absent confidence blocks abstention too,
   review L1; abstention cannot win by plurality — applied to the full stage
   too); the `jev` block records the stage, the chosen reading and the
-  per-reading probabilities.
+  per-reading probabilities. The ambiguity prompt treats slash-separated EUPT
+  word morphology (for example `GN / Subst.`) as explicit evidence to retain
+  corresponding offered alternatives when line context does not resolve them.
 - **single candidate**: accepted without a call only when the parser offered
   it (`parser_row_count > 0`, the 98% base rate below); a parallel-only single
   is asked as a choice against `none-of-these`.
@@ -105,7 +109,10 @@ collector for the requested policy, runs the HARN-022 live runtime with the
 lexical-stage client, scores against the reviewed gold with the lexical
 scorer, and writes a metrics-only report (JSON + markdown) under
 `agent/reports/jev-lexical/` (ignored). Tracing and I/O capture follow the
-HARN-005/031/032 environment flags. Stub completion gates until 028b.
+HARN-005/031/032 environment flags. Column runs export the stage metrics
+`lexical.exact_accuracy`, `lexical.lemma_accuracy`, parser first/all accuracy,
+and the offered-candidate ceiling to Langfuse against the same run trace. Stub
+completion gates until 028b.
 
 ## TDD gates
 
