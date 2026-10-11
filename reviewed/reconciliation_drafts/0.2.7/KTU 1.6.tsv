@@ -890,7 +890,7 @@ id	surface form	morphological parsing	DULAT	POS	gloss	comments
 # KTU 1.6 IV:28						
 131490	x	?	?	?	?	SOURCE_REVIEW_ID=141131
 # KTU 1.6 IV:29						
-131491		?	?	?	?	SOURCE_REVIEW_ID=141132
+131491		?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 # KTU 1.6 V:1						
 131492	yiḫd	!y!ʔḫd[ḏ	/ʔ-ḫ-d(/ḏ)/	vb G prefc.	to collect	SOURCE_REVIEW_ID=141133
 131493	bˤl	bˤl(II)/	bʕl (II)	n. m. / DN	Baʿlu/Baal	SOURCE_REVIEW_ID=141134
@@ -1051,7 +1051,7 @@ id	surface form	morphological parsing	DULAT	POS	gloss	comments
 # KTU 1.6 V:29						
 131609	š	š/	š	n. m. sg.	ram	SOURCE_REVIEW_ID=141251
 # KTU 1.6 V:30						
-131610		?	?	?	?	SOURCE_REVIEW_ID=141252
+131610		?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 # KTU 1.6 VI:1						
 131611	xxxxxxx	?	?	?	?	SOURCE_REVIEW_ID=141253
 131612	ṭrdh	ṭrd[+h	/ṭ-r-d/	vb G perf.	to throw out	SOURCE_REVIEW_ID=141254
