@@ -58,7 +58,7 @@ id	surface form	sign span	morphological parsing	DULAT	POS	gloss	comments
 125858	ˤdb	ʿdb	!!ˤdb[	/ʕ-d-b/	vb G impv. m. sg.	“to leave” > “to put in”, “to place”	SOURCE_REVIEW_ID=154286
 125858	ˤdb	ʿdb	ˤdb[/	/ʕ-d-b/	vb G act. ptcpl.	“to leave” > “to put in”, “to place”	SOURCE_REVIEW_ID=154286
 # KTU 1.1 II:12							
-125859		[            ]	?	?	?	?	indicates an unidentified word | SOURCE_REVIEW_ID=154287
+125859			?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 125860	tˤtqn	tʿtqn	!t!ˤtq[n	/ʕ-t-q/	vb G prefc.	to pass	DULAT cites tʕtqn here s.v. /ʕ-t-q/ 'to pass'. | SOURCE_REVIEW_ID=154288
 # KTU 1.1 II:13							
 125861	šb	[            ]šb	šb/	šb	n. m. sg. abs.	old man	DULAT cites ]šb here s.v. šb 'old man'. | SOURCE_REVIEW_ID=154289
@@ -355,10 +355,10 @@ id	surface form	sign span	morphological parsing	DULAT	POS	gloss	comments
 126090	b	b	b	b	prep.	in	SOURCE_REVIEW_ID=154523
 126091	tk	tk	tk/	tk	n. m. abs. gen.	centre	SOURCE_REVIEW_ID=154524
 126091	tk	tk	tk	tk	prep.	in the midst of	DULAT: tk n. 'centre', also used as prep. (EUPT: Präp.). | SOURCE_REVIEW_ID=154524
-126092		[                   ]	?	?	?	?	SOURCE_REVIEW_ID=154525
+126092			?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 # KTU 1.1 III:29							
 126093	bn	bn	bn(I)/	bn (I)	n. m. sg. cstr.	son	SOURCE_REVIEW_ID=154526
-126094		[                      ]	?	?	?	?	SOURCE_REVIEW_ID=154527
+126094			?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 # KTU 1.1 III:30							
 126095	ax	ax[                        ]	?	?	?	?	SOURCE_REVIEW_ID=154528
 # KTU 1.1 IV:1							
@@ -549,7 +549,7 @@ id	surface form	sign span	morphological parsing	DULAT	POS	gloss	comments
 126233	tngṯnh	tngṯnh	!t!ngṯ[+nh	/n-g-ṯ/	vb G prefc. + 3 m. sg. suff.	to make one’s way to	tngṯnh 'she/you seek(s) him' (?). | SOURCE_REVIEW_ID=154666
 126233	tngṯnh	tngṯnh	!t!ngṯ[+nh:d	/n-g-ṯ/	vb D prefc. + 3 m. sg. suff.	to make one’s way to	EUPT: D-stem (unwritten gemination; both viable). | SOURCE_REVIEW_ID=154666
 # KTU 1.1 V:5							
-126234		[                                          ]	?	?	?	?	SOURCE_REVIEW_ID=154667
+126234			?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 126235	b	b	b	b	prep.	in	SOURCE_REVIEW_ID=154668
 126236	ṣpn	ṣpn	ṣpn/	ṣpn	TN/DN sg. abs. gen.	Ṣapānu/Zaphon/the mountain dwelling of bʕl deified	SOURCE_REVIEW_ID=154669
 # KTU 1.1 V:6							
@@ -616,11 +616,11 @@ id	surface form	sign span	morphological parsing	DULAT	POS	gloss	comments
 126279	išqb	išqb	!(ʔ&i!šqb[	/š-q-b/	vb G prefc. 1 c. sg.	?	DULAT cites išqb here s.v. /š-q-b/ (no gloss given); išqb aylt '... a hind'. | SOURCE_REVIEW_ID=154716
 126280	aylt	aylt	ayl(t(I)/t	ảylt (I)	n. f. sg. abs. acc.	hind	DULAT cites ảylt (I) here; object of išqb (?). | SOURCE_REVIEW_ID=154717
 # KTU 1.1 V:20							
-126281		[                                          ]	?	?	?	?	SOURCE_REVIEW_ID=154718
+126281			?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 126282	mbkm	mbkm	mbk/m	mbk	n. m. pl. abs.	source	DULAT cites mbk 'source, spring' here. | SOURCE_REVIEW_ID=154719
 126283	yˤn	yʿn	!y!ˤn(y(I)[	/ʕ-n-y/ (I)	vb G prefc. 3 m. sg.	to answer	SOURCE_REVIEW_ID=154720
 # KTU 1.1 V:21							
-126284		[                                          ]	?	?	?	?	SOURCE_REVIEW_ID=154721
+126284			?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 126285	ydˤ	ydʿ	ydˤ[	/y-d-ʕ/ (I)	vb G suffc. 3 m. sg.	to know	SOURCE_REVIEW_ID=154722
 126285	ydˤ	ydʿ	!!ydˤ[/	/y-d-ʕ/ (I)	vb G inf. abs.	to know	EUPT: G inf. abs. | SOURCE_REVIEW_ID=154722
 126286	l	l	l(II)	l (II)	adv.	no, not	SOURCE_REVIEW_ID=154723
@@ -646,7 +646,7 @@ id	surface form	sign span	morphological parsing	DULAT	POS	gloss	comments
 126299	at	at	at(I)	ảt (I)	pers. pn.	you	SOURCE_REVIEW_ID=154737
 126300	zd	zd	zd[	/z-d/	vb G	to boil, become inflamed, yearn for	ảt zd 'you yearn (?)' (DULAT cites /z-d/ here); not ṯd 'breast'. | SOURCE_REVIEW_ID=154738
 # KTU 1.1 V:26							
-126301		[                                          ]	?	?	?	?	SOURCE_REVIEW_ID=154739
+126301			?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 126302	tˤrb	tʿrb	!t!ˤrb[	/ʕ-r-b/ (I)	vb G prefc. 3 f. sg.	1) to cause to enter	DULAT cites ]tʕrb b šỉ here s.v. /ʕ-r-b/ (I). | SOURCE_REVIEW_ID=154740
 126303	b	b	b	b	prep.	in	SOURCE_REVIEW_ID=154741
 126304	ši	ši	!!](n]š(ʔ&it/	/n-š-ʔ/	vb G inf. (n. f.)	to raise, lift, help up	MERGE WITH THE NEXT: ši+t = šit, split V:26/27; b šit 'at the lifting/rising (?)' — DULAT cites b šỉ s.v. /n-š-ʔ/ AND s.v. š 'sheep' (alternative). | SOURCE_REVIEW_ID=154742
@@ -657,7 +657,7 @@ id	surface form	sign span	morphological parsing	DULAT	POS	gloss	comments
 126308	l	l	l(II)	l (II)	neg. adv.	no, not	SOURCE_REVIEW_ID=154746
 126309	tptq	tptq	!t=!p]t]q[	/p-q/	vb Gt prefc. 2 m. sg.	to obtain, acquire	DULAT: 'you shall procure for yourself (?)' (/p-q/ Gt). | SOURCE_REVIEW_ID=154747
 # KTU 1.1 V:28							
-126310		[                                          ]	?	?	?	?	SOURCE_REVIEW_ID=154748
+126310			?	?	?	?	PENDING_TOKENIZATION_REVIEW (unreviewed 0.2.7 candidate)
 126311	gbh	gbh	gb(II)/+h	gb (II)	n. m. sg. cstr. nom. + 3 m. sg. suff.	spine, back; loin; body	gbh l arṣ 'his back to the earth' (DULAT cites gb (II) here). | SOURCE_REVIEW_ID=154749
 126312	l	l	l(I)	l (I)	prep.	to	SOURCE_REVIEW_ID=154750
 126313	arṣ	arṣ	arṣ/	ảrṣ	n. f. sg. abs. gen.	earth	SOURCE_REVIEW_ID=154751
